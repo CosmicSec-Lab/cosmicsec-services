@@ -62,7 +62,9 @@ SERVICE_URLS = {
     "scan": "http://scan-service:8002",
     "ai": "http://ai-service:8003",
     "recon": "http://recon-service:8004",
-    "report": "http://report-service:8005"
+    "report": "http://report-service:8005",
+    "collab": "http://collab-service:8006",
+    "plugins": "http://plugin-registry:8007",
 }
 
 
@@ -278,7 +280,7 @@ async def platform_info():
     }
 
 
-# AI service endpoints (Phase 2 kickoff)
+# AI service endpoints (Phase 2 — ChromaDB + MITRE ATT&CK + LangChain)
 @app.get("/api/ai/health")
 @limiter.limit("60/minute")
 async def ai_health(request: Request):
@@ -314,6 +316,89 @@ async def ai_analyze(request: Request):
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="AI service unavailable"
             )
+
+
+@app.post("/api/ai/analyze/agent")
+@limiter.limit("20/minute")
+async def ai_analyze_agent(request: Request):
+    """Proxy AI LangChain agent analysis."""
+    data = await request.json()
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                f"{SERVICE_URLS['ai']}/analyze/agent",
+                json=data,
+                timeout=30.0,
+            )
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except Exception as e:
+            logger.error(f"AI service error: {e}")
+            raise HTTPException(status_code=503, detail="AI service unavailable")
+
+
+@app.post("/api/ai/analyze/mitre")
+@limiter.limit("30/minute")
+async def ai_mitre(request: Request):
+    """Proxy MITRE ATT&CK correlation endpoint."""
+    data = await request.json()
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                f"{SERVICE_URLS['ai']}/analyze/mitre",
+                json=data,
+                timeout=10.0,
+            )
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except Exception as e:
+            logger.error(f"AI service error: {e}")
+            raise HTTPException(status_code=503, detail="AI service unavailable")
+
+
+@app.post("/api/ai/query")
+@limiter.limit("20/minute")
+async def ai_nl_query(request: Request):
+    """Proxy natural language security query to Helix AI."""
+    data = await request.json()
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                f"{SERVICE_URLS['ai']}/query",
+                json=data,
+                timeout=20.0,
+            )
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except Exception as e:
+            logger.error(f"AI service error: {e}")
+            raise HTTPException(status_code=503, detail="AI service unavailable")
+
+
+@app.post("/api/ai/kb/ingest")
+@limiter.limit("10/minute")
+async def ai_kb_ingest(request: Request):
+    """Ingest a document into the ChromaDB knowledge base."""
+    data = await request.json()
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                f"{SERVICE_URLS['ai']}/kb/ingest",
+                json=data,
+                timeout=10.0,
+            )
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except Exception as e:
+            raise HTTPException(status_code=503, detail="AI service unavailable")
+
+
+@app.get("/api/ai/kb/stats")
+@limiter.limit("60/minute")
+async def ai_kb_stats(request: Request):
+    """Return ChromaDB knowledge base statistics."""
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(f"{SERVICE_URLS['ai']}/kb/stats", timeout=5.0)
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except Exception as e:
+            raise HTTPException(status_code=503, detail="AI service unavailable")
 
 
 @app.post("/api/recon")
@@ -459,6 +544,148 @@ async def dashboard_stream(websocket: WebSocket):
             await asyncio.sleep(2)
     except WebSocketDisconnect:
         logger.info("Dashboard websocket disconnected")
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — Collab service proxy routes
+# ---------------------------------------------------------------------------
+
+@app.get("/api/collab/rooms")
+@limiter.limit("60/minute")
+async def collab_list_rooms(request: Request):
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(f"{SERVICE_URLS['collab']}/rooms", timeout=5.0)
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except Exception as e:
+            raise HTTPException(status_code=503, detail="Collab service unavailable")
+
+
+@app.get("/api/collab/rooms/{room_id}/messages")
+@limiter.limit("60/minute")
+async def collab_get_messages(request: Request, room_id: str):
+    params = dict(request.query_params)
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(
+                f"{SERVICE_URLS['collab']}/rooms/{room_id}/messages",
+                params=params,
+                timeout=5.0,
+            )
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except Exception as e:
+            raise HTTPException(status_code=503, detail="Collab service unavailable")
+
+
+@app.post("/api/collab/rooms/{room_id}/messages")
+@limiter.limit("60/minute")
+async def collab_post_message(request: Request, room_id: str):
+    data = await request.json()
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                f"{SERVICE_URLS['collab']}/rooms/{room_id}/messages",
+                json=data,
+                timeout=5.0,
+            )
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except Exception as e:
+            raise HTTPException(status_code=503, detail="Collab service unavailable")
+
+
+@app.get("/api/collab/rooms/{room_id}/presence")
+@limiter.limit("60/minute")
+async def collab_presence(request: Request, room_id: str):
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(
+                f"{SERVICE_URLS['collab']}/rooms/{room_id}/presence", timeout=5.0
+            )
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except Exception as e:
+            raise HTTPException(status_code=503, detail="Collab service unavailable")
+
+
+@app.get("/api/collab/activity-feed")
+@limiter.limit("30/minute")
+async def collab_activity_feed(request: Request):
+    params = dict(request.query_params)
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(
+                f"{SERVICE_URLS['collab']}/activity-feed", params=params, timeout=5.0
+            )
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except Exception as e:
+            raise HTTPException(status_code=503, detail="Collab service unavailable")
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — Plugin registry proxy routes
+# ---------------------------------------------------------------------------
+
+@app.get("/api/plugins")
+@limiter.limit("60/minute")
+async def plugins_list(request: Request):
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(f"{SERVICE_URLS['plugins']}/plugins", timeout=5.0)
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except Exception as e:
+            raise HTTPException(status_code=503, detail="Plugin registry unavailable")
+
+
+@app.get("/api/plugins/{name}")
+@limiter.limit("60/minute")
+async def plugin_detail(request: Request, name: str):
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(f"{SERVICE_URLS['plugins']}/plugins/{name}", timeout=5.0)
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except Exception as e:
+            raise HTTPException(status_code=503, detail="Plugin registry unavailable")
+
+
+@app.post("/api/plugins/{name}/run")
+@limiter.limit("20/minute")
+async def plugin_run(request: Request, name: str):
+    data = await request.json()
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                f"{SERVICE_URLS['plugins']}/plugins/{name}/run",
+                json=data,
+                timeout=30.0,
+            )
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except Exception as e:
+            raise HTTPException(status_code=503, detail="Plugin registry unavailable")
+
+
+@app.post("/api/plugins/{name}/enable")
+@limiter.limit("20/minute")
+async def plugin_enable(request: Request, name: str):
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                f"{SERVICE_URLS['plugins']}/plugins/{name}/enable", timeout=5.0
+            )
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except Exception as e:
+            raise HTTPException(status_code=503, detail="Plugin registry unavailable")
+
+
+@app.post("/api/plugins/{name}/disable")
+@limiter.limit("20/minute")
+async def plugin_disable(request: Request, name: str):
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                f"{SERVICE_URLS['plugins']}/plugins/{name}/disable", timeout=5.0
+            )
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except Exception as e:
+            raise HTTPException(status_code=503, detail="Plugin registry unavailable")
 
 
 if __name__ == "__main__":
