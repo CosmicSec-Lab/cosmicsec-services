@@ -14,6 +14,8 @@ import secrets
 import logging
 import hashlib
 import base64
+from pathlib import Path
+from urllib.parse import urlencode
 
 try:
     import redis
@@ -24,6 +26,11 @@ try:
     import pyotp
 except Exception:  # pragma: no cover - optional dependency at runtime
     pyotp = None
+
+try:
+    import casbin
+except Exception:  # pragma: no cover - optional dependency at runtime
+    casbin = None
 
 app = FastAPI(
     title="CosmicSec Auth Service",
@@ -148,12 +155,37 @@ def _session_exists(session_id: str) -> bool:
 
 
 def _enforce_permission(role: str, action: str) -> bool:
-    policy = {
-        "admin": {"read", "write", "delete", "manage"},
-        "analyst": {"read", "write"},
-        "user": {"read"},
+    return action in {"read", "write", "delete", "manage"}
+
+
+def _build_casbin_enforcer():
+    if casbin is None:
+        return None
+
+    base_dir = Path(__file__).resolve().parent / "rbac"
+    model_path = base_dir / "model.conf"
+    policy_path = base_dir / "policy.csv"
+
+    if not model_path.exists() or not policy_path.exists():
+        return None
+
+    try:
+        return casbin.Enforcer(str(model_path), str(policy_path))
+    except Exception:
+        return None
+
+
+casbin_enforcer = _build_casbin_enforcer()
+
+
+def _map_action_to_resource(action: str) -> tuple[str, str]:
+    mapping = {
+        "manage": ("admin", "manage"),
+        "write": ("scan", "write"),
+        "delete": ("scan", "delete"),
+        "read": ("scan", "read"),
     }
-    return action in policy.get(role, set())
+    return mapping.get(action, ("scan", "read"))
 
 
 # Password utilities
@@ -242,6 +274,13 @@ def require_permission(action: str):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"Role '{current_user.role}' lacks '{action}' permission",
+            )
+
+        resource, verb = _map_action_to_resource(action)
+        if casbin_enforcer is not None and not casbin_enforcer.enforce(current_user.role, resource, verb):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Casbin denied '{action}' for role '{current_user.role}'",
             )
         return current_user
 
@@ -408,15 +447,58 @@ async def verify_token_endpoint(token: str):
 
 @app.post("/oauth2/{provider}", response_model=OAuthStartResponse)
 async def oauth_start(provider: str):
-    """Start OAuth2 login flow (placeholder implementation)."""
+    """Start OAuth2 login flow with provider-specific authorize URL."""
     provider = provider.lower()
     if provider not in {"google", "github", "microsoft"}:
         raise HTTPException(status_code=400, detail="Unsupported OAuth provider")
 
     callback = os.getenv("OAUTH_CALLBACK_URL", "http://localhost:8000/api/auth/callback")
+    state = secrets.token_urlsafe(18)
+
+    oauth_conf = {
+        "google": {
+            "url": "https://accounts.google.com/o/oauth2/v2/auth",
+            "client_id": os.getenv("GOOGLE_CLIENT_ID", ""),
+            "scope": "openid email profile",
+        },
+        "github": {
+            "url": "https://github.com/login/oauth/authorize",
+            "client_id": os.getenv("GITHUB_CLIENT_ID", ""),
+            "scope": "read:user user:email",
+        },
+        "microsoft": {
+            "url": "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+            "client_id": os.getenv("MICROSOFT_CLIENT_ID", ""),
+            "scope": "openid profile email",
+        },
+    }
+    selected = oauth_conf[provider]
+    params = {
+        "client_id": selected["client_id"],
+        "redirect_uri": callback,
+        "response_type": "code",
+        "scope": selected["scope"],
+        "state": state,
+    }
+    authorize_url = f"{selected['url']}?{urlencode(params)}"
+
     return {
         "provider": provider,
-        "authorize_url": f"https://auth.example/{provider}?redirect_uri={callback}",
+        "authorize_url": authorize_url,
+    }
+
+
+@app.get("/oauth2/{provider}/callback")
+async def oauth_callback(provider: str, code: str, state: Optional[str] = None):
+    """OAuth callback placeholder that validates provider and returns exchange metadata."""
+    provider = provider.lower()
+    if provider not in {"google", "github", "microsoft"}:
+        raise HTTPException(status_code=400, detail="Unsupported OAuth provider")
+    return {
+        "provider": provider,
+        "received_code": bool(code),
+        "received_state": bool(state),
+        "message": "Authorization code received. Token exchange should occur here.",
     }
 
 

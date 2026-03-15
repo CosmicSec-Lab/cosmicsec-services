@@ -1,0 +1,10 @@
+p, admin, *, *
+p, analyst, scan, read
+p, analyst, scan, write
+p, analyst, report, read
+p, user, scan, read
+p, user, report, read
+
+g, admin, admin
+g, analyst, analyst
+g, user, user
