@@ -101,25 +101,25 @@ class ScanStateUpdate(BaseModel):
     updated_by: str = Field(..., description="Username who triggered the update")
 
 
-    class ReportSection(BaseModel):
-        section_id: Optional[str] = Field(default=None)
-        title: str = Field(..., description="Section heading")
-        content: str = Field(..., description="Markdown content for this section")
-        author: str = Field(..., description="Username of the author")
-        section_type: str = Field(
-            default="finding",
-            description="executive_summary | finding | recommendation | appendix",
-        )
+class ReportSection(BaseModel):
+    section_id: Optional[str] = Field(default=None)
+    title: str = Field(..., description="Section heading")
+    content: str = Field(..., description="Markdown content for this section")
+    author: str = Field(..., description="Username of the author")
+    section_type: str = Field(
+        default="finding",
+        description="executive_summary | finding | recommendation | appendix",
+    )
 
 
-    class ReportSectionUpdate(BaseModel):
-        title: Optional[str] = Field(default=None)
-        content: Optional[str] = Field(default=None)
-        editor: str = Field(..., description="Username making this edit")
+class ReportSectionUpdate(BaseModel):
+    title: Optional[str] = Field(default=None)
+    content: Optional[str] = Field(default=None)
+    editor: str = Field(..., description="Username making this edit")
 
 
-    # Per-room report sections: _report_store[room_id][section_id] = section_dict
-    _report_store: Dict[str, Dict[str, Dict[str, Any]]] = defaultdict(dict)
+# Per-room report sections: _report_store[room_id][section_id] = section_dict
+_report_store: Dict[str, Dict[str, Dict[str, Any]]] = defaultdict(dict)
 
 
 # ---------------------------------------------------------------------------
@@ -317,136 +317,132 @@ async def activity_feed(limit: int = 20) -> dict:
     }
 
 
-    # ==========================================================================
-    # Phase 2 — Collaborative Report Editing
-    # ==========================================================================
+# ==========================================================================
+# Phase 2 — Collaborative Report Editing
+# ==========================================================================
 
-    @app.post("/rooms/{room_id}/reports", status_code=201)
-    async def create_report_section(room_id: str, payload: ReportSection) -> dict:
-        """
-        Create a new collaborative report section in this room.
-        Broadcasts a 'report_update' event to all connected WebSocket clients.
-        """
-        section_id = payload.section_id or uuid.uuid4().hex
-        now = datetime.utcnow().isoformat()
-        section: Dict[str, Any] = {
-            "section_id": section_id,
-            "room_id": room_id,
-            "title": payload.title,
-            "content": payload.content,
-            "author": payload.author,
-            "section_type": payload.section_type,
-            "created_at": now,
-            "updated_at": now,
-            "revision": 1,
-            "edit_history": [],
-        }
-        _report_store[room_id][section_id] = section
+@app.post("/rooms/{room_id}/reports", status_code=201)
+async def create_report_section(room_id: str, payload: ReportSection) -> dict:
+    """
+    Create a new collaborative report section in this room.
+    Broadcasts a 'report_update' event to all connected WebSocket clients.
+    """
+    section_id = payload.section_id or uuid.uuid4().hex
+    now = datetime.utcnow().isoformat()
+    section: Dict[str, Any] = {
+        "section_id": section_id,
+        "room_id": room_id,
+        "title": payload.title,
+        "content": payload.content,
+        "author": payload.author,
+        "section_type": payload.section_type,
+        "created_at": now,
+        "updated_at": now,
+        "revision": 1,
+        "edit_history": [],
+    }
+    _report_store[room_id][section_id] = section
 
-        room = _get_or_create_room(room_id)
-        await room.broadcast({
-            "type": "report_update",
-            "action": "created",
-            "room": room_id,
-            "section_id": section_id,
-            "title": payload.title,
-            "author": payload.author,
-            "ts": now,
-        })
-        return section
-
-
-    @app.get("/rooms/{room_id}/reports")
-    async def list_report_sections(room_id: str, section_type: Optional[str] = None) -> dict:
-        """List all collaborative report sections for this room."""
-        sections = list(_report_store[room_id].values())
-        if section_type:
-            sections = [s for s in sections if s.get("section_type") == section_type]
-        sections.sort(key=lambda s: s.get("created_at", ""))
-        return {"room_id": room_id, "sections": sections, "total": len(sections)}
+    room = _get_or_create_room(room_id)
+    await room.broadcast({
+        "type": "report_update",
+        "action": "created",
+        "room": room_id,
+        "section_id": section_id,
+        "title": payload.title,
+        "author": payload.author,
+        "ts": now,
+    })
+    return section
 
 
-    @app.get("/rooms/{room_id}/reports/{section_id}")
-    async def get_report_section(room_id: str, section_id: str) -> dict:
-        """Fetch a single report section by ID."""
-        from fastapi import HTTPException as _HTTPException
-        section = _report_store[room_id].get(section_id)
-        if section is None:
-            raise _HTTPException(status_code=404, detail="Section not found")
-        return section
+@app.get("/rooms/{room_id}/reports")
+async def list_report_sections(room_id: str, section_type: Optional[str] = None) -> dict:
+    """List all collaborative report sections for this room."""
+    sections = list(_report_store[room_id].values())
+    if section_type:
+        sections = [s for s in sections if s.get("section_type") == section_type]
+    sections.sort(key=lambda s: s.get("created_at", ""))
+    return {"room_id": room_id, "sections": sections, "total": len(sections)}
 
 
-    @app.put("/rooms/{room_id}/reports/{section_id}")
-    async def update_report_section(room_id: str, section_id: str, payload: ReportSectionUpdate) -> dict:
-        """
-        Update an existing report section (collaborative edit).
-        Saves a snapshot to edit_history and broadcasts a 'report_update' event.
-        """
-        from fastapi import HTTPException as _HTTPException
-        section = _report_store[room_id].get(section_id)
-        if section is None:
-            raise _HTTPException(status_code=404, detail="Section not found")
-
-        now = datetime.utcnow().isoformat()
-        section["edit_history"].append({
-            "revision": section["revision"],
-            "title": section["title"],
-            "content": section["content"],
-            "updated_at": section["updated_at"],
-            "editor": payload.editor,
-        })
-        # Keep last 20 revisions in memory
-        section["edit_history"] = section["edit_history"][-20:]
-
-        if payload.title is not None:
-            section["title"] = payload.title
-        if payload.content is not None:
-            section["content"] = payload.content
-        section["updated_at"] = now
-        section["revision"] += 1
-
-        room = _get_or_create_room(room_id)
-        await room.broadcast({
-            "type": "report_update",
-            "action": "edited",
-            "room": room_id,
-            "section_id": section_id,
-            "title": section["title"],
-            "editor": payload.editor,
-            "revision": section["revision"],
-            "ts": now,
-        })
-        return section
+@app.get("/rooms/{room_id}/reports/{section_id}")
+async def get_report_section(room_id: str, section_id: str) -> dict:
+    """Fetch a single report section by ID."""
+    section = _report_store[room_id].get(section_id)
+    if section is None:
+        raise HTTPException(status_code=404, detail="Section not found")
+    return section
 
 
-    @app.delete("/rooms/{room_id}/reports/{section_id}")
-    async def delete_report_section(room_id: str, section_id: str, editor: str = "api") -> dict:
-        """Delete a report section and notify room members."""
-        from fastapi import HTTPException as _HTTPException
-        if _report_store[room_id].pop(section_id, None) is None:
-            raise _HTTPException(status_code=404, detail="Section not found")
+@app.put("/rooms/{room_id}/reports/{section_id}")
+async def update_report_section(room_id: str, section_id: str, payload: ReportSectionUpdate) -> dict:
+    """
+    Update an existing report section (collaborative edit).
+    Saves a snapshot to edit_history and broadcasts a 'report_update' event.
+    """
+    section = _report_store[room_id].get(section_id)
+    if section is None:
+        raise HTTPException(status_code=404, detail="Section not found")
 
-        room = _get_or_create_room(room_id)
-        await room.broadcast({
-            "type": "report_update",
-            "action": "deleted",
-            "room": room_id,
-            "section_id": section_id,
-            "editor": editor,
-            "ts": datetime.utcnow().isoformat(),
-        })
-        return {"status": "deleted", "section_id": section_id}
+    now = datetime.utcnow().isoformat()
+    section["edit_history"].append({
+        "revision": section["revision"],
+        "title": section["title"],
+        "content": section["content"],
+        "updated_at": section["updated_at"],
+        "editor": payload.editor,
+    })
+    # Keep last 20 revisions in memory
+    section["edit_history"] = section["edit_history"][-20:]
+
+    if payload.title is not None:
+        section["title"] = payload.title
+    if payload.content is not None:
+        section["content"] = payload.content
+    section["updated_at"] = now
+    section["revision"] += 1
+
+    room = _get_or_create_room(room_id)
+    await room.broadcast({
+        "type": "report_update",
+        "action": "edited",
+        "room": room_id,
+        "section_id": section_id,
+        "title": section["title"],
+        "editor": payload.editor,
+        "revision": section["revision"],
+        "ts": now,
+    })
+    return section
 
 
-    @app.get("/rooms/{room_id}/reports/{section_id}/history")
-    async def get_section_history(room_id: str, section_id: str) -> dict:
-        """Return the full edit history for a report section."""
-        from fastapi import HTTPException as _HTTPException
-        section = _report_store[room_id].get(section_id)
-        if section is None:
-            raise _HTTPException(status_code=404, detail="Section not found")
-        return {
-            "section_id": section_id,
-            "current_revision": section["revision"],
-            "history": section["edit_history"],
-        }
+@app.delete("/rooms/{room_id}/reports/{section_id}")
+async def delete_report_section(room_id: str, section_id: str, editor: str = "api") -> dict:
+    """Delete a report section and notify room members."""
+    if _report_store[room_id].pop(section_id, None) is None:
+        raise HTTPException(status_code=404, detail="Section not found")
+
+    room = _get_or_create_room(room_id)
+    await room.broadcast({
+        "type": "report_update",
+        "action": "deleted",
+        "room": room_id,
+        "section_id": section_id,
+        "editor": editor,
+        "ts": datetime.utcnow().isoformat(),
+    })
+    return {"status": "deleted", "section_id": section_id}
+
+
+@app.get("/rooms/{room_id}/reports/{section_id}/history")
+async def get_section_history(room_id: str, section_id: str) -> dict:
+    """Return the full edit history for a report section."""
+    section = _report_store[room_id].get(section_id)
+    if section is None:
+        raise HTTPException(status_code=404, detail="Section not found")
+    return {
+        "section_id": section_id,
+        "current_revision": section["revision"],
+        "history": section["edit_history"],
+    }

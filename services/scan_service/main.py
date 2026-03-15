@@ -28,10 +28,12 @@ from .continuous_monitor import ContinuousMonitor
 from .api_fuzzer import APIFuzzer
 from .container_scanner import scan_container_artifact
 from .smart_scanner import smart_scan
+from .distributed_scanner import DistributedScanCoordinator
 
 
 # Module-level monitor singleton — started on app startup
 _monitor = ContinuousMonitor()
+_distributed = DistributedScanCoordinator()
 
 
 @asynccontextmanager
@@ -390,6 +392,217 @@ async def scan_websocket(websocket: WebSocket, scan_id: str):
             await websocket.receive_text()
     except WebSocketDisconnect:
         ws_manager.disconnect(scan_id, websocket)
+
+
+# ===========================================================================
+# Active Phase 2 endpoints (top-level)
+# ===========================================================================
+
+class ScheduleMonitorRequest(BaseModel):
+    target: str = Field(..., description="Target URL, IP, or domain to monitor")
+    scan_types: List[ScanType] = Field(default=[ScanType.WEB], description="Scan types to run on each cycle")
+    interval_seconds: int = Field(default=3600, ge=60, description="Seconds between scan runs (min 60)")
+    created_by: str = Field(default="api", description="Requesting user identifier")
+    alert_on_new_critical: bool = Field(default=True, description="Emit alert when new critical findings appear")
+
+
+class FuzzRequest(BaseModel):
+    base_url: str = Field(..., description="API base URL to fuzz")
+    openapi_spec: Optional[Dict[str, Any]] = Field(default=None, description="Optional OpenAPI 3.x spec dict")
+    attack_types: Optional[List[str]] = Field(
+        default=None,
+        description="Attack categories: sqli, xss, path_traversal, cmd_injection, ssrf, ssti, auth_bypass",
+    )
+    max_requests: int = Field(default=150, ge=10, le=500, description="Maximum HTTP requests to send")
+    timeout: int = Field(default=8, ge=2, le=30, description="Per-request timeout seconds")
+
+
+class ContainerScanRequest(BaseModel):
+    artifact_type: str = Field(..., description="Type of artifact: 'dockerfile' or 'kubernetes'")
+    content: str = Field(..., description="Raw text content of the Dockerfile or Kubernetes YAML manifest")
+
+
+class SmartScanRequest(BaseModel):
+    url: str = Field(..., description="Target URL to fingerprint and plan")
+    previously_run: Optional[List[str]] = Field(default=None, description="Scan types already executed")
+
+
+class CloudScanRequest(BaseModel):
+    provider: str = Field(..., description="Cloud provider: aws | azure | gcp | k8s")
+    region: Optional[str] = Field(default=None, description="Target region / cluster")
+    resource_types: Optional[List[str]] = Field(default=None, description="Resource types to scan")
+    credentials_hint: Optional[str] = Field(default=None, description="Credential profile name (no secrets)")
+
+
+class RegisterNodeRequest(BaseModel):
+    node_id: str
+    region: str
+    capacity: int = Field(default=4, ge=1, le=128)
+    tags: List[str] = Field(default_factory=list)
+
+
+class NodeHeartbeatRequest(BaseModel):
+    healthy: bool = True
+    active_jobs: Optional[int] = Field(default=None, ge=0)
+
+
+class DistributedAssignRequest(BaseModel):
+    target: str
+    replicas: int = Field(default=1, ge=1, le=10)
+    region_hint: Optional[str] = None
+    required_tags: List[str] = Field(default_factory=list)
+
+
+_CLOUD_FINDINGS: Dict[str, List[Dict[str, Any]]] = {
+    "aws": [
+        {"title": "S3 bucket with public ACL", "severity": "critical", "category": "cloud", "description": "One or more S3 buckets allow unauthenticated public access.", "recommendation": "Enable S3 Block Public Access at account level."},
+        {"title": "IAM wildcard policy attached", "severity": "high", "category": "cloud", "description": "IAM policy contains Action:* or Resource:* granting over-privilege.", "recommendation": "Replace wildcards with least-privilege policy statements."},
+    ],
+    "azure": [
+        {"title": "Azure AD legacy authentication enabled", "severity": "high", "category": "cloud", "description": "Legacy authentication protocols can bypass MFA policies.", "recommendation": "Block legacy auth via Conditional Access."},
+        {"title": "Storage account allows HTTP traffic", "severity": "medium", "category": "cloud", "description": "Storage account accepts unencrypted HTTP connections.", "recommendation": "Enforce HTTPS-only in storage account settings."},
+    ],
+    "gcp": [
+        {"title": "GCS bucket with allUsers permission", "severity": "critical", "category": "cloud", "description": "GCS bucket grants allUsers public access.", "recommendation": "Remove allUsers bindings and enable uniform bucket-level access."},
+    ],
+    "k8s": [
+        {"title": "Kubernetes API server publicly accessible", "severity": "critical", "category": "cloud", "description": "K8s API endpoint is reachable from internet.", "recommendation": "Restrict API access to private networks and trusted IPs."},
+    ],
+}
+
+
+@app.post("/monitor/schedule", status_code=201)
+async def schedule_monitoring(payload: ScheduleMonitorRequest) -> dict:
+    job_id = await _monitor.schedule(
+        target=payload.target,
+        scan_types=[t.value for t in payload.scan_types],
+        interval_seconds=payload.interval_seconds,
+        created_by=payload.created_by,
+        alert_on_new_critical=payload.alert_on_new_critical,
+    )
+    return {"job_id": job_id, "status": "scheduled", "target": payload.target}
+
+
+@app.get("/monitor/jobs")
+async def list_monitor_jobs() -> dict:
+    return {"jobs": _monitor.list_jobs(), "active_count": _monitor.active_job_count}
+
+
+@app.get("/monitor/jobs/{job_id}")
+async def get_monitor_job(job_id: str) -> dict:
+    job = _monitor.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Monitor job not found")
+    return job
+
+
+@app.post("/monitor/jobs/{job_id}/pause")
+async def pause_monitor_job(job_id: str) -> dict:
+    if not _monitor.pause(job_id):
+        raise HTTPException(status_code=404, detail="Monitor job not found")
+    return {"job_id": job_id, "status": "paused"}
+
+
+@app.post("/monitor/jobs/{job_id}/resume")
+async def resume_monitor_job(job_id: str) -> dict:
+    if not _monitor.resume(job_id):
+        raise HTTPException(status_code=404, detail="Monitor job not found")
+    return {"job_id": job_id, "status": "active"}
+
+
+@app.delete("/monitor/jobs/{job_id}")
+async def cancel_monitor_job(job_id: str) -> dict:
+    if not _monitor.cancel(job_id):
+        raise HTTPException(status_code=404, detail="Monitor job not found")
+    return {"job_id": job_id, "status": "cancelled"}
+
+
+@app.post("/scans/fuzz")
+async def fuzz_api(payload: FuzzRequest) -> dict:
+    fuzzer = APIFuzzer(timeout=payload.timeout, max_requests=payload.max_requests)
+    return await fuzzer.fuzz(
+        base_url=payload.base_url,
+        openapi_spec=payload.openapi_spec,
+        attack_types=payload.attack_types,
+    )
+
+
+@app.post("/scans/container")
+async def scan_container(payload: ContainerScanRequest) -> dict:
+    return scan_container_artifact(payload.artifact_type, payload.content)
+
+
+@app.post("/scans/smart-plan")
+async def smart_scan_plan(payload: SmartScanRequest) -> dict:
+    return await smart_scan(payload.url, previously_run=payload.previously_run)
+
+
+@app.post("/scans/cloud")
+async def cloud_scan(payload: CloudScanRequest) -> dict:
+    provider = payload.provider.lower()
+    findings = _CLOUD_FINDINGS.get(provider, [])
+    stamped = []
+    for f in findings:
+        item = dict(f)
+        item["id"] = secrets.token_urlsafe(8)
+        item["detected_at"] = datetime.utcnow().isoformat()
+        stamped.append(item)
+
+    severity_breakdown: Dict[str, int] = {}
+    for f in stamped:
+        s = f.get("severity", "info")
+        severity_breakdown[s] = severity_breakdown.get(s, 0) + 1
+
+    return {
+        "provider": provider,
+        "region": payload.region,
+        "findings": stamped,
+        "findings_count": len(stamped),
+        "severity_breakdown": severity_breakdown,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
+
+@app.post("/distributed/nodes/register", status_code=201)
+async def register_node(payload: RegisterNodeRequest) -> dict:
+    node = _distributed.register_node(
+        node_id=payload.node_id,
+        region=payload.region,
+        capacity=payload.capacity,
+        tags=payload.tags,
+    )
+    return {"status": "registered", "node": node}
+
+
+@app.get("/distributed/nodes")
+async def list_nodes() -> dict:
+    return {"nodes": _distributed.list_nodes(), "total": len(_distributed.list_nodes())}
+
+
+@app.post("/distributed/nodes/{node_id}/heartbeat")
+async def node_heartbeat(node_id: str, payload: NodeHeartbeatRequest) -> dict:
+    node = _distributed.heartbeat(node_id, healthy=payload.healthy, active_jobs=payload.active_jobs)
+    if node is None:
+        raise HTTPException(status_code=404, detail="Node not found")
+    return {"status": "updated", "node": node}
+
+
+@app.post("/distributed/assign")
+async def distributed_assign(payload: DistributedAssignRequest) -> dict:
+    return _distributed.assign_target(
+        target=payload.target,
+        replicas=payload.replicas,
+        region_hint=payload.region_hint,
+        required_tags=payload.required_tags,
+    )
+
+
+@app.post("/distributed/nodes/{node_id}/complete")
+async def distributed_complete(node_id: str) -> dict:
+    ok = _distributed.complete_assignment(node_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Node not found")
+    return {"status": "completed", "node_id": node_id}
 
 
 if __name__ == "__main__":

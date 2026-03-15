@@ -8,7 +8,7 @@ from pydantic import BaseModel, EmailStr, Field
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, Dict, List
 import os
 import secrets
 import logging
@@ -141,6 +141,35 @@ class MFAChallengeVerifyRequest(BaseModel):
     code: str
 
 
+# ---------------------------------------------------------------------------
+# Phase 3.1 — Multi-tenancy models
+# ---------------------------------------------------------------------------
+
+class OrganizationCreate(BaseModel):
+    name: str
+    slug: str = Field(..., min_length=3)
+    owner_email: EmailStr
+    plan: str = "team"  # free | team | enterprise
+    branding: Dict[str, str] = Field(default_factory=dict)
+
+
+class WorkspaceCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    quota_scans_per_day: int = Field(default=100, ge=1, le=100000)
+
+
+class OrganizationMemberAssign(BaseModel):
+    email: EmailStr
+    role: str = "member"  # owner | admin | member
+
+
+class TenantQuotaUpdate(BaseModel):
+    max_users: Optional[int] = Field(default=None, ge=1, le=100000)
+    max_workspaces: Optional[int] = Field(default=None, ge=1, le=100000)
+    max_scans_per_day: Optional[int] = Field(default=None, ge=1, le=1000000)
+
+
 # In-memory user storage (replace with database in production)
 fake_users_db = {}
 fake_api_keys_db = {}
@@ -154,6 +183,12 @@ platform_config = {
 }
 hardware_keys_db = {}
 sms_challenges_db = {}
+
+# Multi-tenant state (in-memory; DB in production)
+organizations_db: Dict[str, Dict] = {}
+org_memberships: Dict[str, Dict[str, str]] = {}  # org_id -> {email: role}
+workspaces_db: Dict[str, List[Dict]] = {}  # org_id -> workspace list
+tenant_quotas: Dict[str, Dict[str, int]] = {}  # org_id -> quotas
 
 redis_client = None
 if redis is not None:
@@ -185,6 +220,24 @@ def _audit(action: str, actor: str, detail: str) -> None:
             "detail": detail,
         }
     )
+
+
+def _audit_org(action: str, actor: str, org_id: str, detail: str) -> None:
+    _audit(action, actor, f"org={org_id}; {detail}")
+
+
+def _require_org_admin(org_id: str, email: str) -> None:
+    members = org_memberships.get(org_id, {})
+    role = members.get(email)
+    if role not in {"owner", "admin"}:
+        raise HTTPException(status_code=403, detail="Organization admin permission required")
+
+
+def _ensure_org_exists(org_id: str) -> Dict:
+    org = organizations_db.get(org_id)
+    if org is None:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    return org
 
 
 def _delete_session(session_id: str) -> None:
@@ -780,6 +833,133 @@ async def mfa_verify(payload: MFAChallengeVerifyRequest):
             return {"verified": payload.code == "000000"}
         return {"verified": pyotp.TOTP(secret).verify(payload.code)}
     raise HTTPException(status_code=400, detail="Unsupported MFA method")
+
+
+# ---------------------------------------------------------------------------
+# Phase 3.1 — Multi-tenancy endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/orgs", status_code=201)
+async def create_organization(payload: OrganizationCreate, current_user: User = Depends(require_permission("manage"))):
+    org_id = secrets.token_urlsafe(10)
+    if any(org.get("slug") == payload.slug for org in organizations_db.values()):
+        raise HTTPException(status_code=409, detail="Organization slug already exists")
+
+    org = {
+        "org_id": org_id,
+        "name": payload.name,
+        "slug": payload.slug,
+        "plan": payload.plan,
+        "branding": payload.branding,
+        "created_at": datetime.utcnow().isoformat(),
+        "created_by": current_user.email,
+    }
+    organizations_db[org_id] = org
+    org_memberships[org_id] = {payload.owner_email: "owner"}
+    workspaces_db[org_id] = []
+    tenant_quotas[org_id] = {
+        "max_users": 25 if payload.plan == "team" else 1000,
+        "max_workspaces": 10 if payload.plan == "team" else 200,
+        "max_scans_per_day": 1000 if payload.plan == "team" else 50000,
+    }
+    _audit_org("org.create", current_user.email, org_id, f"name={payload.name}")
+    return org
+
+
+@app.get("/orgs")
+async def list_organizations(current_user: User = Depends(require_permission("manage"))):
+    visible = []
+    for org_id, org in organizations_db.items():
+        role = org_memberships.get(org_id, {}).get(current_user.email)
+        if current_user.role in {"admin", "superadmin"} or role:
+            visible.append({
+                **org,
+                "member_role": role,
+                "member_count": len(org_memberships.get(org_id, {})),
+                "workspace_count": len(workspaces_db.get(org_id, [])),
+            })
+    return {"items": visible, "total": len(visible)}
+
+
+@app.post("/orgs/{org_id}/members")
+async def add_org_member(org_id: str, payload: OrganizationMemberAssign, current_user: User = Depends(require_permission("manage"))):
+    _ensure_org_exists(org_id)
+    _require_org_admin(org_id, current_user.email)
+    if payload.email not in fake_users_db:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    quotas = tenant_quotas.get(org_id, {})
+    current_members = org_memberships.setdefault(org_id, {})
+    if payload.email not in current_members and len(current_members) >= quotas.get("max_users", 1000):
+        raise HTTPException(status_code=400, detail="Tenant user quota exceeded")
+
+    current_members[payload.email] = payload.role
+    _audit_org("org.member.add", current_user.email, org_id, f"{payload.email}:{payload.role}")
+    return {"org_id": org_id, "email": payload.email, "role": payload.role}
+
+
+@app.get("/orgs/{org_id}/members")
+async def list_org_members(org_id: str, current_user: User = Depends(require_permission("manage"))):
+    _ensure_org_exists(org_id)
+    _require_org_admin(org_id, current_user.email)
+    members = org_memberships.get(org_id, {})
+    return {
+        "org_id": org_id,
+        "members": [{"email": email, "role": role} for email, role in members.items()],
+        "total": len(members),
+    }
+
+
+@app.post("/orgs/{org_id}/workspaces", status_code=201)
+async def create_workspace(org_id: str, payload: WorkspaceCreate, current_user: User = Depends(require_permission("manage"))):
+    _ensure_org_exists(org_id)
+    _require_org_admin(org_id, current_user.email)
+    quota = tenant_quotas.get(org_id, {})
+    current = workspaces_db.setdefault(org_id, [])
+    if len(current) >= quota.get("max_workspaces", 99999):
+        raise HTTPException(status_code=400, detail="Tenant workspace quota exceeded")
+
+    ws = {
+        "workspace_id": secrets.token_urlsafe(10),
+        "name": payload.name,
+        "description": payload.description,
+        "quota_scans_per_day": payload.quota_scans_per_day,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+    current.append(ws)
+    _audit_org("workspace.create", current_user.email, org_id, f"workspace={payload.name}")
+    return {"org_id": org_id, "workspace": ws}
+
+
+@app.get("/orgs/{org_id}/workspaces")
+async def list_workspaces(org_id: str, current_user: User = Depends(require_permission("read"))):
+    _ensure_org_exists(org_id)
+    if current_user.role not in {"admin", "superadmin"} and current_user.email not in org_memberships.get(org_id, {}):
+        raise HTTPException(status_code=403, detail="Not a member of this organization")
+    items = workspaces_db.get(org_id, [])
+    return {"org_id": org_id, "items": items, "total": len(items)}
+
+
+@app.get("/orgs/{org_id}/quotas")
+async def get_org_quotas(org_id: str, current_user: User = Depends(require_permission("manage"))):
+    _ensure_org_exists(org_id)
+    _require_org_admin(org_id, current_user.email)
+    return {"org_id": org_id, "quotas": tenant_quotas.get(org_id, {})}
+
+
+@app.post("/orgs/{org_id}/quotas")
+async def set_org_quotas(org_id: str, payload: TenantQuotaUpdate, current_user: User = Depends(require_permission("manage"))):
+    _ensure_org_exists(org_id)
+    _require_org_admin(org_id, current_user.email)
+    quotas = tenant_quotas.setdefault(org_id, {"max_users": 1000, "max_workspaces": 1000, "max_scans_per_day": 100000})
+    if payload.max_users is not None:
+        quotas["max_users"] = payload.max_users
+    if payload.max_workspaces is not None:
+        quotas["max_workspaces"] = payload.max_workspaces
+    if payload.max_scans_per_day is not None:
+        quotas["max_scans_per_day"] = payload.max_scans_per_day
+    _audit_org("org.quota.update", current_user.email, org_id, str(quotas))
+    return {"org_id": org_id, "quotas": quotas}
 
 
 if __name__ == "__main__":

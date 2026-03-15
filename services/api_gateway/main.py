@@ -524,6 +524,78 @@ async def admin_get_audit_logs(request: Request):
         return JSONResponse(status_code=response.status_code, content=response.json())
 
 
+# ---------------------------------------------------------------------------
+# Phase 3.1 — Multi-tenant org/workspace routes
+# ---------------------------------------------------------------------------
+
+@app.post("/api/orgs")
+@limiter.limit("20/minute")
+async def create_org(request: Request):
+    payload = await request.json()
+    async with httpx.AsyncClient() as client:
+        response = await client.post(f"{SERVICE_URLS['auth']}/orgs", json=payload, timeout=10.0)
+        return JSONResponse(status_code=response.status_code, content=response.json())
+
+
+@app.get("/api/orgs")
+@limiter.limit("60/minute")
+async def list_orgs(request: Request):
+    async with httpx.AsyncClient() as client:
+        response = await client.get(f"{SERVICE_URLS['auth']}/orgs", timeout=10.0)
+        return JSONResponse(status_code=response.status_code, content=response.json())
+
+
+@app.post("/api/orgs/{org_id}/members")
+@limiter.limit("30/minute")
+async def add_org_member(request: Request, org_id: str):
+    payload = await request.json()
+    async with httpx.AsyncClient() as client:
+        response = await client.post(f"{SERVICE_URLS['auth']}/orgs/{org_id}/members", json=payload, timeout=10.0)
+        return JSONResponse(status_code=response.status_code, content=response.json())
+
+
+@app.get("/api/orgs/{org_id}/members")
+@limiter.limit("60/minute")
+async def list_org_members(request: Request, org_id: str):
+    async with httpx.AsyncClient() as client:
+        response = await client.get(f"{SERVICE_URLS['auth']}/orgs/{org_id}/members", timeout=10.0)
+        return JSONResponse(status_code=response.status_code, content=response.json())
+
+
+@app.post("/api/orgs/{org_id}/workspaces")
+@limiter.limit("30/minute")
+async def create_workspace(request: Request, org_id: str):
+    payload = await request.json()
+    async with httpx.AsyncClient() as client:
+        response = await client.post(f"{SERVICE_URLS['auth']}/orgs/{org_id}/workspaces", json=payload, timeout=10.0)
+        return JSONResponse(status_code=response.status_code, content=response.json())
+
+
+@app.get("/api/orgs/{org_id}/workspaces")
+@limiter.limit("60/minute")
+async def list_workspaces(request: Request, org_id: str):
+    async with httpx.AsyncClient() as client:
+        response = await client.get(f"{SERVICE_URLS['auth']}/orgs/{org_id}/workspaces", timeout=10.0)
+        return JSONResponse(status_code=response.status_code, content=response.json())
+
+
+@app.get("/api/orgs/{org_id}/quotas")
+@limiter.limit("60/minute")
+async def get_org_quotas(request: Request, org_id: str):
+    async with httpx.AsyncClient() as client:
+        response = await client.get(f"{SERVICE_URLS['auth']}/orgs/{org_id}/quotas", timeout=10.0)
+        return JSONResponse(status_code=response.status_code, content=response.json())
+
+
+@app.post("/api/orgs/{org_id}/quotas")
+@limiter.limit("20/minute")
+async def set_org_quotas(request: Request, org_id: str):
+    payload = await request.json()
+    async with httpx.AsyncClient() as client:
+        response = await client.post(f"{SERVICE_URLS['auth']}/orgs/{org_id}/quotas", json=payload, timeout=10.0)
+        return JSONResponse(status_code=response.status_code, content=response.json())
+
+
 @app.websocket("/ws/dashboard")
 async def dashboard_stream(websocket: WebSocket):
     await websocket.accept()
@@ -821,6 +893,73 @@ async def scans_cloud(request: Request):
             raise HTTPException(status_code=503, detail="Scan service unavailable")
 
 
+# Distributed scanning --------------------------------------------------------
+
+@app.post("/api/scan/distributed/nodes/register")
+@limiter.limit("20/minute")
+async def scan_register_node(request: Request):
+    data = await request.json()
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.post(f"{SERVICE_URLS['scan']}/distributed/nodes/register", json=data, timeout=10.0)
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            raise HTTPException(status_code=503, detail="Scan service unavailable")
+
+
+@app.get("/api/scan/distributed/nodes")
+@limiter.limit("30/minute")
+async def scan_list_nodes(request: Request):
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.get(f"{SERVICE_URLS['scan']}/distributed/nodes", timeout=5.0)
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            raise HTTPException(status_code=503, detail="Scan service unavailable")
+
+
+@app.post("/api/scan/distributed/nodes/{node_id}/heartbeat")
+@limiter.limit("30/minute")
+async def scan_node_heartbeat(request: Request, node_id: str):
+    data = await request.json()
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.post(
+                f"{SERVICE_URLS['scan']}/distributed/nodes/{node_id}/heartbeat",
+                json=data,
+                timeout=5.0,
+            )
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            raise HTTPException(status_code=503, detail="Scan service unavailable")
+
+
+@app.post("/api/scan/distributed/assign")
+@limiter.limit("20/minute")
+async def scan_distributed_assign(request: Request):
+    data = await request.json()
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.post(f"{SERVICE_URLS['scan']}/distributed/assign", json=data, timeout=10.0)
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            raise HTTPException(status_code=503, detail="Scan service unavailable")
+
+
+@app.post("/api/scan/distributed/nodes/{node_id}/complete")
+@limiter.limit("20/minute")
+async def scan_distributed_complete(request: Request, node_id: str):
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.post(
+                f"{SERVICE_URLS['scan']}/distributed/nodes/{node_id}/complete",
+                timeout=5.0,
+            )
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            raise HTTPException(status_code=503, detail="Scan service unavailable")
+
+
 # ==========================================================================
 # Phase 2 — AI service new routes
 # ==========================================================================
@@ -1007,6 +1146,65 @@ async def plugin_rating(request: Request, name: str):
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.get(f"{SERVICE_URLS['plugins']}/plugins/{name}/rating", timeout=5.0)
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            raise HTTPException(status_code=503, detail="Plugin registry unavailable")
+
+
+@app.get("/api/plugins/updates")
+@limiter.limit("30/minute")
+async def plugins_updates(request: Request):
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.get(f"{SERVICE_URLS['plugins']}/plugins/updates", timeout=5.0)
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            raise HTTPException(status_code=503, detail="Plugin registry unavailable")
+
+
+@app.post("/api/plugins/{name}/auto-update")
+@limiter.limit("10/minute")
+async def plugin_auto_update(request: Request, name: str):
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.post(f"{SERVICE_URLS['plugins']}/plugins/{name}/auto-update", timeout=10.0)
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            raise HTTPException(status_code=503, detail="Plugin registry unavailable")
+
+
+@app.get("/api/community/repositories")
+@limiter.limit("30/minute")
+async def community_repositories(request: Request):
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.get(f"{SERVICE_URLS['plugins']}/community/repositories", timeout=5.0)
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            raise HTTPException(status_code=503, detail="Plugin registry unavailable")
+
+
+@app.post("/api/community/repositories")
+@limiter.limit("10/minute")
+async def community_register_repository(request: Request):
+    data = await request.json()
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.post(f"{SERVICE_URLS['plugins']}/community/repositories", json=data, timeout=10.0)
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            raise HTTPException(status_code=503, detail="Plugin registry unavailable")
+
+
+@app.post("/api/community/repositories/{repo_id}/sync")
+@limiter.limit("10/minute")
+async def community_sync_repository(request: Request, repo_id: str):
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.post(
+                f"{SERVICE_URLS['plugins']}/community/repositories/{repo_id}/sync",
+                timeout=20.0,
+            )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
             raise HTTPException(status_code=503, detail="Plugin registry unavailable")
