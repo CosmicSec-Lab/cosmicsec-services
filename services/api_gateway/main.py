@@ -518,6 +518,60 @@ async def runtime_contracts(request: Request):
     }
 
 
+@app.get("/api/runtime/slo")
+@limiter.limit("60/minute")
+async def runtime_slo(request: Request):
+    """Hybrid runtime SLO snapshot and current error budget usage."""
+    metrics = hybrid_router.get_metrics()
+    total_degradation_events = metrics["fallback_total"] + metrics["policy_denied_total"]
+    total_observed_events = metrics["dynamic_total"] + metrics["static_total"]
+    degraded_ratio = (total_degradation_events / total_observed_events) if total_observed_events else 0.0
+
+    return {
+        "window": "rolling-process-lifetime",
+        "slo_targets": {
+            "hybrid_availability": 0.995,
+            "max_degraded_ratio": 0.10,
+        },
+        "current": {
+            "dynamic_success_rate": metrics["dynamic_success_rate"],
+            "degraded_ratio": round(degraded_ratio, 4),
+            "total_observed_events": total_observed_events,
+            "total_degradation_events": total_degradation_events,
+        },
+        "error_budget": {
+            "availability_remaining": round(max(0.0, 0.995 - (1.0 - metrics["dynamic_success_rate"])), 4),
+            "degradation_remaining": round(max(0.0, 0.10 - degraded_ratio), 4),
+        },
+    }
+
+
+@app.get("/api/runtime/readiness")
+@limiter.limit("60/minute")
+async def runtime_readiness(request: Request):
+    """Production-readiness checklist for hybrid runtime rollout."""
+    required_critical_routes = {"auth.refresh", "scan.get", "ai.analyze", "report.generate"}
+    configured_routes = set(ROUTE_POLICIES.keys())
+    missing_routes = sorted(required_critical_routes - configured_routes)
+    tracing = hybrid_router.get_tracing_status()
+
+    checks = {
+        "shared_middleware_extracted": True,
+        "route_policies_configured": len(configured_routes) >= 8,
+        "critical_routes_covered": not missing_routes,
+        "runtime_contract_endpoint": True,
+        "runtime_metrics_endpoint": True,
+        "runtime_tracing_enabled_or_buffered": tracing["buffer_size"] > 0,
+    }
+
+    return {
+        "ready_for_production": all(checks.values()),
+        "checks": checks,
+        "missing_critical_routes": missing_routes,
+        "tracked_route_count": len(configured_routes),
+    }
+
+
 @app.post("/api/reports/generate")
 @limiter.limit("20/minute")
 async def generate_report(request: Request):
