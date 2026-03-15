@@ -153,6 +153,53 @@ def generate_report(payload: ReportRequest) -> dict:
     }
 
 
+class ComplianceReportRequest(BaseModel):
+    scan_id: str
+    standard: str = Field(..., description="Compliance standard: nist | pci | hipaa")
+    findings: List[dict] = Field(default_factory=list)
+    include_summary: bool = Field(default=True)
+
+
+def _compliance_template(standard: str, findings: List[dict]) -> Dict[str, Any]:
+    """Return a basic compliance report structure for a given standard."""
+    standard = standard.lower()
+    if standard == "nist":
+        sections = [
+            {"title": "Access Control", "status": "pending", "notes": "Validate RBAC and session management."},
+            {"title": "Incident Response", "status": "in_progress", "notes": "Document response playbooks."},
+            {"title": "Audit & Accountability", "status": "complete", "notes": "Audit logs are captured with hash chaining."},
+        ]
+    elif standard == "pci":
+        sections = [
+            {"title": "Cardholder Data Protection", "status": "in_progress", "notes": "Encryption in transit and at rest."},
+            {"title": "Vulnerability Management", "status": "in_progress", "notes": "Automated scan schedule enabled."},
+            {"title": "Access Control", "status": "pending", "notes": "MFA required for admin access."},
+        ]
+    else:
+        sections = [
+            {"title": "Risk Assessment", "status": "in_progress", "notes": "Regular assessments scheduled."},
+            {"title": "Media Protection", "status": "pending", "notes": "Data at rest encryption review."},
+            {"title": "Audit Controls", "status": "complete", "notes": "Audit logs are immutable and retained."},
+        ]
+
+    return {
+        "standard": standard,
+        "sections": sections,
+        "findings": findings,
+        "generated_at": datetime.utcnow().isoformat(),
+    }
+
+
+@app.post("/reports/compliance")
+def generate_compliance_report(payload: ComplianceReportRequest) -> dict:
+    report = _compliance_template(payload.standard, payload.findings)
+    return {
+        "scan_id": payload.scan_id,
+        "compliance_report": report,
+        "generated_at": datetime.utcnow().isoformat(),
+    }
+
+
 @app.post("/reports/schedule")
 def schedule_report(payload: ScheduleRequest) -> dict:
     job = {

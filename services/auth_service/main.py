@@ -8,7 +8,7 @@ from pydantic import BaseModel, EmailStr, Field
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 from datetime import datetime, timedelta
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Any
 import os
 import secrets
 import logging
@@ -184,6 +184,67 @@ platform_config = {
 hardware_keys_db = {}
 sms_challenges_db = {}
 
+# Multi-tenant billing and retention (Phase 3)
+tenant_billing: Dict[str, Dict[str, Any]] = {}
+tenant_retention: Dict[str, int] = {}  # days
+
+
+def _hash_audit_entry(entry: Dict[str, Any], previous_hash: Optional[str]) -> str:
+    """Generate a tamper-evident hash chain for audit logs."""
+    import hashlib, json
+
+    payload = {
+        **entry,
+        "previous_hash": previous_hash or "",
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(raw.encode('utf-8')).hexdigest()
+
+
+def _audit_entry(action: str, actor: str, detail: str, org_id: Optional[str] = None) -> None:
+    ts = datetime.utcnow().isoformat()
+    entry = {
+        "timestamp": ts,
+        "action": action,
+        "actor": actor,
+        "detail": detail,
+        "org_id": org_id,
+    }
+    previous_hash = audit_logs[-1].get("hash") if audit_logs else None
+    entry["hash"] = _hash_audit_entry(entry, previous_hash)
+    audit_logs.append(entry)
+
+
+def _cleanup_retention() -> None:
+    """Delete old entries based on tenant retention policies."""
+    now = datetime.utcnow()
+    kept: List[Dict[str, Any]] = []
+    for entry in audit_logs:
+        org = entry.get("org_id")
+        days = tenant_retention.get(org, 30)
+        try:
+            ts = datetime.fromisoformat(entry["timestamp"])
+        except Exception:
+            kept.append(entry)
+            continue
+        if (now - ts).days <= days:
+            kept.append(entry)
+    audit_logs.clear()
+    audit_logs.extend(kept)
+
+
+@app.on_event("startup")
+async def startup_retention_task():
+    """Background cleanup loop for retention policies."""
+    import asyncio
+
+    async def _loop():
+        while True:
+            _cleanup_retention()
+            await asyncio.sleep(86400)  # run daily
+
+    asyncio.create_task(_loop())
+
 # Multi-tenant state (in-memory; DB in production)
 organizations_db: Dict[str, Dict] = {}
 org_memberships: Dict[str, Dict[str, str]] = {}  # org_id -> {email: role}
@@ -212,18 +273,11 @@ def _store_session(session_id: str, email: str, refresh_token: str) -> None:
 
 
 def _audit(action: str, actor: str, detail: str) -> None:
-    audit_logs.append(
-        {
-            "timestamp": datetime.utcnow().isoformat(),
-            "action": action,
-            "actor": actor,
-            "detail": detail,
-        }
-    )
+    _audit_entry(action, actor, detail, org_id=None)
 
 
 def _audit_org(action: str, actor: str, org_id: str, detail: str) -> None:
-    _audit(action, actor, f"org={org_id}; {detail}")
+    _audit_entry(action, actor, f"org={org_id}; {detail}", org_id=org_id)
 
 
 def _require_org_admin(org_id: str, email: str) -> None:
@@ -545,6 +599,53 @@ async def verify_token_endpoint(token: str):
         }
     except HTTPException:
         return {"valid": False}
+
+
+@app.get("/gdpr/export")
+async def gdpr_export(email: EmailStr):
+    """Export GDPR user data for the provided email."""
+    user = fake_users_db.get(email)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Collect all user-related data from this service
+    sessions = [s for s in fake_sessions_db.values() if s.startswith(f"{email}:")]
+    api_keys = [
+        {"key_id": k, **v} for k, v in fake_api_keys_db.items() if v.get("owner") == email
+    ]
+    memberships = [
+        {"org_id": org_id, "role": role}
+        for org_id, members in org_memberships.items()
+        for member_email, role in members.items()
+        if member_email == email
+    ]
+
+    return {
+        "user": user,
+        "sessions": sessions,
+        "api_keys": api_keys,
+        "memberships": memberships,
+        "audit_logs": [a for a in audit_logs if a.get("actor") == email],
+    }
+
+
+@app.delete("/gdpr/delete")
+async def gdpr_delete(email: EmailStr):
+    """Delete all stored PII for a given email (Right to be forgotten)."""
+    if email in fake_users_db:
+        del fake_users_db[email]
+    for key in list(fake_api_keys_db.keys()):
+        if fake_api_keys_db[key].get("owner") == email:
+            del fake_api_keys_db[key]
+    for sid in list(fake_sessions_db.keys()):
+        if fake_sessions_db[sid].startswith(f"{email}:"):
+            del fake_sessions_db[sid]
+    # Remove from org memberships
+    for members in org_memberships.values():
+        members.pop(email, None)
+
+    _audit("gdpr.delete", email, "User requested data erasure")
+    return {"status": "deleted", "email": email}
 
 
 @app.post("/oauth2/{provider}", response_model=OAuthStartResponse)
@@ -960,6 +1061,38 @@ async def set_org_quotas(org_id: str, payload: TenantQuotaUpdate, current_user: 
         quotas["max_scans_per_day"] = payload.max_scans_per_day
     _audit_org("org.quota.update", current_user.email, org_id, str(quotas))
     return {"org_id": org_id, "quotas": quotas}
+
+
+@app.get("/orgs/{org_id}/retention")
+async def get_org_retention(org_id: str, current_user: User = Depends(require_permission("manage"))):
+    """Get data retention policy settings for an organization."""
+    _ensure_org_exists(org_id)
+    if current_user.email not in org_memberships.get(org_id, {}):
+        raise HTTPException(status_code=403, detail="Not a member of this organization")
+    return {"org_id": org_id, "retention_days": tenant_retention.get(org_id, 30)}
+
+
+class RetentionUpdateRequest(BaseModel):
+    days: int = Field(default=30, ge=1, le=3650)
+
+
+@app.post("/orgs/{org_id}/retention")
+async def set_org_retention(
+    org_id: str,
+    payload: RetentionUpdateRequest,
+    current_user: User = Depends(require_permission("manage")),
+):
+    """Set a tenant-specific data retention policy (days)."""
+    _ensure_org_exists(org_id)
+    _require_org_admin(org_id, current_user.email)
+    tenant_retention[org_id] = payload.days
+    _audit_org(
+        "org.retention.update",
+        current_user.email,
+        org_id,
+        f"retention_days={payload.days}",
+    )
+    return {"org_id": org_id, "retention_days": payload.days}
 
 
 if __name__ == "__main__":

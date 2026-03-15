@@ -123,6 +123,46 @@ async def api_status(request: Request):
     }
 
 
+@app.get("/api/dashboard/summary")
+@limiter.limit("30/minute")
+async def dashboard_summary(request: Request):
+    """Executive dashboard summary for system health and key metrics."""
+    async with httpx.AsyncClient() as client:
+        results = {}
+        # Scan stats
+        try:
+            resp = await client.get(f"{SERVICE_URLS['scan']}/stats", timeout=5.0)
+            results["scan_stats"] = resp.json()
+        except Exception:
+            results["scan_stats"] = {"error": "unavailable"}
+
+        # Active collaboration stats
+        try:
+            resp = await client.get(f"{SERVICE_URLS['collab']}/activity-feed", timeout=5.0)
+            results["collab_activity"] = {"total_events": resp.json().get("total_events", 0)}
+        except Exception:
+            results["collab_activity"] = {"error": "unavailable"}
+
+        # Plugin ecosystem status
+        try:
+            resp = await client.get(f"{SERVICE_URLS['plugins']}/plugins", timeout=5.0)
+            results["plugins"] = {"total": len(resp.json().get("plugins", []))}
+        except Exception:
+            results["plugins"] = {"error": "unavailable"}
+
+        # Integration service signals
+        try:
+            resp = await client.get(f"{SERVICE_URLS['report']}/health", timeout=5.0)
+            results["report_service"] = resp.json()
+        except Exception:
+            results["report_service"] = {"error": "unavailable"}
+
+    return {
+        "summary": results,
+        "timestamp": time.time(),
+    }
+
+
 # Authentication endpoints (proxy to auth service)
 @app.post("/api/auth/register")
 @limiter.limit("5/minute")
@@ -196,6 +236,32 @@ async def refresh_token(request: Request):
             )
 
 
+@app.get("/api/gdpr/export")
+@limiter.limit("20/minute")
+async def gdpr_export(request: Request):
+    params = dict(request.query_params)
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(f"{SERVICE_URLS['auth']}/gdpr/export", params=params, timeout=10.0)
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except Exception as e:
+            logger.error(f"Auth service error: {e}")
+            raise HTTPException(status_code=503, detail="Authentication service unavailable")
+
+
+@app.delete("/api/gdpr/delete")
+@limiter.limit("20/minute")
+async def gdpr_delete(request: Request):
+    params = dict(request.query_params)
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.delete(f"{SERVICE_URLS['auth']}/gdpr/delete", params=params, timeout=10.0)
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except Exception as e:
+            logger.error(f"Auth service error: {e}")
+            raise HTTPException(status_code=503, detail="Authentication service unavailable")
+
+
 # Scan endpoints (proxy to scan service)
 @app.post("/api/scans")
 @limiter.limit("30/minute")
@@ -204,11 +270,17 @@ async def create_scan(request: Request):
     data = await request.json()
     # TODO: Add authentication token validation
 
+    headers = {}
+    for h in ["X-Org-Id", "X-Workspace-Id", "Authorization"]:
+        if request.headers.get(h):
+            headers[h] = request.headers.get(h)
+
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(
                 f"{SERVICE_URLS['scan']}/scans",
                 json=data,
+                headers=headers,
                 timeout=30.0
             )
             return JSONResponse(
@@ -453,6 +525,42 @@ async def webhook_events(request: Request):
         "event_type": payload.get("event_type", "unknown"),
         "timestamp": time.time(),
     }
+
+
+@app.get("/api/threat-intel/ip")
+@limiter.limit("60/minute")
+async def threat_intel_ip(request: Request):
+    params = dict(request.query_params)
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.get(f"{SERVICE_URLS['report']}/threat-intel/ip", params=params, timeout=5.0)
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            raise HTTPException(status_code=503, detail="Integration service unavailable")
++
++
++@app.get("/api/threat-intel/domain")
++@limiter.limit("60/minute")
++async def threat_intel_domain(request: Request):
++    params = dict(request.query_params)
++    async with httpx.AsyncClient() as client:
++        try:
++            resp = await client.get(f"{SERVICE_URLS['report']}/threat-intel/domain", params=params, timeout=5.0)
++            return JSONResponse(status_code=resp.status_code, content=resp.json())
++        except Exception:
++            raise HTTPException(status_code=503, detail="Integration service unavailable")
++
++
++@app.post("/api/ci/build")
++@limiter.limit("20/minute")
++async def ci_build(request: Request):
++    data = await request.json()
++    async with httpx.AsyncClient() as client:
++        try:
++            resp = await client.post(f"{SERVICE_URLS['report']}/ci/build", json=data, timeout=10.0)
++            return JSONResponse(status_code=resp.status_code, content=resp.json())
++        except Exception:
++            raise HTTPException(status_code=503, detail="Integration service unavailable")
 
 
 @app.get("/api/admin/users")

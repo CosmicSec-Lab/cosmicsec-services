@@ -2,7 +2,7 @@
 CosmicSec Scan Service
 Handles security scanning operations with distributed task processing
 """
-from fastapi import FastAPI, BackgroundTasks, HTTPException, status, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, BackgroundTasks, HTTPException, status, WebSocket, WebSocketDisconnect, Request
 from pydantic import BaseModel, HttpUrl, Field
 from typing import List, Optional, Dict
 from enum import Enum
@@ -12,6 +12,8 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from typing import Any
+
+import httpx
 
 try:
     from celery import Celery
@@ -86,6 +88,8 @@ class Scan(BaseModel):
     scan_types: List[ScanType]
     status: ScanStatus
     created_at: datetime
+    org_id: Optional[str] = None
+    workspace_id: Optional[str] = None
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     progress: int = 0
@@ -109,6 +113,35 @@ class Finding(BaseModel):
 scans_db = {}
 findings_db = []
 
+# Optional in-service quota override (used when auth service is not reachable)
+tenant_quotas: Dict[str, Dict[str, int]] = {}
+
+
+async def _fetch_org_quotas(org_id: str) -> Dict[str, int]:
+    """Fetch tenant quota settings from the auth service (fallback to in-memory)."""
+    if org_id in tenant_quotas:
+        return tenant_quotas[org_id]
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(f"{AUTH_SERVICE_URL}/orgs/{org_id}/quotas", timeout=5.0)
+            if resp.status_code == 200:
+                return resp.json().get("quotas", {})
+    except Exception:
+        pass
+    return {}
+
+
+def _scans_today_for_org(org_id: str) -> int:
+    today = datetime.utcnow().date()
+    return sum(
+        1
+        for scan in scans_db.values()
+        if scan.get("org_id") == org_id
+        and isinstance(scan.get("created_at"), datetime)
+        and scan["created_at"].date() == today
+    )
+
 celery_app = None
 if Celery is not None:
     broker_url = os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0")
@@ -122,6 +155,9 @@ if MongoClient is not None:
         mongo_collection = mongo_client["cosmicsec"]["scan_results"]
     except Exception:
         mongo_collection = None
+
+
+AUTH_SERVICE_URL = os.getenv("AUTH_SERVICE_URL", "http://auth-service:8001")
 
 
 class ConnectionManager:
@@ -250,8 +286,21 @@ async def health_check():
 
 
 @app.post("/scans", response_model=Scan)
-async def create_scan(config: ScanConfig, background_tasks: BackgroundTasks):
-    """Create and initiate a new security scan"""
+async def create_scan(config: ScanConfig, background_tasks: BackgroundTasks, request: Request):
+    """Create and initiate a new security scan."""
+    org_id = request.headers.get("X-Org-Id")
+    workspace_id = request.headers.get("X-Workspace-Id")
+
+    if org_id:
+        quotas = await _fetch_org_quotas(org_id)
+        max_scans = quotas.get("max_scans_per_day", 1000)
+        used = _scans_today_for_org(org_id)
+        if used >= max_scans:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=f"Scan quota exceeded for org {org_id} ({used}/{max_scans} today)",
+            )
+
     scan_id = secrets.token_urlsafe(16)
 
     scan_data = {
@@ -260,11 +309,13 @@ async def create_scan(config: ScanConfig, background_tasks: BackgroundTasks):
         "scan_types": config.scan_types,
         "status": ScanStatus.PENDING,
         "created_at": datetime.utcnow(),
+        "org_id": org_id,
+        "workspace_id": workspace_id,
         "started_at": None,
         "completed_at": None,
         "progress": 0,
         "findings_count": 0,
-        "severity_breakdown": {}
+        "severity_breakdown": {},
     }
 
     scans_db[scan_id] = scan_data
@@ -272,7 +323,7 @@ async def create_scan(config: ScanConfig, background_tasks: BackgroundTasks):
     # Start scan in background
     background_tasks.add_task(perform_scan, scan_id, config)
 
-    logger.info(f"Created new scan {scan_id} for target {config.target}")
+    logger.info(f"Created new scan {scan_id} for target {config.target} (org={org_id})")
 
     return Scan(**scan_data)
 
@@ -382,6 +433,31 @@ async def get_stats():
         "severity_breakdown": severity_breakdown,
         "timestamp": datetime.utcnow().isoformat()
     }
+
+
+class QuotaUpdateRequest(BaseModel):
+    max_scans_per_day: int = Field(default=1000, ge=1, le=100000)
+    max_workspaces: Optional[int] = Field(default=None, ge=1)
+    max_users: Optional[int] = Field(default=None, ge=1)
+
+
+@app.get("/orgs/{org_id}/quotas")
+async def get_org_quotas(org_id: str):
+    """Return quota configuration for an organization."""
+    quotas = await _fetch_org_quotas(org_id)
+    return {"org_id": org_id, "quotas": quotas}
+
+
+@app.post("/orgs/{org_id}/quotas")
+async def set_org_quotas(org_id: str, payload: QuotaUpdateRequest):
+    """Update quotas for an organization (local override)."""
+    current = tenant_quotas.setdefault(org_id, {})
+    current["max_scans_per_day"] = payload.max_scans_per_day
+    if payload.max_workspaces is not None:
+        current["max_workspaces"] = payload.max_workspaces
+    if payload.max_users is not None:
+        current["max_users"] = payload.max_users
+    return {"org_id": org_id, "quotas": current}
 
 
 @app.websocket("/ws/scans/{scan_id}")
