@@ -15,6 +15,8 @@ import asyncio
 from typing import Optional
 import logging
 
+from .hybrid_runtime import HybridRouter
+
 # Initialize FastAPI app
 app = FastAPI(
     title="CosmicSec API Gateway",
@@ -70,6 +72,55 @@ SERVICE_URLS = {
     "phase5": "http://phase5-service:8010",
 }
 
+hybrid_router = HybridRouter(SERVICE_URLS)
+
+
+def _static_auth_login(request: Request, payload: Optional[dict]) -> dict:
+    email = (payload or {}).get("email", "demo@cosmicsec.local")
+    mode = hybrid_router.resolve_mode(request).value
+    if mode != "demo":
+        return {
+            "status": "degraded",
+            "message": "Authentication dynamic service unavailable",
+            "fallback_policy": "No privileged auth in non-demo static mode",
+        }
+    return {
+        "access_token": "demo-preview-token",
+        "refresh_token": "demo-preview-refresh-token",
+        "token_type": "bearer",
+        "expires_in": 1800,
+        "preview_user": {"email": email, "role": "demo_viewer"},
+    }
+
+
+def _static_scan_create(request: Request, payload: Optional[dict]) -> dict:
+    return {
+        "id": f"fallback-{int(time.time())}",
+        "target": (payload or {}).get("target", "unknown"),
+        "status": "queued_fallback",
+        "message": "Static disaster-control scan queue accepted request for continuity.",
+    }
+
+
+def _static_recon(request: Request, payload: Optional[dict]) -> dict:
+    target = (payload or {}).get("target", "unknown")
+    return {
+        "target": target,
+        "timestamp": time.time(),
+        "findings": [
+            {"source": "static", "summary": "Dynamic recon unavailable. Returned fallback preview only."}
+        ],
+        "advisory": "Run full recon once dynamic services recover.",
+    }
+
+
+def _static_ai_health(_: Request, __: Optional[dict]) -> dict:
+    return {
+        "status": "degraded",
+        "service": "ai-service",
+        "capabilities": {"dynamic_inference": False, "fallback_profiles": True},
+    }
+
 
 @app.get("/")
 async def root():
@@ -95,7 +146,8 @@ async def health_check():
             "api_gateway": "operational",
             "database": "connected",
             "cache": "connected"
-        }
+        },
+        "runtime_mode_default": hybrid_router.default_mode.value,
     }
 
 
@@ -194,25 +246,17 @@ async def register(request: Request):
 @app.post("/api/auth/login")
 @limiter.limit("10/minute")
 async def login(request: Request):
-    """Proxy login request to auth service"""
+    """Hybrid login: dynamic auth by default, demo/static fallback by mode policy."""
     data = await request.json()
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.post(
-                f"{SERVICE_URLS['auth']}/login",
-                json=data,
-                timeout=10.0
-            )
-            return JSONResponse(
-                status_code=response.status_code,
-                content=response.json()
-            )
-        except Exception as e:
-            logger.error(f"Auth service error: {e}")
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Authentication service unavailable"
-            )
+    return await hybrid_router.execute(
+        request=request,
+        service="auth",
+        path="/login",
+        method="POST",
+        payload=data,
+        timeout=10.0,
+        static_handler=_static_auth_login,
+    )
 
 
 @app.post("/api/auth/refresh")
@@ -269,33 +313,24 @@ async def gdpr_delete(request: Request):
 @app.post("/api/scans")
 @limiter.limit("30/minute")
 async def create_scan(request: Request):
-    """Create a new security scan"""
+    """Create a security scan using dynamic-first hybrid runtime."""
     data = await request.json()
-    # TODO: Add authentication token validation
 
     headers = {}
     for h in ["X-Org-Id", "X-Workspace-Id", "Authorization"]:
         if request.headers.get(h):
             headers[h] = request.headers.get(h)
 
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.post(
-                f"{SERVICE_URLS['scan']}/scans",
-                json=data,
-                headers=headers,
-                timeout=30.0
-            )
-            return JSONResponse(
-                status_code=response.status_code,
-                content=response.json()
-            )
-        except Exception as e:
-            logger.error(f"Scan service error: {e}")
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Scan service unavailable"
-            )
+    return await hybrid_router.execute(
+        request=request,
+        service="scan",
+        path="/scans",
+        method="POST",
+        payload=data,
+        headers=headers,
+        timeout=30.0,
+        static_handler=_static_scan_create,
+    )
 
 
 @app.get("/api/scans/{scan_id}")
@@ -359,17 +394,15 @@ async def platform_info():
 @app.get("/api/ai/health")
 @limiter.limit("60/minute")
 async def ai_health(request: Request):
-    """Proxy AI service health endpoint"""
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.get(f"{SERVICE_URLS['ai']}/health", timeout=5.0)
-            return JSONResponse(status_code=response.status_code, content=response.json())
-        except Exception as e:
-            logger.error(f"AI service error: {e}")
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="AI service unavailable"
-            )
+    """Hybrid AI health endpoint with static resilience profile."""
+    return await hybrid_router.execute(
+        request=request,
+        service="ai",
+        path="/health",
+        method="GET",
+        timeout=5.0,
+        static_handler=_static_ai_health,
+    )
 
 
 @app.post("/api/ai/analyze")
@@ -479,22 +512,29 @@ async def ai_kb_stats(request: Request):
 @app.post("/api/recon")
 @limiter.limit("30/minute")
 async def recon_lookup(request: Request):
-    """Proxy recon request to recon service"""
+    """Hybrid recon endpoint with static fallback preview for continuity."""
     data = await request.json()
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.post(
-                f"{SERVICE_URLS['recon']}/recon",
-                json=data,
-                timeout=15.0,
-            )
-            return JSONResponse(status_code=response.status_code, content=response.json())
-        except Exception as e:
-            logger.error(f"Recon service error: {e}")
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Recon service unavailable"
-            )
+    return await hybrid_router.execute(
+        request=request,
+        service="recon",
+        path="/recon",
+        method="POST",
+        payload=data,
+        timeout=15.0,
+        static_handler=_static_recon,
+    )
+
+
+@app.get("/api/runtime/mode")
+@limiter.limit("60/minute")
+async def runtime_mode(request: Request):
+    """Expose resolved runtime mode for observability and operations."""
+    resolved = hybrid_router.resolve_mode(request).value
+    return {
+        "resolved_mode": resolved,
+        "default_mode": hybrid_router.default_mode.value,
+        "supported_modes": ["dynamic", "hybrid", "static", "demo", "emergency"],
+    }
 
 
 @app.post("/api/reports/generate")
