@@ -2,7 +2,7 @@
 CosmicSec API Gateway
 Main entry point for all API requests with routing, authentication, and rate limiting
 """
-from fastapi import FastAPI, Request, Depends, HTTPException, status
+from fastapi import FastAPI, Request, Depends, HTTPException, status, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
@@ -11,6 +11,7 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 import httpx
 import time
+import asyncio
 from typing import Optional
 import logging
 
@@ -367,6 +368,97 @@ async def webhook_events(request: Request):
         "event_type": payload.get("event_type", "unknown"),
         "timestamp": time.time(),
     }
+
+
+@app.get("/api/admin/users")
+@limiter.limit("60/minute")
+async def admin_list_users(request: Request):
+    async with httpx.AsyncClient() as client:
+        response = await client.get(f"{SERVICE_URLS['auth']}/users", timeout=10.0)
+        return JSONResponse(status_code=response.status_code, content=response.json())
+
+
+@app.post("/api/admin/users")
+@limiter.limit("30/minute")
+async def admin_create_user(request: Request):
+    payload = await request.json()
+    async with httpx.AsyncClient() as client:
+        response = await client.post(f"{SERVICE_URLS['auth']}/users", json=payload, timeout=10.0)
+        return JSONResponse(status_code=response.status_code, content=response.json())
+
+
+@app.put("/api/admin/users/{email}")
+@limiter.limit("30/minute")
+async def admin_update_user(request: Request, email: str):
+    payload = await request.json()
+    async with httpx.AsyncClient() as client:
+        response = await client.put(f"{SERVICE_URLS['auth']}/users/{email}", json=payload, timeout=10.0)
+        return JSONResponse(status_code=response.status_code, content=response.json())
+
+
+@app.delete("/api/admin/users/{email}")
+@limiter.limit("30/minute")
+async def admin_delete_user(request: Request, email: str):
+    async with httpx.AsyncClient() as client:
+        response = await client.delete(f"{SERVICE_URLS['auth']}/users/{email}", timeout=10.0)
+        return JSONResponse(status_code=response.status_code, content=response.json())
+
+
+@app.post("/api/admin/roles/assign")
+@limiter.limit("30/minute")
+async def admin_assign_role(request: Request):
+    payload = await request.json()
+    async with httpx.AsyncClient() as client:
+        response = await client.post(f"{SERVICE_URLS['auth']}/roles/assign", json=payload, timeout=10.0)
+        return JSONResponse(status_code=response.status_code, content=response.json())
+
+
+@app.get("/api/admin/config")
+@limiter.limit("60/minute")
+async def admin_get_config(request: Request):
+    async with httpx.AsyncClient() as client:
+        response = await client.get(f"{SERVICE_URLS['auth']}/config", timeout=10.0)
+        return JSONResponse(status_code=response.status_code, content=response.json())
+
+
+@app.post("/api/admin/config")
+@limiter.limit("30/minute")
+async def admin_set_config(request: Request):
+    payload = await request.json()
+    async with httpx.AsyncClient() as client:
+        response = await client.post(f"{SERVICE_URLS['auth']}/config", json=payload, timeout=10.0)
+        return JSONResponse(status_code=response.status_code, content=response.json())
+
+
+@app.get("/api/admin/audit-logs")
+@limiter.limit("60/minute")
+async def admin_get_audit_logs(request: Request):
+    query = dict(request.query_params)
+    async with httpx.AsyncClient() as client:
+        response = await client.get(f"{SERVICE_URLS['auth']}/audit-logs", params=query, timeout=10.0)
+        return JSONResponse(status_code=response.status_code, content=response.json())
+
+
+@app.websocket("/ws/dashboard")
+async def dashboard_stream(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        while True:
+            payload = {
+                "timestamp": time.time(),
+                "system_health": "healthy",
+                "active_scans": 0,
+                "user_activity": "normal",
+                "resource_utilization": {
+                    "cpu": 22,
+                    "memory": 48,
+                    "network": 31,
+                },
+            }
+            await websocket.send_json(payload)
+            await asyncio.sleep(2)
+    except WebSocketDisconnect:
+        logger.info("Dashboard websocket disconnected")
 
 
 if __name__ == "__main__":

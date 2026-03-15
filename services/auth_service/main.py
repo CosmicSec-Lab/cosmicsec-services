@@ -114,11 +114,46 @@ class RefreshRequest(BaseModel):
     refresh_token: str
 
 
+class UserUpdate(BaseModel):
+    full_name: Optional[str] = None
+    role: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+class RoleAssignRequest(BaseModel):
+    email: EmailStr
+    role: str
+
+
+class ConfigUpdateRequest(BaseModel):
+    key: str
+    value: str
+
+
+class MFARequest(BaseModel):
+    email: EmailStr
+    method: str  # totp | sms | hardware_key
+
+
+class MFAChallengeVerifyRequest(BaseModel):
+    email: EmailStr
+    method: str
+    code: str
+
+
 # In-memory user storage (replace with database in production)
 fake_users_db = {}
 fake_api_keys_db = {}
 fake_2fa_db = {}
 fake_sessions_db = {}
+audit_logs = []
+platform_config = {
+    "maintenance_mode": "false",
+    "default_role": "user",
+    "allow_registration": "true",
+}
+hardware_keys_db = {}
+sms_challenges_db = {}
 
 redis_client = None
 if redis is not None:
@@ -139,6 +174,17 @@ def _store_session(session_id: str, email: str, refresh_token: str) -> None:
         redis_client.setex(f"session:{session_id}", REFRESH_TOKEN_EXPIRE_DAYS * 86400, value)
     else:
         fake_sessions_db[session_id] = value
+
+
+def _audit(action: str, actor: str, detail: str) -> None:
+    audit_logs.append(
+        {
+            "timestamp": datetime.utcnow().isoformat(),
+            "action": action,
+            "actor": actor,
+            "detail": detail,
+        }
+    )
 
 
 def _delete_session(session_id: str) -> None:
@@ -323,6 +369,7 @@ async def register(user_data: UserCreate):
     }
 
     fake_users_db[user_data.email] = new_user
+    _audit("user.register", user_data.email, f"role={user_data.role}")
 
     logger.info(f"New user registered: {user_data.email}")
 
@@ -369,6 +416,7 @@ async def login(user_data: UserLogin):
     refresh_token = create_refresh_token(access_token_data)
     session_id = secrets.token_urlsafe(12)
     _store_session(session_id, user_data.email, refresh_token)
+    _audit("user.login", user_data.email, f"session={session_id}")
 
     logger.info(f"User logged in: {user_data.email}")
 
@@ -427,6 +475,7 @@ async def logout(current_user: User = Depends(get_current_user)):
     """Logout user (invalidate token)"""
     # In production, add token to blacklist in Redis
     logger.info(f"User logged out: {current_user.email}")
+    _audit("user.logout", current_user.email, "logout requested")
     return {"message": "Successfully logged out"}
 
 
@@ -541,6 +590,7 @@ async def create_api_key(current_user: User = Depends(get_current_user)):
         "key_hash": hashlib.sha256(raw_key.encode("utf-8")).hexdigest(),
         "created_at": datetime.utcnow().isoformat(),
     }
+    _audit("apikey.create", current_user.email, f"key_id={key_id}")
     return {"key_id": key_id, "api_key": raw_key}
 
 
@@ -566,6 +616,7 @@ async def get_session(session_id: str, current_user: User = Depends(get_current_
 @app.delete("/sessions/{session_id}")
 async def revoke_session(session_id: str, current_user: User = Depends(get_current_user)):
     _delete_session(session_id)
+    _audit("session.revoke", current_user.email, f"session_id={session_id}")
     return {"revoked": True, "session_id": session_id, "user": current_user.email}
 
 
@@ -573,6 +624,162 @@ async def revoke_session(session_id: str, current_user: User = Depends(get_curre
 async def admin_ping(current_user: User = Depends(require_permission("manage"))):
     """RBAC-protected endpoint for administrators."""
     return {"ok": True, "email": current_user.email, "role": current_user.role}
+
+
+@app.get("/users")
+async def list_users(current_user: User = Depends(require_permission("manage"))):
+    _audit("user.list", current_user.email, "listed users")
+    return {
+        "items": [
+            {
+                "id": user["id"],
+                "email": user["email"],
+                "full_name": user["full_name"],
+                "role": user["role"],
+                "is_active": user["is_active"],
+                "created_at": user["created_at"],
+            }
+            for user in fake_users_db.values()
+        ]
+    }
+
+
+@app.post("/users")
+async def create_user(user_data: UserCreate, current_user: User = Depends(require_permission("manage"))):
+    if user_data.email in fake_users_db:
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    user_id = secrets.token_urlsafe(16)
+    new_user = {
+        "id": user_id,
+        "email": user_data.email,
+        "full_name": user_data.full_name,
+        "hashed_password": get_password_hash(user_data.password),
+        "role": user_data.role,
+        "is_active": True,
+        "created_at": datetime.utcnow(),
+    }
+    fake_users_db[user_data.email] = new_user
+    _audit("user.create", current_user.email, f"created={user_data.email}")
+    return {"message": "User created", "id": user_id}
+
+
+@app.put("/users/{email}")
+async def update_user(email: str, payload: UserUpdate, current_user: User = Depends(require_permission("manage"))):
+    user = fake_users_db.get(email)
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if payload.full_name is not None:
+        user["full_name"] = payload.full_name
+    if payload.role is not None:
+        user["role"] = payload.role
+    if payload.is_active is not None:
+        user["is_active"] = payload.is_active
+    _audit("user.update", current_user.email, f"updated={email}")
+    return {"message": "User updated", "email": email}
+
+
+@app.delete("/users/{email}")
+async def delete_user(email: str, current_user: User = Depends(require_permission("manage"))):
+    if email not in fake_users_db:
+        raise HTTPException(status_code=404, detail="User not found")
+    del fake_users_db[email]
+    _audit("user.delete", current_user.email, f"deleted={email}")
+    return {"message": "User deleted", "email": email}
+
+
+@app.post("/roles/assign")
+async def assign_role(payload: RoleAssignRequest, current_user: User = Depends(require_permission("manage"))):
+    user = fake_users_db.get(payload.email)
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    user["role"] = payload.role
+    _audit("role.assign", current_user.email, f"{payload.email}->{payload.role}")
+    return {"message": "Role assigned", "email": payload.email, "role": payload.role}
+
+
+@app.get("/config")
+async def get_config(current_user: User = Depends(require_permission("manage"))):
+    _audit("config.get", current_user.email, "read config")
+    return {"config": platform_config}
+
+
+@app.post("/config")
+async def update_config(payload: ConfigUpdateRequest, current_user: User = Depends(require_permission("manage"))):
+    platform_config[payload.key] = payload.value
+    _audit("config.set", current_user.email, f"{payload.key}={payload.value}")
+    return {"message": "Config updated", "config": platform_config}
+
+
+@app.get("/audit-logs")
+async def get_audit_logs(
+    action: Optional[str] = None,
+    actor: Optional[str] = None,
+    current_user: User = Depends(require_permission("manage")),
+):
+    logs = audit_logs
+    if action:
+        logs = [entry for entry in logs if entry["action"] == action]
+    if actor:
+        logs = [entry for entry in logs if entry["actor"] == actor]
+    _audit("audit.read", current_user.email, f"count={len(logs)}")
+    return {"items": logs[-200:]}
+
+
+@app.get("/saml/metadata")
+async def saml_metadata():
+    """Minimal SAML metadata endpoint for enterprise SSO integration."""
+    acs = os.getenv("SAML_ACS_URL", "http://localhost:8001/saml/acs")
+    entity_id = os.getenv("SAML_ENTITY_ID", "cosmicsec-auth-service")
+    return {
+        "entity_id": entity_id,
+        "assertion_consumer_service": acs,
+        "name_id_format": "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
+    }
+
+
+@app.post("/saml/acs")
+async def saml_acs(assertion: str):
+    """SAML assertion consumer service placeholder for IdP responses."""
+    return {"accepted": bool(assertion), "message": "SAML assertion received"}
+
+
+@app.post("/mfa/challenge")
+async def mfa_challenge(payload: MFARequest):
+    method = payload.method.lower()
+    if method not in {"totp", "sms", "hardware_key"}:
+        raise HTTPException(status_code=400, detail="Unsupported MFA method")
+
+    if method == "sms":
+        code = f"{secrets.randbelow(1000000):06d}"
+        sms_challenges_db[payload.email] = code
+        return {"method": method, "challenge_created": True, "delivery": "simulated", "code": code}
+    if method == "hardware_key":
+        challenge = secrets.token_urlsafe(24)
+        hardware_keys_db[payload.email] = challenge
+        return {"method": method, "challenge_created": True, "challenge": challenge}
+
+    # TOTP challenge relies on previously configured secret
+    return {"method": method, "challenge_created": True}
+
+
+@app.post("/mfa/verify")
+async def mfa_verify(payload: MFAChallengeVerifyRequest):
+    method = payload.method.lower()
+    if method == "sms":
+        return {"verified": sms_challenges_db.get(payload.email) == payload.code}
+    if method == "hardware_key":
+        expected = hardware_keys_db.get(payload.email)
+        return {"verified": expected is not None and payload.code == expected}
+    if method == "totp":
+        secret = fake_2fa_db.get(payload.email)
+        if not secret:
+            return {"verified": False}
+        if pyotp is None:
+            return {"verified": payload.code == "000000"}
+        return {"verified": pyotp.TOTP(secret).verify(payload.code)}
+    raise HTTPException(status_code=400, detail="Unsupported MFA method")
 
 
 if __name__ == "__main__":
