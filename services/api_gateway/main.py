@@ -15,9 +15,10 @@ import asyncio
 from typing import Optional
 import logging
 
-from .hybrid_runtime import HybridRouter
-from .policy_registry import ROUTE_POLICIES
-from .static_profiles import STATIC_PROFILES
+from cosmicsec_platform.contracts.runtime_metadata import HYBRID_SCHEMA, HYBRID_VERSION
+from cosmicsec_platform.middleware.hybrid_router import HybridRouter
+from cosmicsec_platform.middleware.policy_registry import ROUTE_POLICIES
+from cosmicsec_platform.middleware.static_profiles import STATIC_PROFILES
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -217,25 +218,17 @@ async def login(request: Request):
 @app.post("/api/auth/refresh")
 @limiter.limit("20/minute")
 async def refresh_token(request: Request):
-    """Refresh JWT token"""
+    """Refresh JWT token (security-critical: no static fallback)."""
     data = await request.json()
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.post(
-                f"{SERVICE_URLS['auth']}/refresh",
-                json=data,
-                timeout=10.0
-            )
-            return JSONResponse(
-                status_code=response.status_code,
-                content=response.json()
-            )
-        except Exception as e:
-            logger.error(f"Auth service error: {e}")
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Authentication service unavailable"
-            )
+    return await hybrid_router.execute(
+        request=request,
+        service="auth",
+        path="/refresh",
+        method="POST",
+        payload=data,
+        timeout=10.0,
+        route_key="auth.refresh",
+    )
 
 
 @app.get("/api/gdpr/export")
@@ -291,23 +284,16 @@ async def create_scan(request: Request):
 @app.get("/api/scans/{scan_id}")
 @limiter.limit("60/minute")
 async def get_scan(request: Request, scan_id: str):
-    """Get scan details by ID"""
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.get(
-                f"{SERVICE_URLS['scan']}/scans/{scan_id}",
-                timeout=10.0
-            )
-            return JSONResponse(
-                status_code=response.status_code,
-                content=response.json()
-            )
-        except Exception as e:
-            logger.error(f"Scan service error: {e}")
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Scan service unavailable"
-            )
+    """Get scan details by ID with partial fallback profile."""
+    return await hybrid_router.execute(
+        request=request,
+        service="scan",
+        path=f"/scans/{scan_id}",
+        method="GET",
+        payload={"scan_id": scan_id},
+        timeout=10.0,
+        route_key="scan.get",
+    )
 
 
 @app.get("/api/info")
@@ -363,22 +349,17 @@ async def ai_health(request: Request):
 @app.post("/api/ai/analyze")
 @limiter.limit("30/minute")
 async def ai_analyze(request: Request):
-    """Proxy AI service analyze endpoint"""
+    """Proxy AI analysis endpoint (fallback disabled by policy)."""
     data = await request.json()
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.post(
-                f"{SERVICE_URLS['ai']}/analyze",
-                json=data,
-                timeout=15.0
-            )
-            return JSONResponse(status_code=response.status_code, content=response.json())
-        except Exception as e:
-            logger.error(f"AI service error: {e}")
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="AI service unavailable"
-            )
+    return await hybrid_router.execute(
+        request=request,
+        service="ai",
+        path="/analyze",
+        method="POST",
+        payload=data,
+        timeout=15.0,
+        route_key="ai.analyze",
+    )
 
 
 @app.post("/api/ai/analyze/agent")
@@ -519,19 +500,19 @@ async def runtime_tracing(request: Request):
 async def runtime_contracts(request: Request):
     """Contract helper for clients to parse hybrid runtime metadata consistently."""
     return {
-        "schema": "cosmicsec.hybrid.v1",
-        "version": "1.0.0",
+        "schema": HYBRID_SCHEMA,
+        "version": HYBRID_VERSION,
         "runtime_field": "_runtime",
         "contract_field": "_contract",
         "route_policies": {k: v.to_dict() for k, v in ROUTE_POLICIES.items()},
         "examples": {
             "dynamic": {
                 "_runtime": {"route": "dynamic", "mode": "hybrid", "trace_id": "uuid"},
-                "_contract": {"degraded": False, "schema": "cosmicsec.hybrid.v1"},
+                "_contract": {"degraded": False, "schema": HYBRID_SCHEMA},
             },
             "static_fallback": {
                 "_runtime": {"route": "static_fallback", "mode": "hybrid", "trace_id": "uuid"},
-                "_contract": {"degraded": True, "schema": "cosmicsec.hybrid.v1"},
+                "_contract": {"degraded": True, "schema": HYBRID_SCHEMA},
             },
         },
     }
@@ -540,22 +521,17 @@ async def runtime_contracts(request: Request):
 @app.post("/api/reports/generate")
 @limiter.limit("20/minute")
 async def generate_report(request: Request):
-    """Proxy report generation request to report service"""
+    """Hybrid report generation with degraded queue fallback profile."""
     data = await request.json()
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.post(
-                f"{SERVICE_URLS['report']}/reports/generate",
-                json=data,
-                timeout=20.0,
-            )
-            return JSONResponse(status_code=response.status_code, content=response.json())
-        except Exception as e:
-            logger.error(f"Report service error: {e}")
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Report service unavailable"
-            )
+    return await hybrid_router.execute(
+        request=request,
+        service="report",
+        path="/reports/generate",
+        method="POST",
+        payload=data,
+        timeout=20.0,
+        route_key="report.generate",
+    )
 
 
 @app.post("/api/webhooks/events")
