@@ -6,6 +6,7 @@ from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel, EmailStr, Field
 from passlib.context import CryptContext
+import bcrypt as bcrypt_lib
 from jose import JWTError, jwt
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Any
@@ -48,8 +49,8 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 REFRESH_TOKEN_EXPIRE_DAYS = 30
 
-# Password hashing
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# Password hashing with bcrypt 4.0+ compatibility
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__ident="2b")
 
 # OAuth2 scheme
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
@@ -343,13 +344,18 @@ def _map_action_to_resource(action: str) -> tuple[str, str]:
 
 # Password utilities
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Verify password against hash"""
-    return pwd_context.verify(plain_password, hashed_password)
+    """Verify password against hash using bcrypt directly"""
+    password_bytes = plain_password.encode('utf-8')[:72]  # Truncate to 72 bytes
+    hash_bytes = hashed_password.encode('utf-8')
+    return bcrypt_lib.checkpw(password_bytes, hash_bytes)
 
 
 def get_password_hash(password: str) -> str:
-    """Hash password using bcrypt"""
-    return pwd_context.hash(password)
+    """Hash password using bcrypt directly"""
+    password_bytes = password.encode('utf-8')[:72]  # Truncate to 72 bytes
+    salt = bcrypt_lib.gensalt()
+    hashed = bcrypt_lib.hashpw(password_bytes, salt)
+    return hashed.decode('utf-8')
 
 
 # JWT utilities

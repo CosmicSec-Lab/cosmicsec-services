@@ -537,30 +537,30 @@ async def threat_intel_ip(request: Request):
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
             raise HTTPException(status_code=503, detail="Integration service unavailable")
-+
-+
-+@app.get("/api/threat-intel/domain")
-+@limiter.limit("60/minute")
-+async def threat_intel_domain(request: Request):
-+    params = dict(request.query_params)
-+    async with httpx.AsyncClient() as client:
-+        try:
-+            resp = await client.get(f"{SERVICE_URLS['report']}/threat-intel/domain", params=params, timeout=5.0)
-+            return JSONResponse(status_code=resp.status_code, content=resp.json())
-+        except Exception:
-+            raise HTTPException(status_code=503, detail="Integration service unavailable")
-+
-+
-+@app.post("/api/ci/build")
-+@limiter.limit("20/minute")
-+async def ci_build(request: Request):
-+    data = await request.json()
-+    async with httpx.AsyncClient() as client:
-+        try:
-+            resp = await client.post(f"{SERVICE_URLS['report']}/ci/build", json=data, timeout=10.0)
-+            return JSONResponse(status_code=resp.status_code, content=resp.json())
-+        except Exception:
-+            raise HTTPException(status_code=503, detail="Integration service unavailable")
+
+
+@app.get("/api/threat-intel/domain")
+@limiter.limit("60/minute")
+async def threat_intel_domain(request: Request):
+    params = dict(request.query_params)
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.get(f"{SERVICE_URLS['report']}/threat-intel/domain", params=params, timeout=5.0)
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            raise HTTPException(status_code=503, detail="Integration service unavailable")
+
+
+@app.post("/api/ci/build")
+@limiter.limit("20/minute")
+async def ci_build(request: Request):
+    data = await request.json()
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.post(f"{SERVICE_URLS['report']}/ci/build", json=data, timeout=10.0)
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            raise HTTPException(status_code=503, detail="Integration service unavailable")
 
 
 @app.get("/api/admin/users")
