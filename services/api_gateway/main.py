@@ -16,6 +16,8 @@ from typing import Optional
 import logging
 
 from .hybrid_runtime import HybridRouter
+from .policy_registry import ROUTE_POLICIES
+from .static_profiles import STATIC_PROFILES
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -72,54 +74,7 @@ SERVICE_URLS = {
     "phase5": "http://phase5-service:8010",
 }
 
-hybrid_router = HybridRouter(SERVICE_URLS)
-
-
-def _static_auth_login(request: Request, payload: Optional[dict]) -> dict:
-    email = (payload or {}).get("email", "demo@cosmicsec.local")
-    mode = hybrid_router.resolve_mode(request).value
-    if mode != "demo":
-        return {
-            "status": "degraded",
-            "message": "Authentication dynamic service unavailable",
-            "fallback_policy": "No privileged auth in non-demo static mode",
-        }
-    return {
-        "access_token": "demo-preview-token",
-        "refresh_token": "demo-preview-refresh-token",
-        "token_type": "bearer",
-        "expires_in": 1800,
-        "preview_user": {"email": email, "role": "demo_viewer"},
-    }
-
-
-def _static_scan_create(request: Request, payload: Optional[dict]) -> dict:
-    return {
-        "id": f"fallback-{int(time.time())}",
-        "target": (payload or {}).get("target", "unknown"),
-        "status": "queued_fallback",
-        "message": "Static disaster-control scan queue accepted request for continuity.",
-    }
-
-
-def _static_recon(request: Request, payload: Optional[dict]) -> dict:
-    target = (payload or {}).get("target", "unknown")
-    return {
-        "target": target,
-        "timestamp": time.time(),
-        "findings": [
-            {"source": "static", "summary": "Dynamic recon unavailable. Returned fallback preview only."}
-        ],
-        "advisory": "Run full recon once dynamic services recover.",
-    }
-
-
-def _static_ai_health(_: Request, __: Optional[dict]) -> dict:
-    return {
-        "status": "degraded",
-        "service": "ai-service",
-        "capabilities": {"dynamic_inference": False, "fallback_profiles": True},
-    }
+hybrid_router = HybridRouter(SERVICE_URLS, static_profiles=STATIC_PROFILES)
 
 
 @app.get("/")
@@ -255,7 +210,7 @@ async def login(request: Request):
         method="POST",
         payload=data,
         timeout=10.0,
-        static_handler=_static_auth_login,
+        route_key="auth.login",
     )
 
 
@@ -329,7 +284,7 @@ async def create_scan(request: Request):
         payload=data,
         headers=headers,
         timeout=30.0,
-        static_handler=_static_scan_create,
+        route_key="scan.create",
     )
 
 
@@ -401,7 +356,7 @@ async def ai_health(request: Request):
         path="/health",
         method="GET",
         timeout=5.0,
-        static_handler=_static_ai_health,
+        route_key="ai.health",
     )
 
 
@@ -521,7 +476,7 @@ async def recon_lookup(request: Request):
         method="POST",
         payload=data,
         timeout=15.0,
-        static_handler=_static_recon,
+        route_key="recon.lookup",
     )
 
 
@@ -534,6 +489,51 @@ async def runtime_mode(request: Request):
         "resolved_mode": resolved,
         "default_mode": hybrid_router.default_mode.value,
         "supported_modes": ["dynamic", "hybrid", "static", "demo", "emergency"],
+    }
+
+
+@app.get("/api/runtime/metrics")
+@limiter.limit("60/minute")
+async def runtime_metrics(request: Request):
+    """Runtime metrics for fallback and dynamic success tracking."""
+    return hybrid_router.get_metrics()
+
+
+@app.get("/api/runtime/traces")
+@limiter.limit("60/minute")
+async def runtime_traces(request: Request):
+    """Recent runtime trace decisions for degradation and chaos debugging."""
+    limit = int(request.query_params.get("limit", "50"))
+    return {"traces": hybrid_router.get_recent_traces(limit)}
+
+
+@app.get("/api/runtime/tracing")
+@limiter.limit("60/minute")
+async def runtime_tracing(request: Request):
+    """Tracing exporter status and in-memory trace buffer utilization."""
+    return hybrid_router.get_tracing_status()
+
+
+@app.get("/api/runtime/contracts")
+@limiter.limit("60/minute")
+async def runtime_contracts(request: Request):
+    """Contract helper for clients to parse hybrid runtime metadata consistently."""
+    return {
+        "schema": "cosmicsec.hybrid.v1",
+        "version": "1.0.0",
+        "runtime_field": "_runtime",
+        "contract_field": "_contract",
+        "route_policies": {k: v.to_dict() for k, v in ROUTE_POLICIES.items()},
+        "examples": {
+            "dynamic": {
+                "_runtime": {"route": "dynamic", "mode": "hybrid", "trace_id": "uuid"},
+                "_contract": {"degraded": False, "schema": "cosmicsec.hybrid.v1"},
+            },
+            "static_fallback": {
+                "_runtime": {"route": "static_fallback", "mode": "hybrid", "trace_id": "uuid"},
+                "_contract": {"degraded": True, "schema": "cosmicsec.hybrid.v1"},
+            },
+        },
     }
 
 
