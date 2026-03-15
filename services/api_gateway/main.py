@@ -5,13 +5,14 @@ Main entry point for all API requests with routing, authentication, and rate lim
 from fastapi import FastAPI, Request, Depends, HTTPException, status, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 import httpx
 import time
 import asyncio
+import uuid
 from typing import Optional
 import logging
 
@@ -76,6 +77,36 @@ SERVICE_URLS = {
 }
 
 hybrid_router = HybridRouter(SERVICE_URLS, static_profiles=STATIC_PROFILES)
+PRIVILEGED_PREFIXES = ("/api/admin", "/api/orgs")
+
+
+@app.middleware("http")
+async def enforce_demo_privileged_guard(request: Request, call_next):
+    resolved_mode = hybrid_router.resolve_mode(request)
+    if resolved_mode.value == "demo" and request.url.path.startswith(PRIVILEGED_PREFIXES):
+        trace_id = request.headers.get("X-Request-Id", str(uuid.uuid4()))
+        now = time.time()
+        return JSONResponse(
+            status_code=403,
+            content={
+                "status": "denied",
+                "detail": "Privileged administrative routes are disabled in demo mode.",
+                "_runtime": {
+                    "mode": "demo",
+                    "route": "policy_denied",
+                    "trace_id": trace_id,
+                    "decision_ts": now,
+                    "reason": "demo_mode_privileged_route_blocked",
+                },
+                "_contract": {
+                    "schema": HYBRID_SCHEMA,
+                    "version": HYBRID_VERSION,
+                    "degraded": True,
+                    "consumer_hint": "Switch to authenticated non-demo mode for privileged operations.",
+                },
+            },
+        )
+    return await call_next(request)
 
 
 @app.get("/")
@@ -469,6 +500,7 @@ async def runtime_mode(request: Request):
     return {
         "resolved_mode": resolved,
         "default_mode": hybrid_router.default_mode.value,
+        "rollout": hybrid_router.get_rollout_config(),
         "supported_modes": ["dynamic", "hybrid", "static", "demo", "emergency"],
     }
 
@@ -478,6 +510,34 @@ async def runtime_mode(request: Request):
 async def runtime_metrics(request: Request):
     """Runtime metrics for fallback and dynamic success tracking."""
     return hybrid_router.get_metrics()
+
+
+@app.get("/api/runtime/metrics/prometheus")
+@limiter.limit("60/minute")
+async def runtime_metrics_prometheus(request: Request):
+    """Prometheus-format runtime metrics for Grafana/Prometheus dashboards."""
+    metrics = hybrid_router.get_metrics()
+    lines = [
+        "# HELP cosmicsec_runtime_dynamic_total Total dynamic route attempts.",
+        "# TYPE cosmicsec_runtime_dynamic_total counter",
+        f"cosmicsec_runtime_dynamic_total {metrics['dynamic_total']}",
+        "# HELP cosmicsec_runtime_dynamic_success Total successful dynamic responses.",
+        "# TYPE cosmicsec_runtime_dynamic_success counter",
+        f"cosmicsec_runtime_dynamic_success {metrics['dynamic_success']}",
+        "# HELP cosmicsec_runtime_fallback_total Total hybrid fallback executions.",
+        "# TYPE cosmicsec_runtime_fallback_total counter",
+        f"cosmicsec_runtime_fallback_total {metrics['fallback_total']}",
+        "# HELP cosmicsec_runtime_static_total Total static/disaster responses.",
+        "# TYPE cosmicsec_runtime_static_total counter",
+        f"cosmicsec_runtime_static_total {metrics['static_total']}",
+        "# HELP cosmicsec_runtime_policy_denied_total Total policy-denied requests.",
+        "# TYPE cosmicsec_runtime_policy_denied_total counter",
+        f"cosmicsec_runtime_policy_denied_total {metrics['policy_denied_total']}",
+        "# HELP cosmicsec_runtime_dynamic_success_rate Dynamic success ratio.",
+        "# TYPE cosmicsec_runtime_dynamic_success_rate gauge",
+        f"cosmicsec_runtime_dynamic_success_rate {metrics['dynamic_success_rate']}",
+    ]
+    return PlainTextResponse(content="\n".join(lines) + "\n")
 
 
 @app.get("/api/runtime/traces")
@@ -570,6 +630,22 @@ async def runtime_readiness(request: Request):
         "missing_critical_routes": missing_routes,
         "tracked_route_count": len(configured_routes),
     }
+
+
+@app.get("/api/runtime/rollout")
+@limiter.limit("60/minute")
+async def runtime_rollout_get(request: Request):
+    """Get canary rollout controls for hybrid runtime."""
+    return hybrid_router.get_rollout_config()
+
+
+@app.post("/api/runtime/rollout")
+@limiter.limit("20/minute")
+async def runtime_rollout_set(request: Request):
+    """Set canary rollout controls for dynamic traffic splitting."""
+    payload = await request.json()
+    percent = payload.get("dynamic_canary_percent", 0)
+    return hybrid_router.set_rollout_config(percent)
 
 
 @app.post("/api/reports/generate")
