@@ -67,6 +67,7 @@ SERVICE_URLS = {
     "plugins": "http://plugin-registry:8007",
     "integration": "http://integration-service:8008",
     "bugbounty": "http://bugbounty-service:8009",
+    "phase5": "http://phase5-service:8010",
 }
 
 
@@ -1465,6 +1466,41 @@ async def bugbounty_dashboard_earnings(request: Request):
 @limiter.limit("30/minute")
 async def bugbounty_timeline(request: Request):
     return await _proxy_get("bugbounty", "/timeline", params=dict(request.query_params))
+
+
+@app.post("/api/bugbounty/collaboration/share")
+@limiter.limit("30/minute")
+async def bugbounty_collaboration_share(request: Request):
+    return await _proxy_post("bugbounty", "/collaboration/share", await request.json())
+
+
+@app.get("/api/bugbounty/collaboration/threads")
+@limiter.limit("60/minute")
+async def bugbounty_collaboration_threads(request: Request):
+    return await _proxy_get("bugbounty", "/collaboration/threads", params=dict(request.query_params))
+
+
+@app.get("/api/bugbounty/reports/templates")
+@limiter.limit("60/minute")
+async def bugbounty_report_templates(request: Request):
+    return await _proxy_get("bugbounty", "/reports/templates")
+
+
+@app.api_route("/api/phase5/{path:path}", methods=["GET", "POST"])
+@limiter.limit("120/minute")
+async def phase5_proxy(request: Request, path: str):
+    params = dict(request.query_params)
+    url = f"{SERVICE_URLS['phase5']}/{path}"
+    async with httpx.AsyncClient() as client:
+        try:
+            if request.method == "GET":
+                resp = await client.get(url, params=params, timeout=15.0)
+            else:
+                data = await request.json()
+                resp = await client.post(url, json=data, params=params, timeout=20.0)
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            raise HTTPException(status_code=503, detail="phase5 service unavailable")
 
 
 if __name__ == "__main__":

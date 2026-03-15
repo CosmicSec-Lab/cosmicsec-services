@@ -12,6 +12,11 @@ app = FastAPI(title="CosmicSec Bug Bounty Service", version="1.0.0")
 platforms = ["hackerone", "bugcrowd", "intigriti", "yeswehack", "synack"]
 programs: Dict[str, Dict[str, Any]] = {}
 submissions: Dict[str, Dict[str, Any]] = {}
+collaboration_threads: List[Dict[str, Any]] = []
+report_templates: List[Dict[str, Any]] = [
+    {"template_id": "tmpl-web-xss", "name": "Web XSS Report", "category": "web"},
+    {"template_id": "tmpl-api-authz", "name": "API Authorization Report", "category": "api"},
+]
 
 
 class ProgramCreate(BaseModel):
@@ -36,6 +41,13 @@ class SubmissionCreate(BaseModel):
     description: str
     severity: str = "medium"
     poc: Optional[str] = None
+
+
+class CollaborationShare(BaseModel):
+    program_id: str
+    title: str
+    message: str
+    participants: List[str] = Field(default_factory=list)
 
 
 @app.get("/health")
@@ -153,3 +165,30 @@ def timeline(program_id: Optional[str] = None) -> dict:
             continue
         events.append({"event": "submission_status", "submission_id": sub["submission_id"], "status": sub["status"]})
     return {"events": events, "total": len(events)}
+
+
+@app.post("/collaboration/share")
+def collaboration_share(payload: CollaborationShare) -> dict:
+    entry = {
+        "thread_id": f"thread-{len(collaboration_threads)+1:04d}",
+        "program_id": payload.program_id,
+        "title": payload.title,
+        "message": payload.message,
+        "participants": payload.participants,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+    collaboration_threads.append(entry)
+    return entry
+
+
+@app.get("/collaboration/threads")
+def collaboration_threads_list(program_id: Optional[str] = None) -> dict:
+    items = collaboration_threads
+    if program_id:
+        items = [t for t in items if t["program_id"] == program_id]
+    return {"items": items, "total": len(items)}
+
+
+@app.get("/reports/templates")
+def list_report_templates() -> dict:
+    return {"templates": report_templates, "total": len(report_templates)}
