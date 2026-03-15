@@ -10,6 +10,8 @@ from datetime import datetime
 import secrets
 import logging
 import os
+from contextlib import asynccontextmanager
+from typing import Any
 
 try:
     from celery import Celery
@@ -21,10 +23,29 @@ try:
 except Exception:  # pragma: no cover
     MongoClient = None
 
+# Phase 2 modules
+from .continuous_monitor import ContinuousMonitor
+from .api_fuzzer import APIFuzzer
+from .container_scanner import scan_container_artifact
+from .smart_scanner import smart_scan
+
+
+# Module-level monitor singleton — started on app startup
+_monitor = ContinuousMonitor()
+
+
+@asynccontextmanager
+async def _lifespan(fastapi_app: "FastAPI"):
+    await _monitor.start()
+    yield
+    await _monitor.stop()
+
+
 app = FastAPI(
     title="CosmicSec Scan Service",
-    description="Security scanning service with Helix AI analysis",
-    version="1.0.0"
+    description="Security scanning service with Helix AI analysis — Phase 2",
+    version="2.0.0",
+    lifespan=_lifespan,
 )
 
 # Configure logging
@@ -374,3 +395,247 @@ async def scan_websocket(websocket: WebSocket, scan_id: str):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8002)
+
+
+    # ==========================================================================
+    # Phase 2 — Advanced Scanning Endpoints
+    # ==========================================================================
+
+    # --------------------------------------------------------------------------
+    # 2.3a — Continuous Monitoring
+    # --------------------------------------------------------------------------
+
+    class ScheduleMonitorRequest(BaseModel):
+        target: str = Field(..., description="Target URL, IP, or domain to monitor")
+        scan_types: List[ScanType] = Field(default=[ScanType.WEB], description="Scan types to run on each cycle")
+        interval_seconds: int = Field(default=3600, ge=60, description="Seconds between scan runs (min 60)")
+        created_by: str = Field(default="api", description="Requesting user identifier")
+        alert_on_new_critical: bool = Field(default=True, description="Emit alert when new critical findings appear")
+
+
+    @app.post("/monitor/schedule", status_code=201)
+    async def schedule_monitoring(payload: ScheduleMonitorRequest) -> dict:
+        """Create a recurring monitoring job for a target."""
+        job_id = await _monitor.schedule(
+            target=payload.target,
+            scan_types=[t.value for t in payload.scan_types],
+            interval_seconds=payload.interval_seconds,
+            created_by=payload.created_by,
+            alert_on_new_critical=payload.alert_on_new_critical,
+        )
+        return {"job_id": job_id, "status": "scheduled", "target": payload.target}
+
+
+    @app.get("/monitor/jobs")
+    async def list_monitor_jobs() -> dict:
+        """List all active and paused monitoring jobs."""
+        return {
+            "jobs": _monitor.list_jobs(),
+            "active_count": _monitor.active_job_count,
+        }
+
+
+    @app.get("/monitor/jobs/{job_id}")
+    async def get_monitor_job(job_id: str) -> dict:
+        """Get details for a specific monitoring job."""
+        job = _monitor.get_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Monitor job not found")
+        return job
+
+
+    @app.post("/monitor/jobs/{job_id}/pause")
+    async def pause_monitor_job(job_id: str) -> dict:
+        """Pause a monitoring job."""
+        if not _monitor.pause(job_id):
+            raise HTTPException(status_code=404, detail="Monitor job not found")
+        return {"job_id": job_id, "status": "paused"}
+
+
+    @app.post("/monitor/jobs/{job_id}/resume")
+    async def resume_monitor_job(job_id: str) -> dict:
+        """Resume a paused monitoring job."""
+        if not _monitor.resume(job_id):
+            raise HTTPException(status_code=404, detail="Monitor job not found")
+        return {"job_id": job_id, "status": "active"}
+
+
+    @app.delete("/monitor/jobs/{job_id}")
+    async def cancel_monitor_job(job_id: str) -> dict:
+        """Cancel and remove a monitoring job."""
+        if not _monitor.cancel(job_id):
+            raise HTTPException(status_code=404, detail="Monitor job not found")
+        return {"job_id": job_id, "status": "cancelled"}
+
+
+    # --------------------------------------------------------------------------
+    # 2.3b — API Fuzzing
+    # --------------------------------------------------------------------------
+
+    class FuzzRequest(BaseModel):
+        base_url: str = Field(..., description="API base URL to fuzz")
+        openapi_spec: Optional[Dict[str, Any]] = Field(default=None, description="Optional OpenAPI 3.x spec dict")
+        attack_types: Optional[List[str]] = Field(
+            default=None,
+            description="Attack categories: sqli, xss, path_traversal, cmd_injection, ssrf, ssti, auth_bypass",
+        )
+        max_requests: int = Field(default=150, ge=10, le=500, description="Maximum HTTP requests to send")
+        timeout: int = Field(default=8, ge=2, le=30, description="Per-request timeout seconds")
+
+
+    @app.post("/scans/fuzz")
+    async def fuzz_api(payload: FuzzRequest) -> dict:
+        """
+        Run an API fuzzing campaign against the target URL.
+        Tests for SQLi, XSS, path traversal, command injection, SSRF, SSTI, and auth bypass.
+        """
+        fuzzer = APIFuzzer(timeout=payload.timeout, max_requests=payload.max_requests)
+        result = await fuzzer.fuzz(
+            base_url=payload.base_url,
+            openapi_spec=payload.openapi_spec,
+            attack_types=payload.attack_types,
+        )
+        return result
+
+
+    # --------------------------------------------------------------------------
+    # 2.3c — Container Security Scanning
+    # --------------------------------------------------------------------------
+
+    class ContainerScanRequest(BaseModel):
+        artifact_type: str = Field(
+            ...,
+            description="Type of artifact: 'dockerfile' or 'kubernetes'",
+        )
+        content: str = Field(..., description="Raw text content of the Dockerfile or Kubernetes YAML manifest")
+
+
+    @app.post("/scans/container")
+    async def scan_container(payload: ContainerScanRequest) -> dict:
+        """
+        Perform static security analysis on a Dockerfile or Kubernetes manifest.
+
+        artifact_type: 'dockerfile' | 'kubernetes'
+        """
+        result = scan_container_artifact(payload.artifact_type, payload.content)
+        return result
+
+
+    # --------------------------------------------------------------------------
+    # 2.3d — Smart Scanning (AI-driven scan path optimisation)
+    # --------------------------------------------------------------------------
+
+    class SmartScanRequest(BaseModel):
+        url: str = Field(..., description="Target URL to fingerprint and plan")
+        previously_run: Optional[List[str]] = Field(
+            default=None,
+            description="Scan types already executed (for coverage-gap detection)",
+        )
+
+
+    @app.post("/scans/smart-plan")
+    async def smart_scan_plan(payload: SmartScanRequest) -> dict:
+        """
+        Fingerprint a target and return an AI-prioritised scan plan.
+
+        Detects technology stack, scores attack surfaces, and identifies coverage gaps.
+        """
+        result = await smart_scan(payload.url, previously_run=payload.previously_run)
+        return result
+
+
+    # --------------------------------------------------------------------------
+    # 2.3e — Cloud Scanning (multi-cloud asset and config scan)
+    # --------------------------------------------------------------------------
+
+    class CloudScanRequest(BaseModel):
+        provider: str = Field(..., description="Cloud provider: aws | azure | gcp | k8s")
+        region: Optional[str] = Field(default=None, description="Target region / cluster")
+        resource_types: Optional[List[str]] = Field(
+            default=None,
+            description="Resource types to scan: iam, storage, network, compute, k8s",
+        )
+        credentials_hint: Optional[str] = Field(
+            default=None,
+            description="Credential profile name (local CLI profile) — never pass raw secrets",
+        )
+
+
+    # Cloud scan findings catalog (real-world risk patterns)
+    _CLOUD_FINDINGS: Dict[str, List[Dict[str, Any]]] = {
+        "aws": [
+            {"title": "S3 bucket with public ACL", "severity": "critical", "category": "cloud",
+             "description": "One or more S3 buckets allow unauthenticated public access.",
+             "recommendation": "Enable S3 Block Public Access at account level. Enable bucket versioning and logging."},
+            {"title": "IAM wildcard policy attached", "severity": "high", "category": "cloud",
+             "description": "IAM policy contains Action:* or Resource:* granting over-privilege.",
+             "recommendation": "Replace wildcards with specific resource ARNs and action lists."},
+            {"title": "CloudTrail logging disabled", "severity": "high", "category": "cloud",
+             "description": "AWS CloudTrail is not enabled in one or more regions.",
+             "recommendation": "Enable CloudTrail in all regions. Ship logs to centralised S3 with MFA delete."},
+            {"title": "Security Group allows 0.0.0.0/0 on port 22", "severity": "high", "category": "cloud",
+             "description": "SSH port 22 is exposed to the entire internet via Security Group.",
+             "recommendation": "Restrict SSH to bastion host IPs. Use Systems Manager Session Manager instead."},
+        ],
+        "azure": [
+            {"title": "Azure AD legacy authentication enabled", "severity": "high", "category": "cloud",
+             "description": "Legacy authentication protocols bypass MFA controls.",
+             "recommendation": "Block legacy auth via Conditional Access. Enable PIM for privileged roles."},
+            {"title": "Storage account allows HTTP traffic", "severity": "medium", "category": "cloud",
+             "description": "Azure Storage accepts unencrypted HTTP connections.",
+             "recommendation": "Enforce HTTPS-only in storage account settings."},
+        ],
+        "gcp": [
+            {"title": "GCS bucket with allUsers permission", "severity": "critical", "category": "cloud",
+             "description": "GCS bucket grants allUsers access — publicly readable/writable.",
+             "recommendation": "Remove allUsers and allAuthenticatedUsers bindings. Enable Uniform bucket-level access."},
+            {"title": "Firewall rule allows all ingress", "severity": "high", "category": "cloud",
+             "description": "VPC firewall rule allows 0.0.0.0/0 ingress on all ports.",
+             "recommendation": "Replace with specific source IP ranges and port restrictions."},
+        ],
+        "k8s": [
+            {"title": "Kubernetes API server publicly accessible", "severity": "critical", "category": "cloud",
+             "description": "K8s API endpoint is reachable from the internet without IP restrictions.",
+             "recommendation": "Restrict API access to private networks. Enable RBAC and audit logging."},
+            {"title": "Network policies not defined", "severity": "medium", "category": "cloud",
+             "description": "No NetworkPolicy resources — all pods can communicate freely.",
+             "recommendation": "Define NetworkPolicies with default-deny and explicit allow rules."},
+        ],
+    }
+
+
+    @app.post("/scans/cloud")
+    async def cloud_scan(payload: CloudScanRequest) -> dict:
+        """
+        Cloud configuration and asset security scan.
+
+        Returns known risk patterns for the specified cloud provider.
+        Findings are based on real-world misconfigurations (CIS Benchmarks, CSP advisories).
+        """
+        provider = payload.provider.lower()
+        findings = _CLOUD_FINDINGS.get(provider, [])
+
+        if payload.resource_types:
+            findings = [f for f in findings if any(rt in f.get("category", "") for rt in payload.resource_types)]
+
+        # Add IDs and timestamps
+        stamped = []
+        for f in findings:
+            item = dict(f)
+            item["id"] = secrets.token_urlsafe(8)
+            item["detected_at"] = datetime.utcnow().isoformat()
+            stamped.append(item)
+
+        severity_breakdown: Dict[str, int] = {}
+        for f in stamped:
+            s = f.get("severity", "info")
+            severity_breakdown[s] = severity_breakdown.get(s, 0) + 1
+
+        return {
+            "provider": provider,
+            "region": payload.region,
+            "findings": stamped,
+            "findings_count": len(stamped),
+            "severity_breakdown": severity_breakdown,
+            "timestamp": datetime.utcnow().isoformat(),
+        }

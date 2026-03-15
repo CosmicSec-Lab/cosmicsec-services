@@ -688,6 +688,330 @@ async def plugin_disable(request: Request, name: str):
             raise HTTPException(status_code=503, detail="Plugin registry unavailable")
 
 
+# ==========================================================================
+# Phase 2 — New proxy routes: monitoring, fuzzing, container, smart scan
+# ==========================================================================
+
+# Continuous monitoring -------------------------------------------------------
+
+@app.post("/api/scan/monitor/schedule")
+@limiter.limit("20/minute")
+async def scan_monitor_schedule(request: Request):
+    data = await request.json()
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.post(f"{SERVICE_URLS['scan']}/monitor/schedule", json=data, timeout=10.0)
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            raise HTTPException(status_code=503, detail="Scan service unavailable")
+
+
+@app.get("/api/scan/monitor/jobs")
+@limiter.limit("30/minute")
+async def scan_monitor_jobs(request: Request):
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.get(f"{SERVICE_URLS['scan']}/monitor/jobs", timeout=5.0)
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            raise HTTPException(status_code=503, detail="Scan service unavailable")
+
+
+@app.get("/api/scan/monitor/jobs/{job_id}")
+@limiter.limit("30/minute")
+async def scan_monitor_job_detail(request: Request, job_id: str):
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.get(f"{SERVICE_URLS['scan']}/monitor/jobs/{job_id}", timeout=5.0)
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            raise HTTPException(status_code=503, detail="Scan service unavailable")
+
+
+@app.post("/api/scan/monitor/jobs/{job_id}/pause")
+@limiter.limit("20/minute")
+async def scan_monitor_pause(request: Request, job_id: str):
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.post(f"{SERVICE_URLS['scan']}/monitor/jobs/{job_id}/pause", timeout=5.0)
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            raise HTTPException(status_code=503, detail="Scan service unavailable")
+
+
+@app.post("/api/scan/monitor/jobs/{job_id}/resume")
+@limiter.limit("20/minute")
+async def scan_monitor_resume(request: Request, job_id: str):
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.post(f"{SERVICE_URLS['scan']}/monitor/jobs/{job_id}/resume", timeout=5.0)
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            raise HTTPException(status_code=503, detail="Scan service unavailable")
+
+
+@app.delete("/api/scan/monitor/jobs/{job_id}")
+@limiter.limit("20/minute")
+async def scan_monitor_cancel(request: Request, job_id: str):
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.delete(f"{SERVICE_URLS['scan']}/monitor/jobs/{job_id}", timeout=5.0)
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            raise HTTPException(status_code=503, detail="Scan service unavailable")
+
+
+# API fuzzing -----------------------------------------------------------------
+
+@app.post("/api/scans/fuzz")
+@limiter.limit("10/minute")
+async def scans_fuzz(request: Request):
+    """Run an API security fuzzing campaign."""
+    data = await request.json()
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.post(f"{SERVICE_URLS['scan']}/scans/fuzz", json=data, timeout=60.0)
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            raise HTTPException(status_code=503, detail="Scan service unavailable")
+
+
+# Container / K8s scanning ----------------------------------------------------
+
+@app.post("/api/scans/container")
+@limiter.limit("20/minute")
+async def scans_container(request: Request):
+    """Scan a Dockerfile or Kubernetes manifest for security issues."""
+    data = await request.json()
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.post(f"{SERVICE_URLS['scan']}/scans/container", json=data, timeout=30.0)
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            raise HTTPException(status_code=503, detail="Scan service unavailable")
+
+
+# Smart scan plan -------------------------------------------------------------
+
+@app.post("/api/scans/smart-plan")
+@limiter.limit("20/minute")
+async def scans_smart_plan(request: Request):
+    """AI-driven scan plan optimisation via technology fingerprinting."""
+    data = await request.json()
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.post(f"{SERVICE_URLS['scan']}/scans/smart-plan", json=data, timeout=30.0)
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            raise HTTPException(status_code=503, detail="Scan service unavailable")
+
+
+# Cloud configuration scan ----------------------------------------------------
+
+@app.post("/api/scans/cloud")
+@limiter.limit("10/minute")
+async def scans_cloud(request: Request):
+    """Cloud infrastructure security scan (AWS / Azure / GCP / K8s)."""
+    data = await request.json()
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.post(f"{SERVICE_URLS['scan']}/scans/cloud", json=data, timeout=30.0)
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            raise HTTPException(status_code=503, detail="Scan service unavailable")
+
+
+# ==========================================================================
+# Phase 2 — AI service new routes
+# ==========================================================================
+
+@app.post("/api/ai/agent/autonomous")
+@limiter.limit("10/minute")
+async def ai_agent_autonomous(request: Request):
+    """Autonomous multi-step AI security analysis agent."""
+    data = await request.json()
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.post(f"{SERVICE_URLS['ai']}/agent/autonomous", json=data, timeout=60.0)
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            raise HTTPException(status_code=503, detail="AI service unavailable")
+
+
+@app.post("/api/ai/exploit/suggest")
+@limiter.limit("20/minute")
+async def ai_exploit_suggest(request: Request):
+    """Educational CVE exploit guidance and remediation advice."""
+    data = await request.json()
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.post(f"{SERVICE_URLS['ai']}/exploit/suggest", json=data, timeout=30.0)
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            raise HTTPException(status_code=503, detail="AI service unavailable")
+
+
+@app.post("/api/ai/anomaly/fit")
+@limiter.limit("10/minute")
+async def ai_anomaly_fit(request: Request):
+    """Train the anomaly detector on historical scan baseline data."""
+    data = await request.json()
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.post(f"{SERVICE_URLS['ai']}/anomaly/fit", json=data, timeout=30.0)
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            raise HTTPException(status_code=503, detail="AI service unavailable")
+
+
+@app.post("/api/ai/anomaly/detect")
+@limiter.limit("30/minute")
+async def ai_anomaly_detect(request: Request):
+    """Score a single scan result for anomalousness."""
+    data = await request.json()
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.post(f"{SERVICE_URLS['ai']}/anomaly/detect", json=data, timeout=15.0)
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            raise HTTPException(status_code=503, detail="AI service unavailable")
+
+
+@app.post("/api/ai/anomaly/batch")
+@limiter.limit("10/minute")
+async def ai_anomaly_batch(request: Request):
+    """Batch anomaly detection across multiple scan records."""
+    data = await request.json()
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.post(f"{SERVICE_URLS['ai']}/anomaly/batch", json=data, timeout=30.0)
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            raise HTTPException(status_code=503, detail="AI service unavailable")
+
+
+# ==========================================================================
+# Phase 2 — Collaborative report editing routes
+# ==========================================================================
+
+@app.post("/api/collab/rooms/{room_id}/reports")
+@limiter.limit("30/minute")
+async def collab_create_report_section(request: Request, room_id: str):
+    data = await request.json()
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.post(f"{SERVICE_URLS['collab']}/rooms/{room_id}/reports", json=data, timeout=10.0)
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            raise HTTPException(status_code=503, detail="Collab service unavailable")
+
+
+@app.get("/api/collab/rooms/{room_id}/reports")
+@limiter.limit("60/minute")
+async def collab_list_report_sections(request: Request, room_id: str):
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.get(f"{SERVICE_URLS['collab']}/rooms/{room_id}/reports", timeout=5.0)
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            raise HTTPException(status_code=503, detail="Collab service unavailable")
+
+
+@app.put("/api/collab/rooms/{room_id}/reports/{section_id}")
+@limiter.limit("30/minute")
+async def collab_update_report_section(request: Request, room_id: str, section_id: str):
+    data = await request.json()
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.put(
+                f"{SERVICE_URLS['collab']}/rooms/{room_id}/reports/{section_id}",
+                json=data,
+                timeout=10.0,
+            )
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            raise HTTPException(status_code=503, detail="Collab service unavailable")
+
+
+@app.delete("/api/collab/rooms/{room_id}/reports/{section_id}")
+@limiter.limit("20/minute")
+async def collab_delete_report_section(request: Request, room_id: str, section_id: str):
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.delete(
+                f"{SERVICE_URLS['collab']}/rooms/{room_id}/reports/{section_id}",
+                timeout=5.0,
+            )
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            raise HTTPException(status_code=503, detail="Collab service unavailable")
+
+
+@app.get("/api/collab/rooms/{room_id}/reports/{section_id}/history")
+@limiter.limit("30/minute")
+async def collab_section_history(request: Request, room_id: str, section_id: str):
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.get(
+                f"{SERVICE_URLS['collab']}/rooms/{room_id}/reports/{section_id}/history",
+                timeout=5.0,
+            )
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            raise HTTPException(status_code=503, detail="Collab service unavailable")
+
+
+# Plugin marketplace routes ---------------------------------------------------
+
+@app.get("/api/marketplace")
+@limiter.limit("60/minute")
+async def marketplace_list(request: Request):
+    """Browse the plugin community marketplace."""
+    params = dict(request.query_params)
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.get(f"{SERVICE_URLS['plugins']}/marketplace", params=params, timeout=5.0)
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            raise HTTPException(status_code=503, detail="Plugin registry unavailable")
+
+
+@app.post("/api/marketplace/publish")
+@limiter.limit("10/minute")
+async def marketplace_publish(request: Request):
+    """Publish a plugin to the community marketplace."""
+    data = await request.json()
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.post(f"{SERVICE_URLS['plugins']}/marketplace/publish", json=data, timeout=10.0)
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            raise HTTPException(status_code=503, detail="Plugin registry unavailable")
+
+
+@app.post("/api/plugins/{name}/rate")
+@limiter.limit("20/minute")
+async def plugin_rate(request: Request, name: str):
+    data = await request.json()
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.post(f"{SERVICE_URLS['plugins']}/plugins/{name}/rate", json=data, timeout=5.0)
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            raise HTTPException(status_code=503, detail="Plugin registry unavailable")
+
+
+@app.get("/api/plugins/{name}/rating")
+@limiter.limit("60/minute")
+async def plugin_rating(request: Request, name: str):
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.get(f"{SERVICE_URLS['plugins']}/plugins/{name}/rating", timeout=5.0)
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            raise HTTPException(status_code=503, detail="Plugin registry unavailable")
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
