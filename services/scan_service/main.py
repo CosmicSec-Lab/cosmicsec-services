@@ -2,13 +2,24 @@
 CosmicSec Scan Service
 Handles security scanning operations with distributed task processing
 """
-from fastapi import FastAPI, BackgroundTasks, HTTPException, status
+from fastapi import FastAPI, BackgroundTasks, HTTPException, status, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, HttpUrl, Field
 from typing import List, Optional, Dict
 from enum import Enum
 from datetime import datetime
 import secrets
 import logging
+import os
+
+try:
+    from celery import Celery
+except Exception:  # pragma: no cover
+    Celery = None
+
+try:
+    from pymongo import MongoClient
+except Exception:  # pragma: no cover
+    MongoClient = None
 
 app = FastAPI(
     title="CosmicSec Scan Service",
@@ -75,6 +86,39 @@ class Finding(BaseModel):
 scans_db = {}
 findings_db = []
 
+celery_app = None
+if Celery is not None:
+    broker_url = os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0")
+    backend_url = os.getenv("CELERY_BACKEND_URL", "redis://redis:6379/0")
+    celery_app = Celery("cosmicsec_scan", broker=broker_url, backend=backend_url)
+
+mongo_collection = None
+if MongoClient is not None:
+    try:
+        mongo_client = MongoClient(os.getenv("MONGO_URI", "mongodb://mongodb:27017"), serverSelectionTimeoutMS=2000)
+        mongo_collection = mongo_client["cosmicsec"]["scan_results"]
+    except Exception:
+        mongo_collection = None
+
+
+class ConnectionManager:
+    def __init__(self) -> None:
+        self.active_connections: Dict[str, List[WebSocket]] = {}
+
+    async def connect(self, scan_id: str, websocket: WebSocket) -> None:
+        await websocket.accept()
+        self.active_connections.setdefault(scan_id, []).append(websocket)
+
+    def disconnect(self, scan_id: str, websocket: WebSocket) -> None:
+        self.active_connections[scan_id] = [ws for ws in self.active_connections.get(scan_id, []) if ws != websocket]
+
+    async def broadcast(self, scan_id: str, message: dict) -> None:
+        for ws in self.active_connections.get(scan_id, []):
+            await ws.send_json(message)
+
+
+ws_manager = ConnectionManager()
+
 
 async def perform_scan(scan_id: str, config: ScanConfig):
     """Background task to perform the actual scan"""
@@ -84,6 +128,7 @@ async def perform_scan(scan_id: str, config: ScanConfig):
         # Update status
         scan["status"] = ScanStatus.RUNNING
         scan["started_at"] = datetime.utcnow()
+        await ws_manager.broadcast(scan_id, {"scan_id": scan_id, "status": "running", "progress": 0})
 
         # Simulate scanning process
         logger.info(f"Starting scan {scan_id} for target {config.target}")
@@ -91,6 +136,7 @@ async def perform_scan(scan_id: str, config: ScanConfig):
         # Network scan simulation
         if ScanType.NETWORK in config.scan_types:
             scan["progress"] = 25
+            await ws_manager.broadcast(scan_id, {"scan_id": scan_id, "status": "running", "progress": 25})
             logger.info(f"Scan {scan_id}: Network scan in progress...")
             # Add simulated findings
             findings_db.append({
@@ -108,6 +154,7 @@ async def perform_scan(scan_id: str, config: ScanConfig):
         # Web scan simulation
         if ScanType.WEB in config.scan_types:
             scan["progress"] = 50
+            await ws_manager.broadcast(scan_id, {"scan_id": scan_id, "status": "running", "progress": 50})
             logger.info(f"Scan {scan_id}: Web scan in progress...")
             findings_db.append({
                 "id": secrets.token_urlsafe(16),
@@ -124,12 +171,14 @@ async def perform_scan(scan_id: str, config: ScanConfig):
         # API scan simulation
         if ScanType.API in config.scan_types:
             scan["progress"] = 75
+            await ws_manager.broadcast(scan_id, {"scan_id": scan_id, "status": "running", "progress": 75})
             logger.info(f"Scan {scan_id}: API scan in progress...")
 
         # Complete scan
         scan["progress"] = 100
         scan["status"] = ScanStatus.COMPLETED
         scan["completed_at"] = datetime.utcnow()
+        await ws_manager.broadcast(scan_id, {"scan_id": scan_id, "status": "completed", "progress": 100})
 
         # Count findings
         scan_findings = [f for f in findings_db if f["scan_id"] == scan_id]
@@ -142,12 +191,29 @@ async def perform_scan(scan_id: str, config: ScanConfig):
             severity_breakdown[severity] = severity_breakdown.get(severity, 0) + 1
         scan["severity_breakdown"] = severity_breakdown
 
+        if mongo_collection is not None:
+            mongo_collection.update_one(
+                {"scan_id": scan_id},
+                {
+                    "$set": {
+                        "scan_id": scan_id,
+                        "target": config.target,
+                        "status": scan["status"],
+                        "findings": scan_findings,
+                        "severity_breakdown": severity_breakdown,
+                        "updated_at": datetime.utcnow(),
+                    }
+                },
+                upsert=True,
+            )
+
         logger.info(f"Scan {scan_id} completed successfully with {len(scan_findings)} findings")
 
     except Exception as e:
         logger.error(f"Scan {scan_id} failed: {str(e)}")
         scan["status"] = ScanStatus.FAILED
         scan["completed_at"] = datetime.utcnow()
+        await ws_manager.broadcast(scan_id, {"scan_id": scan_id, "status": "failed", "progress": scan.get("progress", 0)})
 
 
 @app.get("/health")
@@ -186,6 +252,22 @@ async def create_scan(config: ScanConfig, background_tasks: BackgroundTasks):
     logger.info(f"Created new scan {scan_id} for target {config.target}")
 
     return Scan(**scan_data)
+
+
+@app.post("/scans/{scan_id}/enqueue")
+async def enqueue_scan(scan_id: str):
+    """Queue scan execution using Celery when available."""
+    if scan_id not in scans_db:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scan not found")
+
+    if celery_app is None:
+        return {"queued": False, "reason": "Celery not configured", "scan_id": scan_id}
+
+    celery_app.send_task(
+        "scan.perform",
+        kwargs={"scan_id": scan_id, "target": scans_db[scan_id]["target"]},
+    )
+    return {"queued": True, "scan_id": scan_id}
 
 
 @app.get("/scans/{scan_id}", response_model=Scan)
@@ -277,6 +359,16 @@ async def get_stats():
         "severity_breakdown": severity_breakdown,
         "timestamp": datetime.utcnow().isoformat()
     }
+
+
+@app.websocket("/ws/scans/{scan_id}")
+async def scan_websocket(websocket: WebSocket, scan_id: str):
+    await ws_manager.connect(scan_id, websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        ws_manager.disconnect(scan_id, websocket)
 
 
 if __name__ == "__main__":

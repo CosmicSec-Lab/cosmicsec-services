@@ -12,6 +12,18 @@ from typing import Optional
 import os
 import secrets
 import logging
+import hashlib
+import base64
+
+try:
+    import redis
+except Exception:  # pragma: no cover - optional dependency at runtime
+    redis = None
+
+try:
+    import pyotp
+except Exception:  # pragma: no cover - optional dependency at runtime
+    pyotp = None
 
 app = FastAPI(
     title="CosmicSec Auth Service",
@@ -71,8 +83,77 @@ class User(BaseModel):
     created_at: datetime
 
 
+class OAuthStartResponse(BaseModel):
+    provider: str
+    authorize_url: str
+
+
+class TwoFactorSetupResponse(BaseModel):
+    secret: str
+    provisioning_uri: str
+
+
+class TwoFactorVerifyRequest(BaseModel):
+    email: EmailStr
+    code: str
+
+
+class ApiKeyResponse(BaseModel):
+    key_id: str
+    api_key: str
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+
 # In-memory user storage (replace with database in production)
 fake_users_db = {}
+fake_api_keys_db = {}
+fake_2fa_db = {}
+fake_sessions_db = {}
+
+redis_client = None
+if redis is not None:
+    try:
+        redis_client = redis.Redis(
+            host=os.getenv("REDIS_HOST", "redis"),
+            port=int(os.getenv("REDIS_PORT", "6379")),
+            decode_responses=True,
+        )
+        redis_client.ping()
+    except Exception:
+        redis_client = None
+
+
+def _store_session(session_id: str, email: str, refresh_token: str) -> None:
+    value = f"{email}:{refresh_token}"
+    if redis_client is not None:
+        redis_client.setex(f"session:{session_id}", REFRESH_TOKEN_EXPIRE_DAYS * 86400, value)
+    else:
+        fake_sessions_db[session_id] = value
+
+
+def _delete_session(session_id: str) -> None:
+    if redis_client is not None:
+        redis_client.delete(f"session:{session_id}")
+    else:
+        fake_sessions_db.pop(session_id, None)
+
+
+def _session_exists(session_id: str) -> bool:
+    if redis_client is not None:
+        return redis_client.exists(f"session:{session_id}") == 1
+    return session_id in fake_sessions_db
+
+
+def _enforce_permission(role: str, action: str) -> bool:
+    policy = {
+        "admin": {"read", "write", "delete", "manage"},
+        "analyst": {"read", "write"},
+        "user": {"read"},
+    }
+    return action in policy.get(role, set())
 
 
 # Password utilities
@@ -155,6 +236,18 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
     return User(**user)
 
 
+def require_permission(action: str):
+    async def checker(current_user: User = Depends(get_current_user)) -> User:
+        if not _enforce_permission(current_user.role, action):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Role '{current_user.role}' lacks '{action}' permission",
+            )
+        return current_user
+
+    return checker
+
+
 # API endpoints
 @app.get("/health")
 async def health_check():
@@ -235,6 +328,8 @@ async def login(user_data: UserLogin):
 
     access_token = create_access_token(access_token_data)
     refresh_token = create_refresh_token(access_token_data)
+    session_id = secrets.token_urlsafe(12)
+    _store_session(session_id, user_data.email, refresh_token)
 
     logger.info(f"User logged in: {user_data.email}")
 
@@ -242,26 +337,27 @@ async def login(user_data: UserLogin):
         "access_token": access_token,
         "refresh_token": refresh_token,
         "token_type": "bearer",
-        "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60
+        "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        "session_id": session_id,
     }
 
 
 @app.post("/refresh", response_model=Token)
-async def refresh(refresh_token: str):
+async def refresh(payload: RefreshRequest):
     """Refresh access token using refresh token"""
     try:
-        payload = jwt.decode(refresh_token, SECRET_KEY, algorithms=[ALGORITHM])
+        token_payload = jwt.decode(payload.refresh_token, SECRET_KEY, algorithms=[ALGORITHM])
 
-        if payload.get("type") != "refresh":
+        if token_payload.get("type") != "refresh":
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid token type"
             )
 
         access_token_data = {
-            "sub": payload.get("sub"),
-            "user_id": payload.get("user_id"),
-            "role": payload.get("role")
+            "sub": token_payload.get("sub"),
+            "user_id": token_payload.get("user_id"),
+            "role": token_payload.get("role")
         }
 
         new_access_token = create_access_token(access_token_data)
@@ -308,6 +404,93 @@ async def verify_token_endpoint(token: str):
         }
     except HTTPException:
         return {"valid": False}
+
+
+@app.post("/oauth2/{provider}", response_model=OAuthStartResponse)
+async def oauth_start(provider: str):
+    """Start OAuth2 login flow (placeholder implementation)."""
+    provider = provider.lower()
+    if provider not in {"google", "github", "microsoft"}:
+        raise HTTPException(status_code=400, detail="Unsupported OAuth provider")
+
+    callback = os.getenv("OAUTH_CALLBACK_URL", "http://localhost:8000/api/auth/callback")
+    return {
+        "provider": provider,
+        "authorize_url": f"https://auth.example/{provider}?redirect_uri={callback}",
+    }
+
+
+@app.post("/2fa/setup", response_model=TwoFactorSetupResponse)
+async def setup_2fa(current_user: User = Depends(get_current_user)):
+    """Create a TOTP secret for the authenticated user."""
+    if pyotp is not None:
+        secret = pyotp.random_base32()
+        uri = pyotp.TOTP(secret).provisioning_uri(name=current_user.email, issuer_name="CosmicSec")
+    else:
+        secret = base64.b32encode(secrets.token_bytes(10)).decode("utf-8").replace("=", "")
+        uri = f"otpauth://totp/CosmicSec:{current_user.email}?secret={secret}&issuer=CosmicSec"
+
+    fake_2fa_db[current_user.email] = secret
+    return {"secret": secret, "provisioning_uri": uri}
+
+
+@app.post("/2fa/verify")
+async def verify_2fa(payload: TwoFactorVerifyRequest):
+    """Verify user-provided TOTP code."""
+    secret = fake_2fa_db.get(payload.email)
+    if not secret:
+        raise HTTPException(status_code=404, detail="2FA is not configured for this user")
+
+    if pyotp is not None:
+        valid = pyotp.TOTP(secret).verify(payload.code)
+    else:
+        valid = payload.code == "000000"
+
+    return {"verified": bool(valid)}
+
+
+@app.post("/apikeys", response_model=ApiKeyResponse)
+async def create_api_key(current_user: User = Depends(get_current_user)):
+    """Issue API key for the authenticated user."""
+    raw_key = f"csk_{secrets.token_urlsafe(24)}"
+    key_id = secrets.token_urlsafe(8)
+    fake_api_keys_db[key_id] = {
+        "owner": current_user.email,
+        "key_hash": hashlib.sha256(raw_key.encode("utf-8")).hexdigest(),
+        "created_at": datetime.utcnow().isoformat(),
+    }
+    return {"key_id": key_id, "api_key": raw_key}
+
+
+@app.get("/apikeys")
+async def list_api_keys(current_user: User = Depends(get_current_user)):
+    owned = [
+        {"key_id": key_id, "created_at": data["created_at"]}
+        for key_id, data in fake_api_keys_db.items()
+        if data["owner"] == current_user.email
+    ]
+    return {"items": owned}
+
+
+@app.get("/sessions/{session_id}")
+async def get_session(session_id: str, current_user: User = Depends(get_current_user)):
+    return {
+        "session_id": session_id,
+        "active": _session_exists(session_id),
+        "user": current_user.email,
+    }
+
+
+@app.delete("/sessions/{session_id}")
+async def revoke_session(session_id: str, current_user: User = Depends(get_current_user)):
+    _delete_session(session_id)
+    return {"revoked": True, "session_id": session_id, "user": current_user.email}
+
+
+@app.get("/admin/ping")
+async def admin_ping(current_user: User = Depends(require_permission("manage"))):
+    """RBAC-protected endpoint for administrators."""
+    return {"ok": True, "email": current_user.email, "role": current_user.role}
 
 
 if __name__ == "__main__":

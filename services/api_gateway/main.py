@@ -60,7 +60,8 @@ SERVICE_URLS = {
     "auth": "http://auth-service:8001",
     "scan": "http://scan-service:8002",
     "ai": "http://ai-service:8003",
-    "report": "http://report-service:8004"
+    "recon": "http://recon-service:8004",
+    "report": "http://report-service:8005"
 }
 
 
@@ -273,6 +274,98 @@ async def platform_info():
             "Real-time collaboration",
             "Enterprise compliance"
         ]
+    }
+
+
+# AI service endpoints (Phase 2 kickoff)
+@app.get("/api/ai/health")
+@limiter.limit("60/minute")
+async def ai_health(request: Request):
+    """Proxy AI service health endpoint"""
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(f"{SERVICE_URLS['ai']}/health", timeout=5.0)
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except Exception as e:
+            logger.error(f"AI service error: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="AI service unavailable"
+            )
+
+
+@app.post("/api/ai/analyze")
+@limiter.limit("30/minute")
+async def ai_analyze(request: Request):
+    """Proxy AI service analyze endpoint"""
+    data = await request.json()
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                f"{SERVICE_URLS['ai']}/analyze",
+                json=data,
+                timeout=15.0
+            )
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except Exception as e:
+            logger.error(f"AI service error: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="AI service unavailable"
+            )
+
+
+@app.post("/api/recon")
+@limiter.limit("30/minute")
+async def recon_lookup(request: Request):
+    """Proxy recon request to recon service"""
+    data = await request.json()
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                f"{SERVICE_URLS['recon']}/recon",
+                json=data,
+                timeout=15.0,
+            )
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except Exception as e:
+            logger.error(f"Recon service error: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Recon service unavailable"
+            )
+
+
+@app.post("/api/reports/generate")
+@limiter.limit("20/minute")
+async def generate_report(request: Request):
+    """Proxy report generation request to report service"""
+    data = await request.json()
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                f"{SERVICE_URLS['report']}/reports/generate",
+                json=data,
+                timeout=20.0,
+            )
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except Exception as e:
+            logger.error(f"Report service error: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Report service unavailable"
+            )
+
+
+@app.post("/api/webhooks/events")
+@limiter.limit("120/minute")
+async def webhook_events(request: Request):
+    """Webhook ingress endpoint for external integrations."""
+    payload = await request.json()
+    return {
+        "status": "received",
+        "event_type": payload.get("event_type", "unknown"),
+        "timestamp": time.time(),
     }
 
 
