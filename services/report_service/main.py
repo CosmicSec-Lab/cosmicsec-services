@@ -1,6 +1,6 @@
 from datetime import datetime
 from pathlib import Path
-from typing import List
+from typing import Any, Dict, List
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -31,6 +31,27 @@ class ScheduleRequest(BaseModel):
     scan_id: str
     format: str = "pdf"
     cron: str = "0 0 * * *"
+
+
+class TopologyRequest(BaseModel):
+    nodes: List[dict] = Field(default_factory=list)
+    edges: List[dict] = Field(default_factory=list)
+    node_filter: str = Field(default="all")
+
+
+class AttackPathRequest(BaseModel):
+    attack_steps: List[dict] = Field(default_factory=list)
+    highlight_threshold: int = Field(default=70)
+
+
+class ThreatHeatmapRequest(BaseModel):
+    observations: List[dict] = Field(default_factory=list)
+    group_by: str = Field(default="region")
+
+
+class ImmersiveViewRequest(BaseModel):
+    mode: str = Field(default="vr", pattern="^(vr|ar)$")
+    scene_name: str = Field(default="soc-operations")
 
 
 REPORT_DIR = Path("/tmp/reports")
@@ -210,3 +231,64 @@ def schedule_report(payload: ScheduleRequest) -> dict:
     }
     scheduled_jobs.append(job)
     return {"status": "scheduled", "job": job}
+
+
+@app.post("/visualization/topology")
+def generate_topology(payload: TopologyRequest) -> dict:
+    filtered_nodes = payload.nodes
+    if payload.node_filter != "all":
+        filtered_nodes = [n for n in payload.nodes if n.get("type") == payload.node_filter]
+    allowed_ids = {n.get("id") for n in filtered_nodes}
+    filtered_edges = [e for e in payload.edges if e.get("source") in allowed_ids and e.get("target") in allowed_ids]
+    return {
+        "mode": "threejs-ready",
+        "node_count": len(filtered_nodes),
+        "edge_count": len(filtered_edges),
+        "topology": {"nodes": filtered_nodes, "edges": filtered_edges},
+        "generated_at": datetime.utcnow().isoformat(),
+    }
+
+
+@app.post("/visualization/attack-path")
+def build_attack_path(payload: AttackPathRequest) -> dict:
+    ranked = sorted(payload.attack_steps, key=lambda s: int(s.get("risk", 0)), reverse=True)
+    highlighted = [step for step in ranked if int(step.get("risk", 0)) >= payload.highlight_threshold]
+    return {
+        "total_steps": len(payload.attack_steps),
+        "highlighted_steps": len(highlighted),
+        "path": ranked,
+        "highlighted": highlighted,
+        "generated_at": datetime.utcnow().isoformat(),
+    }
+
+
+@app.post("/visualization/heatmap")
+def create_threat_heatmap(payload: ThreatHeatmapRequest) -> dict:
+    buckets: Dict[str, Dict[str, Any]] = {}
+    for obs in payload.observations:
+        bucket = str(obs.get(payload.group_by, "unknown"))
+        severity = str(obs.get("severity", "low")).lower()
+        score = {"critical": 4, "high": 3, "medium": 2, "low": 1}.get(severity, 1)
+        if bucket not in buckets:
+            buckets[bucket] = {"count": 0, "score": 0}
+        buckets[bucket]["count"] += 1
+        buckets[bucket]["score"] += score
+
+    heatmap = [{"bucket": key, **value} for key, value in buckets.items()]
+    heatmap.sort(key=lambda item: item["score"], reverse=True)
+    return {
+        "group_by": payload.group_by,
+        "heatmap": heatmap,
+        "generated_at": datetime.utcnow().isoformat(),
+    }
+
+
+@app.post("/visualization/immersive")
+def create_immersive_view(payload: ImmersiveViewRequest) -> dict:
+    return {
+        "mode": payload.mode,
+        "scene_name": payload.scene_name,
+        "status": "configured",
+        "controls": ["orbit", "zoom", "node-select", "timeline-scrub"],
+        "generated_at": datetime.utcnow().isoformat(),
+    }

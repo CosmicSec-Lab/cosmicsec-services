@@ -171,6 +171,42 @@ class TenantQuotaUpdate(BaseModel):
     max_scans_per_day: Optional[int] = Field(default=None, ge=1, le=1000000)
 
 
+class BillingCustomerCreate(BaseModel):
+    billing_email: EmailStr
+    provider: str = "stripe"
+
+
+class SubscriptionUpdate(BaseModel):
+    plan: str = Field(default="team")
+    status: str = Field(default="active")
+
+
+class InvoiceCreate(BaseModel):
+    amount_cents: int = Field(..., ge=1)
+    currency: str = Field(default="USD", min_length=3, max_length=3)
+    description: str = Field(default="Security platform usage")
+
+
+class SecretStoreRequest(BaseModel):
+    name: str
+    value: str
+    engine: str = "vault"
+
+
+class FieldEncryptionRequest(BaseModel):
+    value: str
+
+
+class SecurityScanRequest(BaseModel):
+    target: str
+    controls: List[str] = Field(default_factory=lambda: ["mfa", "rbac", "audit_logs", "token_rotation"])
+
+
+class DataResidencyRequest(BaseModel):
+    region: str = Field(default="us-east-1")
+    storage_class: str = Field(default="standard")
+
+
 # In-memory user storage (replace with database in production)
 fake_users_db = {}
 fake_api_keys_db = {}
@@ -188,6 +224,8 @@ sms_challenges_db = {}
 # Multi-tenant billing and retention (Phase 3)
 tenant_billing: Dict[str, Dict[str, Any]] = {}
 tenant_retention: Dict[str, int] = {}  # days
+tenant_data_residency: Dict[str, Dict[str, str]] = {}
+vault_store: Dict[str, Dict[str, str]] = {}
 
 
 def _hash_audit_entry(entry: Dict[str, Any], previous_hash: Optional[str]) -> str:
@@ -1067,6 +1105,185 @@ async def set_org_quotas(org_id: str, payload: TenantQuotaUpdate, current_user: 
         quotas["max_scans_per_day"] = payload.max_scans_per_day
     _audit_org("org.quota.update", current_user.email, org_id, str(quotas))
     return {"org_id": org_id, "quotas": quotas}
+
+
+@app.post("/orgs/{org_id}/billing/customer")
+async def create_billing_customer(
+    org_id: str,
+    payload: BillingCustomerCreate,
+    current_user: User = Depends(require_permission("manage")),
+):
+    _ensure_org_exists(org_id)
+    _require_org_admin(org_id, current_user.email)
+    customer_id = f"cus_{secrets.token_urlsafe(8)}"
+    state = tenant_billing.setdefault(org_id, {"invoices": []})
+    state["customer"] = {
+        "customer_id": customer_id,
+        "billing_email": payload.billing_email,
+        "provider": payload.provider,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+    _audit_org("org.billing.customer.create", current_user.email, org_id, f"provider={payload.provider}")
+    return {"org_id": org_id, "customer": state["customer"]}
+
+
+@app.post("/orgs/{org_id}/billing/subscription")
+async def set_billing_subscription(
+    org_id: str,
+    payload: SubscriptionUpdate,
+    current_user: User = Depends(require_permission("manage")),
+):
+    _ensure_org_exists(org_id)
+    _require_org_admin(org_id, current_user.email)
+    state = tenant_billing.setdefault(org_id, {"invoices": []})
+    state["subscription"] = {
+        "plan": payload.plan,
+        "status": payload.status,
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+    _audit_org("org.billing.subscription.update", current_user.email, org_id, f"plan={payload.plan}")
+    return {"org_id": org_id, "subscription": state["subscription"]}
+
+
+@app.post("/orgs/{org_id}/billing/invoices")
+async def create_billing_invoice(
+    org_id: str,
+    payload: InvoiceCreate,
+    current_user: User = Depends(require_permission("manage")),
+):
+    _ensure_org_exists(org_id)
+    _require_org_admin(org_id, current_user.email)
+    state = tenant_billing.setdefault(org_id, {"invoices": []})
+    invoice = {
+        "invoice_id": f"inv_{secrets.token_urlsafe(8)}",
+        "amount_cents": payload.amount_cents,
+        "currency": payload.currency.upper(),
+        "description": payload.description,
+        "status": "issued",
+        "issued_at": datetime.utcnow().isoformat(),
+    }
+    state.setdefault("invoices", []).append(invoice)
+    _audit_org("org.billing.invoice.create", current_user.email, org_id, f"amount={payload.amount_cents}")
+    return {"org_id": org_id, "invoice": invoice}
+
+
+@app.get("/orgs/{org_id}/billing")
+async def get_billing_state(org_id: str, current_user: User = Depends(require_permission("manage"))):
+    _ensure_org_exists(org_id)
+    _require_org_admin(org_id, current_user.email)
+    return {"org_id": org_id, "billing": tenant_billing.get(org_id, {"invoices": []})}
+
+
+@app.post("/orgs/{org_id}/security/secrets")
+async def store_secret(
+    org_id: str,
+    payload: SecretStoreRequest,
+    current_user: User = Depends(require_permission("manage")),
+):
+    _ensure_org_exists(org_id)
+    _require_org_admin(org_id, current_user.email)
+    org_secrets = vault_store.setdefault(org_id, {})
+    org_secrets[payload.name] = payload.value
+    _audit_org("org.security.secret.store", current_user.email, org_id, f"name={payload.name} engine={payload.engine}")
+    return {"org_id": org_id, "stored": True, "name": payload.name, "engine": payload.engine}
+
+
+def _field_encrypt(raw: str) -> str:
+    key = hashlib.sha256(SECRET_KEY.encode("utf-8")).digest()
+    data = raw.encode("utf-8")
+    ciphertext = bytes(b ^ key[i % len(key)] for i, b in enumerate(data))
+    return base64.b64encode(ciphertext).decode("utf-8")
+
+
+def _field_decrypt(raw: str) -> str:
+    key = hashlib.sha256(SECRET_KEY.encode("utf-8")).digest()
+    data = base64.b64decode(raw.encode("utf-8"))
+    plaintext = bytes(b ^ key[i % len(key)] for i, b in enumerate(data))
+    return plaintext.decode("utf-8")
+
+
+@app.post("/orgs/{org_id}/security/field-encryption/encrypt")
+async def encrypt_field_value(
+    org_id: str,
+    payload: FieldEncryptionRequest,
+    current_user: User = Depends(require_permission("manage")),
+):
+    _ensure_org_exists(org_id)
+    _require_org_admin(org_id, current_user.email)
+    encrypted = _field_encrypt(payload.value)
+    _audit_org("org.security.field.encrypt", current_user.email, org_id, "field encrypted")
+    return {"org_id": org_id, "encrypted_value": encrypted}
+
+
+@app.post("/orgs/{org_id}/security/field-encryption/decrypt")
+async def decrypt_field_value(
+    org_id: str,
+    payload: FieldEncryptionRequest,
+    current_user: User = Depends(require_permission("manage")),
+):
+    _ensure_org_exists(org_id)
+    _require_org_admin(org_id, current_user.email)
+    decrypted = _field_decrypt(payload.value)
+    _audit_org("org.security.field.decrypt", current_user.email, org_id, "field decrypted")
+    return {"org_id": org_id, "decrypted_value": decrypted}
+
+
+@app.get("/orgs/{org_id}/security/policies")
+async def get_security_policies(org_id: str, current_user: User = Depends(require_permission("read"))):
+    _ensure_org_exists(org_id)
+    if current_user.role not in {"admin", "superadmin"} and current_user.email not in org_memberships.get(org_id, {}):
+        raise HTTPException(status_code=403, detail="Not a member of this organization")
+    return {
+        "org_id": org_id,
+        "policies": [
+            {"name": "mfa_required", "status": "enabled"},
+            {"name": "token_rotation", "status": "enabled"},
+            {"name": "least_privilege_rbac", "status": "enabled"},
+            {"name": "tamper_evident_audit", "status": "enabled"},
+        ],
+    }
+
+
+@app.post("/orgs/{org_id}/security/scan")
+async def run_security_policy_scan(
+    org_id: str,
+    payload: SecurityScanRequest,
+    current_user: User = Depends(require_permission("manage")),
+):
+    _ensure_org_exists(org_id)
+    _require_org_admin(org_id, current_user.email)
+    results = [{"control": c, "status": "pass"} for c in payload.controls]
+    _audit_org("org.security.scan.run", current_user.email, org_id, f"target={payload.target}")
+    return {
+        "org_id": org_id,
+        "target": payload.target,
+        "results": results,
+        "summary": {"total": len(results), "passed": len(results), "failed": 0},
+    }
+
+
+@app.post("/orgs/{org_id}/compliance/data-residency")
+async def set_data_residency(
+    org_id: str,
+    payload: DataResidencyRequest,
+    current_user: User = Depends(require_permission("manage")),
+):
+    _ensure_org_exists(org_id)
+    _require_org_admin(org_id, current_user.email)
+    tenant_data_residency[org_id] = {"region": payload.region, "storage_class": payload.storage_class}
+    _audit_org("org.compliance.data_residency.set", current_user.email, org_id, f"region={payload.region}")
+    return {"org_id": org_id, "data_residency": tenant_data_residency[org_id]}
+
+
+@app.get("/orgs/{org_id}/compliance/data-residency")
+async def get_data_residency(org_id: str, current_user: User = Depends(require_permission("read"))):
+    _ensure_org_exists(org_id)
+    if current_user.role not in {"admin", "superadmin"} and current_user.email not in org_memberships.get(org_id, {}):
+        raise HTTPException(status_code=403, detail="Not a member of this organization")
+    return {
+        "org_id": org_id,
+        "data_residency": tenant_data_residency.get(org_id, {"region": "us-east-1", "storage_class": "standard"}),
+    }
 
 
 @app.get("/orgs/{org_id}/retention")

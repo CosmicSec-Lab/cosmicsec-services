@@ -65,6 +65,8 @@ SERVICE_URLS = {
     "report": "http://report-service:8005",
     "collab": "http://collab-service:8006",
     "plugins": "http://plugin-registry:8007",
+    "integration": "http://integration-service:8008",
+    "bugbounty": "http://bugbounty-service:8009",
 }
 
 
@@ -1316,6 +1318,153 @@ async def community_sync_repository(request: Request, repo_id: str):
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
             raise HTTPException(status_code=503, detail="Plugin registry unavailable")
+
+
+async def _proxy_get(service: str, path: str, params: Optional[dict] = None, timeout: float = 10.0) -> JSONResponse:
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.get(f"{SERVICE_URLS[service]}{path}", params=params, timeout=timeout)
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            raise HTTPException(status_code=503, detail=f"{service} service unavailable")
+
+
+async def _proxy_post(service: str, path: str, data: dict, timeout: float = 10.0) -> JSONResponse:
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.post(f"{SERVICE_URLS[service]}{path}", json=data, timeout=timeout)
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            raise HTTPException(status_code=503, detail=f"{service} service unavailable")
+
+
+@app.post("/api/ai/red-team/plan")
+@limiter.limit("20/minute")
+async def ai_red_team_plan(request: Request):
+    return await _proxy_post("ai", "/red-team/plan", await request.json())
+
+
+@app.post("/api/ai/red-team/safety-check")
+@limiter.limit("20/minute")
+async def ai_red_team_safety(request: Request):
+    return await _proxy_post("ai", "/red-team/safety-check", await request.json())
+
+
+@app.post("/api/ai/zero-day/train")
+@limiter.limit("10/minute")
+async def ai_zero_day_train(request: Request):
+    return await _proxy_post("ai", "/zero-day/train", await request.json())
+
+
+@app.post("/api/ai/zero-day/forecast")
+@limiter.limit("30/minute")
+async def ai_zero_day_forecast(request: Request):
+    return await _proxy_post("ai", "/zero-day/forecast", await request.json())
+
+
+@app.get("/api/ai/quantum/algorithms")
+@limiter.limit("60/minute")
+async def ai_quantum_algorithms(request: Request):
+    return await _proxy_get("ai", "/quantum/algorithms")
+
+
+@app.post("/api/reports/visualization/topology")
+@limiter.limit("30/minute")
+async def report_topology(request: Request):
+    return await _proxy_post("report", "/visualization/topology", await request.json())
+
+
+@app.post("/api/reports/visualization/attack-path")
+@limiter.limit("30/minute")
+async def report_attack_path(request: Request):
+    return await _proxy_post("report", "/visualization/attack-path", await request.json())
+
+
+@app.post("/api/reports/visualization/heatmap")
+@limiter.limit("30/minute")
+async def report_heatmap(request: Request):
+    return await _proxy_post("report", "/visualization/heatmap", await request.json())
+
+
+@app.post("/api/reports/visualization/immersive")
+@limiter.limit("30/minute")
+async def report_immersive(request: Request):
+    return await _proxy_post("report", "/visualization/immersive", await request.json())
+
+
+@app.post("/api/integration/siem/{vendor}")
+@limiter.limit("60/minute")
+async def integration_siem_vendor(request: Request, vendor: str):
+    path = f"/siem/{vendor}"
+    return await _proxy_post("integration", path, await request.json())
+
+
+@app.post("/api/integration/ticket/{provider}")
+@limiter.limit("30/minute")
+async def integration_ticket_provider(request: Request, provider: str):
+    path = f"/ticket/{provider}"
+    return await _proxy_post("integration", path, await request.json())
+
+
+@app.post("/api/integration/notify/{channel}")
+@limiter.limit("60/minute")
+async def integration_notify_channel(request: Request, channel: str):
+    path = f"/notify/{channel}"
+    return await _proxy_post("integration", path, await request.json())
+
+
+@app.post("/api/bugbounty/programs")
+@limiter.limit("20/minute")
+async def bugbounty_programs_create(request: Request):
+    return await _proxy_post("bugbounty", "/programs", await request.json())
+
+
+@app.get("/api/bugbounty/programs")
+@limiter.limit("60/minute")
+async def bugbounty_programs_list(request: Request):
+    return await _proxy_get("bugbounty", "/programs", params=dict(request.query_params))
+
+
+@app.post("/api/bugbounty/recon/auto")
+@limiter.limit("30/minute")
+async def bugbounty_recon_auto(request: Request):
+    return await _proxy_post("bugbounty", "/recon/auto", await request.json())
+
+
+@app.post("/api/bugbounty/findings/prioritize")
+@limiter.limit("30/minute")
+async def bugbounty_prioritize(request: Request):
+    return await _proxy_post("bugbounty", "/findings/prioritize", await request.json())
+
+
+@app.post("/api/bugbounty/poc/build")
+@limiter.limit("30/minute")
+async def bugbounty_poc_build(request: Request):
+    return await _proxy_post("bugbounty", "/poc/build", await request.json())
+
+
+@app.post("/api/bugbounty/submissions")
+@limiter.limit("30/minute")
+async def bugbounty_submissions_create(request: Request):
+    return await _proxy_post("bugbounty", "/submissions", await request.json())
+
+
+@app.post("/api/bugbounty/submissions/{submission_id}/submit")
+@limiter.limit("30/minute")
+async def bugbounty_submissions_submit(request: Request, submission_id: str):
+    return await _proxy_post("bugbounty", f"/submissions/{submission_id}/submit", {})
+
+
+@app.get("/api/bugbounty/dashboard/earnings")
+@limiter.limit("30/minute")
+async def bugbounty_dashboard_earnings(request: Request):
+    return await _proxy_get("bugbounty", "/dashboard/earnings")
+
+
+@app.get("/api/bugbounty/timeline")
+@limiter.limit("30/minute")
+async def bugbounty_timeline(request: Request):
+    return await _proxy_get("bugbounty", "/timeline", params=dict(request.query_params))
 
 
 if __name__ == "__main__":
