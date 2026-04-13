@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+import re
 import httpx
 import json
 import time
@@ -37,7 +38,39 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Rate limiting
-limiter = Limiter(key_func=get_remote_address)
+def get_user_identifier(request: Request) -> str:
+    """Return user ID from JWT for per-user rate limiting; fall back to IP for anonymous."""
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        try:
+            import base64 as _b64
+            token = auth_header.split(" ", 1)[1]
+            parts = token.split(".")
+            if len(parts) == 3:
+                payload_bytes = parts[1] + "=="  # add padding
+                decoded = _b64.urlsafe_b64decode(payload_bytes)
+                import json as _json
+                claims = _json.loads(decoded)
+                sub = claims.get("sub") or claims.get("user_id")
+                if sub:
+                    return f"user:{sub}"
+        except Exception:
+            pass
+    return get_remote_address(request)
+
+
+# SQL injection and XSS pattern blocklist (request-level WAF)
+_SQL_INJECTION_RE = re.compile(
+    r"(union\s+select|drop\s+table|insert\s+into|delete\s+from|"
+    r"exec\s*\(|execute\s*\(|xp_cmdshell|benchmark\s*\(|sleep\s*\()",
+    re.IGNORECASE,
+)
+_XSS_RE = re.compile(
+    r"(<script|javascript:|vbscript:|onload\s*=|onerror\s*=|<iframe)",
+    re.IGNORECASE,
+)
+
+limiter = Limiter(key_func=get_user_identifier)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -63,6 +96,36 @@ async def add_process_time_header(request: Request, call_next):
     logger.info(f"{request.method} {request.url.path} - {response.status_code} - {process_time:.3f}s")
     return response
 
+
+@app.middleware("http")
+async def waf_middleware(request: Request, call_next):
+    """Block common SQLi and XSS patterns in query strings and JSON bodies."""
+    # Check query string
+    query_string = str(request.url.query)
+    if _SQL_INJECTION_RE.search(query_string) or _XSS_RE.search(query_string):
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "Request blocked by security policy", "error_code": "WAF_BLOCKED"},
+        )
+    # Check JSON body (skip file uploads and form data)
+    content_type = request.headers.get("content-type", "")
+    if "application/json" in content_type:
+        try:
+            body_bytes = await request.body()
+            body_str = body_bytes.decode("utf-8", errors="ignore")
+            if _SQL_INJECTION_RE.search(body_str) or _XSS_RE.search(body_str):
+                return JSONResponse(
+                    status_code=400,
+                    content={"detail": "Request blocked by security policy", "error_code": "WAF_BLOCKED"},
+                )
+            # Re-attach body so downstream can read it
+            async def receive():
+                return {"type": "http.request", "body": body_bytes}
+            request._receive = receive  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    return await call_next(request)
+
 # Service URLs (configure via environment variables in production)
 SERVICE_URLS = {
     "auth": "http://auth-service:8001",
@@ -75,6 +138,7 @@ SERVICE_URLS = {
     "integration": "http://integration-service:8008",
     "bugbounty": "http://bugbounty-service:8009",
     "phase5": "http://phase5-service:8010",
+    "notification": "http://notification-service:8012",
 }
 
 hybrid_router = HybridRouter(SERVICE_URLS, static_profiles=STATIC_PROFILES)
