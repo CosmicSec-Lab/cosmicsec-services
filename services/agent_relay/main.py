@@ -104,7 +104,7 @@ async def agent_ws(websocket: WebSocket, agent_id: str) -> None:
     Authenticates via ``api_key`` query parameter (validated non-empty).
     Receives JSON messages from the agent and updates last-seen timestamps.
     """
-    api_key = websocket.query_params.get("api_key", "")
+    api_key = websocket.query_params.get("api_key") or websocket.headers.get("x-api-key")
     if not api_key:
         await websocket.close(code=4001)
         return

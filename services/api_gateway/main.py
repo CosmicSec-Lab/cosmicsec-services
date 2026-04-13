@@ -1776,7 +1776,7 @@ async def agent_websocket(websocket: WebSocket, agent_id: str) -> None:
     Authenticates via ``api_key`` query parameter.  Receives finding JSON from
     the agent and echoes task assignments back.  Sends a heartbeat every 30 s.
     """
-    api_key = websocket.query_params.get("api_key")
+    api_key = websocket.query_params.get("api_key") or websocket.headers.get("x-api-key")
     if not api_key:
         await websocket.close(code=4001)
         return

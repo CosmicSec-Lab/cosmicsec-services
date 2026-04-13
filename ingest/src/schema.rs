@@ -1,6 +1,7 @@
 /// Core data schema for ingest findings.
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -20,7 +21,7 @@ impl Default for SeverityLevel {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Finding {
-    /// Unique identifier (UUID v4 string).
+    /// Unique identifier (UUID v4).
     pub id: String,
     pub title: String,
     pub severity: SeverityLevel,
@@ -42,7 +43,7 @@ impl Finding {
         target: impl Into<String>,
     ) -> Self {
         Finding {
-            id: uuid_v4(),
+            id: Uuid::new_v4().to_string(),
             title: title.into(),
             severity,
             description: description.into(),
@@ -62,28 +63,3 @@ pub struct IngestResult {
     pub duration_ms: f64,
 }
 
-/// Minimal UUID v4 generator using random bytes from the OS via stdlib.
-fn uuid_v4() -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    use std::time::SystemTime;
-
-    let mut h = DefaultHasher::new();
-    SystemTime::now().hash(&mut h);
-    std::thread::current().id().hash(&mut h);
-    let a = h.finish();
-
-    let mut h2 = DefaultHasher::new();
-    a.hash(&mut h2);
-    42u64.hash(&mut h2);
-    let b = h2.finish();
-
-    format!(
-        "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
-        (a >> 32) as u32,
-        (a >> 16) as u16,
-        a as u16 & 0x0fff,
-        (b >> 48) as u16 | 0x8000,
-        b & 0x0000_ffff_ffff_ffff,
-    )
-}
