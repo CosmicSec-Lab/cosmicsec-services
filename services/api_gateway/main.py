@@ -75,6 +75,7 @@ SERVICE_URLS = {
     "integration": "http://integration-service:8008",
     "bugbounty": "http://bugbounty-service:8009",
     "phase5": "http://phase5-service:8010",
+    "notification": "http://notification-service:8012",
 }
 
 hybrid_router = HybridRouter(SERVICE_URLS, static_profiles=STATIC_PROFILES)
