@@ -3,21 +3,23 @@ Phase 2 — Real-Time Collaboration Service (port 8006).
 
 Provides:
 - WebSocket rooms per scan/workspace with presence tracking.
-- Team chat with threading and @mention parsing.
+- Team chat with threading and @mention parsing (persisted to PostgreSQL).
 - Shared scan-state broadcasts.
 - Async REST endpoints for history, presence, and activity feed.
 """
 from __future__ import annotations
 
-import asyncio
 import uuid
-from collections import defaultdict
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Set
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
+
+from services.common.db import get_db
+from services.common.models import CollabMessageModel, CollabReportSectionModel
 
 app = FastAPI(
     title="CosmicSec Collaboration Service",
@@ -33,17 +35,16 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
-# In-memory state (replace with Redis pub/sub for production multi-replica)
+# In-memory state for WebSocket connections only (not persisted)
 # ---------------------------------------------------------------------------
 
 class _Room:
-    """WebSocket room with presence, message history, and broadcast."""
+    """WebSocket room with presence and broadcast."""
 
     def __init__(self, room_id: str):
         self.room_id = room_id
-        self.created_at = datetime.utcnow().isoformat()
-        self.connections: Dict[str, WebSocket] = {}  # username → ws
-        self.messages: List[Dict[str, Any]] = []
+        self.created_at = datetime.now(timezone.utc).isoformat()
+        self.connections: Dict[str, WebSocket] = {}
         self.scan_state: Optional[Dict[str, Any]] = None
 
     def add_connection(self, username: str, ws: WebSocket) -> None:
@@ -67,12 +68,6 @@ class _Room:
                 dead.append(user)
         for u in dead:
             self.connections.pop(u, None)
-
-    def add_message(self, msg: Dict[str, Any]) -> None:
-        self.messages.append(msg)
-        # Keep last 500 messages in memory
-        if len(self.messages) > 500:
-            self.messages = self.messages[-500:]
 
 
 _rooms: Dict[str, _Room] = {}
@@ -118,10 +113,6 @@ class ReportSectionUpdate(BaseModel):
     editor: str = Field(..., description="Username making this edit")
 
 
-# Per-room report sections: _report_store[room_id][section_id] = section_dict
-_report_store: Dict[str, Dict[str, Dict[str, Any]]] = defaultdict(dict)
-
-
 # ---------------------------------------------------------------------------
 # WebSocket endpoint
 # ---------------------------------------------------------------------------
@@ -145,14 +136,13 @@ async def room_websocket(websocket: WebSocket, room_id: str):
     room = _get_or_create_room(room_id)
     room.add_connection(username, websocket)
 
-    # Announce presence
     await room.broadcast({
         "type": "presence",
         "room": room_id,
         "username": username,
         "event": "joined",
         "present_users": room.present_users,
-        "ts": datetime.utcnow().isoformat(),
+        "ts": datetime.now(timezone.utc).isoformat(),
     })
 
     try:
@@ -171,9 +161,8 @@ async def room_websocket(websocket: WebSocket, room_id: str):
                     "text": text,
                     "mentions": mentions,
                     "thread_id": data.get("thread_id"),
-                    "ts": datetime.utcnow().isoformat(),
+                    "ts": datetime.now(timezone.utc).isoformat(),
                 }
-                room.add_message(msg)
                 await room.broadcast(msg)
 
             elif ev_type == "scan_update":
@@ -188,11 +177,11 @@ async def room_websocket(websocket: WebSocket, room_id: str):
                     "room": room_id,
                     "state": state,
                     "updated_by": username,
-                    "ts": datetime.utcnow().isoformat(),
+                    "ts": datetime.now(timezone.utc).isoformat(),
                 })
 
             elif ev_type == "ping":
-                await websocket.send_json({"type": "pong", "ts": datetime.utcnow().isoformat()})
+                await websocket.send_json({"type": "pong", "ts": datetime.now(timezone.utc).isoformat()})
 
     except WebSocketDisconnect:
         room.remove_connection(username)
@@ -201,7 +190,7 @@ async def room_websocket(websocket: WebSocket, room_id: str):
             "room": room_id,
             "username": username,
             "present_users": room.present_users,
-            "ts": datetime.utcnow().isoformat(),
+            "ts": datetime.now(timezone.utc).isoformat(),
         })
 
 
@@ -215,7 +204,7 @@ async def health_check() -> dict:
         "status": "healthy",
         "service": "collab",
         "active_rooms": len(_rooms),
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -226,7 +215,6 @@ async def list_rooms() -> dict:
             {
                 "room_id": rid,
                 "present_users": r.present_users,
-                "message_count": len(r.messages),
                 "created_at": r.created_at,
             }
             for rid, r in _rooms.items()
@@ -235,13 +223,16 @@ async def list_rooms() -> dict:
 
 
 @app.get("/rooms/{room_id}/messages")
-async def get_messages(room_id: str, limit: int = 50) -> dict:
-    room = _get_or_create_room(room_id)
-    return {
-        "room_id": room_id,
-        "messages": room.messages[-limit:],
-        "total": len(room.messages),
-    }
+async def get_messages(room_id: str, limit: int = 50, db: Session = Depends(get_db)) -> dict:
+    messages = (
+        db.query(CollabMessageModel)
+        .filter(CollabMessageModel.room_id == room_id)
+        .order_by(CollabMessageModel.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    result = [_msg_to_dict(m) for m in reversed(messages)]
+    return {"room_id": room_id, "messages": result, "total": len(result)}
 
 
 @app.get("/rooms/{room_id}/presence")
@@ -257,36 +248,41 @@ async def get_presence(room_id: str) -> dict:
 @app.get("/rooms/{room_id}/scan-state")
 async def get_scan_state(room_id: str) -> dict:
     room = _get_or_create_room(room_id)
-    return {
-        "room_id": room_id,
-        "scan_state": room.scan_state,
-    }
+    return {"room_id": room_id, "scan_state": room.scan_state}
 
 
 @app.post("/rooms/{room_id}/messages")
-async def post_message(room_id: str, payload: SendMessageRequest) -> dict:
-    """POST a message into a room (for non-WebSocket clients)."""
-    room = _get_or_create_room(room_id)
+async def post_message(room_id: str, payload: SendMessageRequest, db: Session = Depends(get_db)) -> dict:
+    """POST a message into a room (for non-WebSocket clients). Persisted to DB."""
     mentions = [w[1:] for w in payload.text.split() if w.startswith("@")]
+    message_id = uuid.uuid4().hex
+    msg_row = CollabMessageModel(
+        id=message_id,
+        room_id=room_id,
+        username=payload.username,
+        text=payload.text,
+        mentions=mentions,
+        thread_id=payload.thread_id,
+    )
+    db.add(msg_row)
+    db.commit()
     msg: Dict[str, Any] = {
         "type": "message",
         "room": room_id,
-        "message_id": uuid.uuid4().hex,
+        "message_id": message_id,
         "username": payload.username,
         "text": payload.text,
         "mentions": mentions,
         "thread_id": payload.thread_id,
-        "ts": datetime.utcnow().isoformat(),
+        "ts": msg_row.created_at.isoformat() if msg_row.created_at else datetime.now(timezone.utc).isoformat(),
     }
-    room.add_message(msg)
-    # Broadcast to connected WebSocket clients
+    room = _get_or_create_room(room_id)
     await room.broadcast(msg)
-    return {"status": "sent", "message_id": msg["message_id"]}
+    return {"status": "sent", "message_id": message_id}
 
 
 @app.post("/rooms/{room_id}/scan-state")
 async def update_scan_state(room_id: str, payload: ScanStateUpdate) -> dict:
-    """Update the shared scan state for a room (REST version of the WS event)."""
     room = _get_or_create_room(room_id)
     state = {
         "status": payload.status,
@@ -299,50 +295,48 @@ async def update_scan_state(room_id: str, payload: ScanStateUpdate) -> dict:
         "room": room_id,
         "state": state,
         "updated_by": payload.updated_by,
-        "ts": datetime.utcnow().isoformat(),
+        "ts": datetime.now(timezone.utc).isoformat(),
     })
     return {"room_id": room_id, "state": state}
 
 
 @app.get("/activity-feed")
-async def activity_feed(limit: int = 20) -> dict:
+async def activity_feed(limit: int = 20, db: Session = Depends(get_db)) -> dict:
     """Global activity feed — latest messages across all rooms."""
-    all_msgs: List[Dict[str, Any]] = []
-    for room in _rooms.values():
-        all_msgs.extend(room.messages)
-    all_msgs.sort(key=lambda m: m.get("ts", ""), reverse=True)
+    messages = (
+        db.query(CollabMessageModel)
+        .order_by(CollabMessageModel.created_at.desc())
+        .limit(limit)
+        .all()
+    )
     return {
-        "feed": all_msgs[:limit],
-        "total_events": len(all_msgs),
+        "feed": [_msg_to_dict(m) for m in messages],
+        "total_events": len(messages),
     }
 
 
 # ==========================================================================
-# Phase 2 — Collaborative Report Editing
+# Phase 2 — Collaborative Report Editing (persisted to DB)
 # ==========================================================================
 
 @app.post("/rooms/{room_id}/reports", status_code=201)
-async def create_report_section(room_id: str, payload: ReportSection) -> dict:
-    """
-    Create a new collaborative report section in this room.
-    Broadcasts a 'report_update' event to all connected WebSocket clients.
-    """
+async def create_report_section(room_id: str, payload: ReportSection, db: Session = Depends(get_db)) -> dict:
     section_id = payload.section_id or uuid.uuid4().hex
-    now = datetime.utcnow().isoformat()
-    section: Dict[str, Any] = {
-        "section_id": section_id,
-        "room_id": room_id,
-        "title": payload.title,
-        "content": payload.content,
-        "author": payload.author,
-        "section_type": payload.section_type,
-        "created_at": now,
-        "updated_at": now,
-        "revision": 1,
-        "edit_history": [],
-    }
-    _report_store[room_id][section_id] = section
+    section_row = CollabReportSectionModel(
+        id=section_id,
+        room_id=room_id,
+        title=payload.title,
+        content=payload.content,
+        author=payload.author,
+        section_type=payload.section_type,
+        revision=1,
+        edit_history=[],
+    )
+    db.add(section_row)
+    db.commit()
+    db.refresh(section_row)
 
+    now = section_row.created_at.isoformat() if section_row.created_at else datetime.now(timezone.utc).isoformat()
     room = _get_or_create_room(room_id)
     await room.broadcast({
         "type": "report_update",
@@ -353,55 +347,57 @@ async def create_report_section(room_id: str, payload: ReportSection) -> dict:
         "author": payload.author,
         "ts": now,
     })
-    return section
+    return _section_to_dict(section_row)
 
 
 @app.get("/rooms/{room_id}/reports")
-async def list_report_sections(room_id: str, section_type: Optional[str] = None) -> dict:
-    """List all collaborative report sections for this room."""
-    sections = list(_report_store[room_id].values())
+async def list_report_sections(room_id: str, section_type: Optional[str] = None, db: Session = Depends(get_db)) -> dict:
+    query = db.query(CollabReportSectionModel).filter(CollabReportSectionModel.room_id == room_id)
     if section_type:
-        sections = [s for s in sections if s.get("section_type") == section_type]
-    sections.sort(key=lambda s: s.get("created_at", ""))
-    return {"room_id": room_id, "sections": sections, "total": len(sections)}
+        query = query.filter(CollabReportSectionModel.section_type == section_type)
+    sections = query.order_by(CollabReportSectionModel.created_at).all()
+    return {"room_id": room_id, "sections": [_section_to_dict(s) for s in sections], "total": len(sections)}
 
 
 @app.get("/rooms/{room_id}/reports/{section_id}")
-async def get_report_section(room_id: str, section_id: str) -> dict:
-    """Fetch a single report section by ID."""
-    section = _report_store[room_id].get(section_id)
+async def get_report_section(room_id: str, section_id: str, db: Session = Depends(get_db)) -> dict:
+    section = db.query(CollabReportSectionModel).filter(
+        CollabReportSectionModel.id == section_id,
+        CollabReportSectionModel.room_id == room_id,
+    ).first()
     if section is None:
+        from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="Section not found")
-    return section
+    return _section_to_dict(section)
 
 
 @app.put("/rooms/{room_id}/reports/{section_id}")
-async def update_report_section(room_id: str, section_id: str, payload: ReportSectionUpdate) -> dict:
-    """
-    Update an existing report section (collaborative edit).
-    Saves a snapshot to edit_history and broadcasts a 'report_update' event.
-    """
-    section = _report_store[room_id].get(section_id)
+async def update_report_section(room_id: str, section_id: str, payload: ReportSectionUpdate, db: Session = Depends(get_db)) -> dict:
+    from fastapi import HTTPException
+    section = db.query(CollabReportSectionModel).filter(
+        CollabReportSectionModel.id == section_id,
+        CollabReportSectionModel.room_id == room_id,
+    ).first()
     if section is None:
         raise HTTPException(status_code=404, detail="Section not found")
 
-    now = datetime.utcnow().isoformat()
-    section["edit_history"].append({
-        "revision": section["revision"],
-        "title": section["title"],
-        "content": section["content"],
-        "updated_at": section["updated_at"],
+    now = datetime.now(timezone.utc).isoformat()
+    history = list(section.edit_history or [])
+    history.append({
+        "revision": section.revision,
+        "title": section.title,
+        "content": section.content,
+        "updated_at": section.updated_at.isoformat() if section.updated_at else now,
         "editor": payload.editor,
     })
-    # Keep last 20 revisions in memory
-    section["edit_history"] = section["edit_history"][-20:]
-
+    section.edit_history = history[-20:]
     if payload.title is not None:
-        section["title"] = payload.title
+        section.title = payload.title
     if payload.content is not None:
-        section["content"] = payload.content
-    section["updated_at"] = now
-    section["revision"] += 1
+        section.content = payload.content
+    section.revision += 1
+    db.commit()
+    db.refresh(section)
 
     room = _get_or_create_room(room_id)
     await room.broadcast({
@@ -409,19 +405,25 @@ async def update_report_section(room_id: str, section_id: str, payload: ReportSe
         "action": "edited",
         "room": room_id,
         "section_id": section_id,
-        "title": section["title"],
+        "title": section.title,
         "editor": payload.editor,
-        "revision": section["revision"],
-        "ts": now,
+        "revision": section.revision,
+        "ts": section.updated_at.isoformat() if section.updated_at else now,
     })
-    return section
+    return _section_to_dict(section)
 
 
 @app.delete("/rooms/{room_id}/reports/{section_id}")
-async def delete_report_section(room_id: str, section_id: str, editor: str = "api") -> dict:
-    """Delete a report section and notify room members."""
-    if _report_store[room_id].pop(section_id, None) is None:
+async def delete_report_section(room_id: str, section_id: str, editor: str = "api", db: Session = Depends(get_db)) -> dict:
+    from fastapi import HTTPException
+    section = db.query(CollabReportSectionModel).filter(
+        CollabReportSectionModel.id == section_id,
+        CollabReportSectionModel.room_id == room_id,
+    ).first()
+    if section is None:
         raise HTTPException(status_code=404, detail="Section not found")
+    db.delete(section)
+    db.commit()
 
     room = _get_or_create_room(room_id)
     await room.broadcast({
@@ -430,19 +432,55 @@ async def delete_report_section(room_id: str, section_id: str, editor: str = "ap
         "room": room_id,
         "section_id": section_id,
         "editor": editor,
-        "ts": datetime.utcnow().isoformat(),
+        "ts": datetime.now(timezone.utc).isoformat(),
     })
     return {"status": "deleted", "section_id": section_id}
 
 
 @app.get("/rooms/{room_id}/reports/{section_id}/history")
-async def get_section_history(room_id: str, section_id: str) -> dict:
-    """Return the full edit history for a report section."""
-    section = _report_store[room_id].get(section_id)
+async def get_section_history(room_id: str, section_id: str, db: Session = Depends(get_db)) -> dict:
+    from fastapi import HTTPException
+    section = db.query(CollabReportSectionModel).filter(
+        CollabReportSectionModel.id == section_id,
+        CollabReportSectionModel.room_id == room_id,
+    ).first()
     if section is None:
         raise HTTPException(status_code=404, detail="Section not found")
     return {
         "section_id": section_id,
-        "current_revision": section["revision"],
-        "history": section["edit_history"],
+        "current_revision": section.revision,
+        "history": section.edit_history,
     }
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _msg_to_dict(m: CollabMessageModel) -> dict:
+    return {
+        "type": "message",
+        "room": m.room_id,
+        "message_id": m.id,
+        "username": m.username,
+        "text": m.text,
+        "mentions": m.mentions,
+        "thread_id": m.thread_id,
+        "ts": m.created_at.isoformat() if m.created_at else None,
+    }
+
+
+def _section_to_dict(s: CollabReportSectionModel) -> dict:
+    return {
+        "section_id": s.id,
+        "room_id": s.room_id,
+        "title": s.title,
+        "content": s.content,
+        "author": s.author,
+        "section_type": s.section_type,
+        "created_at": s.created_at.isoformat() if s.created_at else None,
+        "updated_at": s.updated_at.isoformat() if s.updated_at else None,
+        "revision": s.revision,
+        "edit_history": s.edit_history,
+    }
+

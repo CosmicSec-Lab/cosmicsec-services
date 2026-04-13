@@ -1,19 +1,26 @@
 """Phase 5 Advanced Security Platform Service."""
 from __future__ import annotations
 
-from datetime import datetime
+import uuid
+from datetime import datetime, timezone
 from statistics import mean
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
+
+from services.common.db import get_db
+from services.common.models import (
+    Phase5AlertModel,
+    Phase5IOCModel,
+    Phase5IncidentModel,
+    Phase5PolicyModel,
+)
 
 app = FastAPI(title="CosmicSec Phase 5 Service", version="1.0.0")
 
-alerts: List[Dict[str, Any]] = []
-incidents: Dict[str, Dict[str, Any]] = {}
-policies: Dict[str, Dict[str, Any]] = {}
-iocs: Dict[str, Dict[str, Any]] = {}
+# In-memory only for ephemeral/non-critical state
 vendors: Dict[str, Dict[str, Any]] = {}
 
 
@@ -140,52 +147,72 @@ class FuzzRequest(BaseModel):
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "healthy", "service": "phase5", "timestamp": datetime.utcnow().isoformat()}
+    return {"status": "healthy", "service": "phase5", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 
 @app.post("/soc/alerts/ingest")
-def soc_alert_ingest(payload: AlertIngest) -> dict:
+def soc_alert_ingest(payload: AlertIngest, db: Session = Depends(get_db)) -> dict:
     score = {"critical": 95, "high": 80, "medium": 60, "low": 35}.get(payload.severity.lower(), 40)
-    alert = {
-        "id": f"alt-{len(alerts)+1:05d}",
-        "source": payload.source,
-        "severity": payload.severity,
-        "title": payload.title,
+    alert = Phase5AlertModel(
+        source=payload.source,
+        severity=payload.severity,
+        title=payload.title,
+        payload={**payload.payload, "priority_score": score},
+    )
+    db.add(alert)
+    db.commit()
+    db.refresh(alert)
+    return {
+        "id": alert.id,
+        "source": alert.source,
+        "severity": alert.severity,
+        "title": alert.title,
         "priority_score": score,
-        "payload": payload.payload,
-        "created_at": datetime.utcnow().isoformat(),
+        "payload": alert.payload,
+        "created_at": alert.created_at.isoformat() if alert.created_at else None,
     }
-    alerts.append(alert)
-    return alert
 
 
 @app.get("/soc/alerts/dashboard")
-def soc_alert_dashboard() -> dict:
-    total = len(alerts)
-    open_critical = len([a for a in alerts if a["severity"].lower() == "critical"])
-    avg_priority = round(mean([a["priority_score"] for a in alerts]), 2) if alerts else 0.0
+def soc_alert_dashboard(db: Session = Depends(get_db)) -> dict:
+    all_alerts = db.query(Phase5AlertModel).all()
+    total = len(all_alerts)
+    open_critical = sum(1 for a in all_alerts if a.severity.lower() == "critical")
+    scores = [a.payload.get("priority_score", 50) for a in all_alerts if isinstance(a.payload, dict)]
+    avg_priority = round(mean(scores), 2) if scores else 0.0
     return {"total_alerts": total, "critical_alerts": open_critical, "average_priority": avg_priority}
 
 
 @app.post("/soc/incidents")
-def soc_incident_create(payload: IncidentCreate) -> dict:
-    incident_id = f"inc-{len(incidents)+1:05d}"
-    incident = {
-        "incident_id": incident_id,
-        "title": payload.title,
-        "severity": payload.severity,
-        "evidence": payload.evidence,
-        "chain_of_custody": [{"step": "created", "at": datetime.utcnow().isoformat()}],
-        "status": "open",
+def soc_incident_create(payload: IncidentCreate, db: Session = Depends(get_db)) -> dict:
+    incident_id = f"inc-{uuid.uuid4().hex[:8]}"
+    timeline = [{"step": "created", "at": datetime.now(timezone.utc).isoformat()}]
+    incident = Phase5IncidentModel(
+        id=incident_id,
+        title=payload.title,
+        severity=payload.severity,
+        evidence=payload.evidence,
+        timeline=timeline,
+        status="open",
+    )
+    db.add(incident)
+    db.commit()
+    db.refresh(incident)
+    return {
+        "incident_id": incident.id,
+        "title": incident.title,
+        "severity": incident.severity,
+        "evidence": incident.evidence,
+        "chain_of_custody": incident.timeline,
+        "status": incident.status,
     }
-    incidents[incident_id] = incident
-    return incident
 
 
 @app.get("/soc/incidents/{incident_id}/timeline")
-def soc_incident_timeline(incident_id: str) -> dict:
-    incident = incidents.get(incident_id, {"chain_of_custody": []})
-    return {"incident_id": incident_id, "timeline": incident.get("chain_of_custody", [])}
+def soc_incident_timeline(incident_id: str, db: Session = Depends(get_db)) -> dict:
+    incident = db.query(Phase5IncidentModel).filter(Phase5IncidentModel.id == incident_id).first()
+    timeline = incident.timeline if incident else []
+    return {"incident_id": incident_id, "timeline": timeline}
 
 
 @app.post("/soc/threat-hunt/query")
@@ -207,7 +234,7 @@ def soc_run_playbook(payload: PlaybookRun) -> dict:
 
 @app.post("/soc/shifts/handoff")
 def soc_shift_handoff(payload: ShiftHandoff) -> dict:
-    return {"status": "recorded", "handoff": payload.model_dump(), "at": datetime.utcnow().isoformat()}
+    return {"status": "recorded", "handoff": payload.model_dump(), "at": datetime.now(timezone.utc).isoformat()}
 
 
 @app.get("/soc/metrics")
@@ -281,26 +308,58 @@ def grc_risk_assess(payload: RiskAssessmentRequest) -> dict:
 
 
 @app.post("/grc/policies")
-def grc_policy_create(payload: PolicyCreate) -> dict:
-    policy_id = f"pol-{len(policies)+1:05d}"
-    record = {**payload.model_dump(), "policy_id": policy_id, "version": 1, "status": "approved", "created_at": datetime.utcnow().isoformat()}
-    policies[policy_id] = record
-    return record
+def grc_policy_create(payload: PolicyCreate, db: Session = Depends(get_db)) -> dict:
+    policy_id = f"pol-{uuid.uuid4().hex[:8]}"
+    record = Phase5PolicyModel(
+        id=policy_id,
+        name=payload.name,
+        policy_type=payload.framework,
+        rules=[{"content": payload.content, "approver": payload.approver}],
+        is_active=True,
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return {
+        "policy_id": record.id,
+        "name": record.name,
+        "framework": record.policy_type,
+        "version": 1,
+        "status": "approved",
+        "created_at": record.created_at.isoformat() if record.created_at else None,
+    }
 
 
 @app.get("/grc/policies")
-def grc_policy_list() -> dict:
-    return {"items": list(policies.values()), "total": len(policies)}
+def grc_policy_list(db: Session = Depends(get_db)) -> dict:
+    items = db.query(Phase5PolicyModel).all()
+    result = [
+        {
+            "policy_id": p.id,
+            "name": p.name,
+            "framework": p.policy_type,
+            "is_active": p.is_active,
+            "created_at": p.created_at.isoformat() if p.created_at else None,
+        }
+        for p in items
+    ]
+    return {"items": result, "total": len(result)}
 
 
 @app.get("/grc/audit/evidence")
-def grc_audit_evidence() -> dict:
-    return {"immutable_audit_log": True, "evidence_items": len(alerts) + len(incidents), "gap_analysis_ready": True}
+def grc_audit_evidence(db: Session = Depends(get_db)) -> dict:
+    alert_count = db.query(Phase5AlertModel).count()
+    incident_count = db.query(Phase5IncidentModel).count()
+    return {
+        "immutable_audit_log": True,
+        "evidence_items": alert_count + incident_count,
+        "gap_analysis_ready": True,
+    }
 
 
 @app.post("/grc/third-party/assess")
 def grc_vendor_assess(payload: VendorAssessment) -> dict:
-    vendor_id = f"vnd-{len(vendors)+1:05d}"
+    vendor_id = f"vnd-{uuid.uuid4().hex[:8]}"
     record = {**payload.model_dump(), "vendor_id": vendor_id, "risk": "high" if payload.questionnaire_score < 60 else "medium"}
     vendors[vendor_id] = record
     return record
@@ -308,22 +367,43 @@ def grc_vendor_assess(payload: VendorAssessment) -> dict:
 
 @app.post("/threat-intel/osint/collect")
 def threat_intel_collect(payload: OSINTCollectRequest) -> dict:
-    feeds = ["domain_reputation", "dark_web_mentions" if payload.include_darkweb else "none", "social_signal" if payload.include_social else "none"]
+    feeds = [
+        "domain_reputation",
+        "dark_web_mentions" if payload.include_darkweb else "none",
+        "social_signal" if payload.include_social else "none",
+    ]
     return {"target": payload.target, "feeds": feeds, "records": 3}
 
 
 @app.post("/threat-intel/ioc/create")
-def threat_intel_ioc_create(payload: IOCRequest) -> dict:
-    ioc_id = f"ioc-{len(iocs)+1:05d}"
-    record = {**payload.model_dump(), "ioc_id": ioc_id, "created_at": datetime.utcnow().isoformat()}
-    iocs[ioc_id] = record
-    return record
+def threat_intel_ioc_create(payload: IOCRequest, db: Session = Depends(get_db)) -> dict:
+    ioc_id = f"ioc-{uuid.uuid4().hex[:8]}"
+    record = Phase5IOCModel(
+        id=ioc_id,
+        ioc_type=payload.ioc_type,
+        value=payload.value,
+        confidence=payload.confidence / 100.0,
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return {
+        "ioc_id": record.id,
+        "ioc_type": record.ioc_type,
+        "value": record.value,
+        "confidence": record.confidence,
+        "created_at": record.created_at.isoformat() if record.created_at else None,
+    }
 
 
 @app.get("/threat-intel/ioc/search")
-def threat_intel_ioc_search(value: str) -> dict:
-    matches = [v for v in iocs.values() if value in v.get("value", "")]
-    return {"matches": matches, "total": len(matches)}
+def threat_intel_ioc_search(value: str, db: Session = Depends(get_db)) -> dict:
+    matches = db.query(Phase5IOCModel).filter(Phase5IOCModel.value.contains(value)).all()
+    result = [
+        {"ioc_id": m.id, "ioc_type": m.ioc_type, "value": m.value, "confidence": m.confidence}
+        for m in matches
+    ]
+    return {"matches": result, "total": len(result)}
 
 
 @app.post("/threat-intel/actors/track")
@@ -440,7 +520,7 @@ def training_cert_paths() -> dict:
 
 @app.get("/training/learning-paths")
 def training_learning_paths(role: Optional[str] = None) -> dict:
-    base = [{"track": "pentester"}, {"track": "soc_analyst"}, {"track": "security_engineer"}]
+    base: List[Dict[str, Any]] = [{"track": "pentester"}, {"track": "soc_analyst"}, {"track": "security_engineer"}]
     if role:
         base = [b for b in base if b["track"] == role]
     return {"paths": base, "video_tutorials": True, "docs_available": True}
@@ -468,4 +548,6 @@ def executive_resource_optimization() -> dict:
 
 @app.get("/executive/reports")
 def executive_reports() -> dict:
-    return {"reports": ["board_kpi_deck", "quarterly_roi", "risk_reduction_trend"], "generated_at": datetime.utcnow().isoformat()}
+    return {"reports": ["board_kpi_deck", "quarterly_roi", "risk_reduction_trend"], "generated_at": datetime.now(timezone.utc).isoformat()}
+
+
