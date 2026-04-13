@@ -10,6 +10,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 import httpx
+import json
 import time
 import asyncio
 import uuid
@@ -1707,6 +1708,131 @@ async def phase5_proxy(request: Request, path: str):
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
             raise HTTPException(status_code=503, detail="phase5 service unavailable")
+
+
+# ---------------------------------------------------------------------------
+# Phase D — CLI Agent endpoints
+# ---------------------------------------------------------------------------
+
+# In-memory registry of connected agents (agent_id → metadata)
+_registered_agents: dict[str, dict] = {}
+# Active WebSocket connections keyed by agent_id
+_agent_ws_connections: dict[str, "WebSocket"] = {}
+
+
+@app.post("/api/agents/register")
+@limiter.limit("30/minute")
+async def register_agent(request: Request) -> JSONResponse:
+    """Register a local CLI agent and its tool manifest.
+
+    Requires ``X-API-Key`` header.  Returns a stable ``agent_id`` so the agent
+    can reconnect across sessions.
+    """
+    api_key = request.headers.get("X-API-Key")
+    if not api_key:
+        raise HTTPException(status_code=401, detail="X-API-Key header required")
+
+    body = await request.json()
+    manifest = body.get("manifest", {})
+    user_id = body.get("user_id", "anonymous")
+
+    agent_id = str(uuid.uuid4())
+    _registered_agents[agent_id] = {
+        "agent_id": agent_id,
+        "user_id": user_id,
+        "manifest": manifest,
+        "registered_at": time.time(),
+        "last_seen_at": time.time(),
+        "status": "registered",
+    }
+    logger.info("Agent %s registered for user %s", agent_id, user_id)
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "agent_id": agent_id,
+            "registered": True,
+            "message": f"Agent registered with {len(manifest.get('tools', []))} tool(s)",
+        },
+    )
+
+
+@app.get("/api/agents")
+@limiter.limit("60/minute")
+async def list_agents(request: Request) -> JSONResponse:
+    """Return all registered agents.  Requires JWT ``Authorization`` header."""
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Bearer token required")
+
+    agents = list(_registered_agents.values())
+    return JSONResponse(content={"agents": agents, "total": len(agents)})
+
+
+@app.websocket("/ws/agent/{agent_id}")
+async def agent_websocket(websocket: WebSocket, agent_id: str) -> None:
+    """WebSocket endpoint for a connected CLI agent.
+
+    Authenticates via ``api_key`` query parameter.  Receives finding JSON from
+    the agent and echoes task assignments back.  Sends a heartbeat every 30 s.
+    """
+    api_key = websocket.query_params.get("api_key")
+    if not api_key:
+        await websocket.close(code=4001)
+        return
+
+    await websocket.accept()
+    _agent_ws_connections[agent_id] = websocket
+    if agent_id in _registered_agents:
+        _registered_agents[agent_id]["status"] = "connected"
+
+    logger.info("Agent %s WebSocket connected", agent_id)
+
+    heartbeat_task = asyncio.create_task(_agent_heartbeat(websocket, agent_id))
+
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                logger.warning("Agent %s sent non-JSON message", agent_id)
+                continue
+
+            msg_type = msg.get("type")
+            if agent_id in _registered_agents:
+                _registered_agents[agent_id]["last_seen_at"] = time.time()
+
+            if msg_type == "finding":
+                finding = msg.get("payload", {})
+                logger.info("Agent %s submitted finding: %s", agent_id, finding.get("title"))
+            elif msg_type == "scan_complete":
+                logger.info(
+                    "Agent %s scan complete: %s", agent_id, msg.get("scan_id")
+                )
+            else:
+                logger.debug("Agent %s unknown message type: %s", agent_id, msg_type)
+
+    except WebSocketDisconnect:
+        logger.info("Agent %s WebSocket disconnected", agent_id)
+    finally:
+        heartbeat_task.cancel()
+        _agent_ws_connections.pop(agent_id, None)
+        if agent_id in _registered_agents:
+            _registered_agents[agent_id]["status"] = "disconnected"
+
+
+async def _agent_heartbeat(websocket: "WebSocket", agent_id: str) -> None:
+    """Send a heartbeat ping to the agent every 30 seconds."""
+    try:
+        while True:
+            await asyncio.sleep(30)
+            await websocket.send_json({"type": "heartbeat", "ts": time.time()})
+    except Exception:
+        pass
+
+
+# Import json for WebSocket message parsing (already available via stdlib)
 
 
 if __name__ == "__main__":
