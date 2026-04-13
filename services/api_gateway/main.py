@@ -17,13 +17,17 @@ import asyncio
 import uuid
 from typing import Optional
 import logging
+from datetime import timedelta
 
 from cosmicsec_platform.contracts.runtime_metadata import HYBRID_SCHEMA, HYBRID_VERSION
 from cosmicsec_platform.middleware.hybrid_router import HybridRouter
 from cosmicsec_platform.middleware.policy_registry import ROUTE_POLICIES
 from cosmicsec_platform.middleware.static_profiles import STATIC_PROFILES
+from services.api_gateway.graphql_runtime import mount_graphql
+from services.common.caching import CacheManager, get_redis
 from services.common.exceptions import CosmicSecException
 from services.common.logging import clear_context, set_request_id, set_trace_id, setup_structured_logging
+from services.common.observability import setup_observability
 from services.common.versioning import APIVersionMiddleware
 
 # Initialize FastAPI app
@@ -167,6 +171,7 @@ async def waf_middleware(request: Request, call_next):
 
 # Service URLs (configure via environment variables in production)
 SERVICE_URLS = {
+    "gateway": "http://api-gateway:8000",
     "auth": "http://auth-service:8001",
     "scan": "http://scan-service:8002",
     "ai": "http://ai-service:8003",
@@ -177,8 +182,13 @@ SERVICE_URLS = {
     "integration": "http://integration-service:8008",
     "bugbounty": "http://bugbounty-service:8009",
     "phase5": "http://phase5-service:8010",
+    "agent_relay": "http://agent-relay:8011",
     "notification": "http://notification-service:8012",
 }
+
+# Runtime observability and GraphQL wiring
+_observability_state = setup_observability(app, service_name="api-gateway", logger=logger)
+_graphql_enabled = mount_graphql(app, service_urls=SERVICE_URLS, logger=logger)
 
 hybrid_router = HybridRouter(SERVICE_URLS, static_profiles=STATIC_PROFILES)
 PRIVILEGED_PREFIXES = ("/api/admin", "/api/orgs")
@@ -312,8 +322,17 @@ async def dashboard_summary(request: Request):
 @limiter.limit("60/minute")
 async def dashboard_overview(request: Request):
     """Aggregated security overview for the main dashboard page."""
-    import random
     import math
+
+    cache_key = "dashboard:overview:v1"
+    try:
+        cache_manager = CacheManager(await get_redis())
+        cached = await cache_manager.get(cache_key)
+        if isinstance(cached, dict):
+            cached["_cache"] = "hit"
+            return cached
+    except Exception as exc:
+        logger.warning("Dashboard overview cache read skipped: %s", exc)
 
     total_scans = 0
     critical_findings = 0
@@ -360,7 +379,7 @@ async def dashboard_overview(request: Request):
         score = max(10, math.floor(100 - (finding_ratio * 60) - (open_bugs * 2)))
     score = min(100, max(0, score))
 
-    return {
+    response_body = {
         "total_scans": total_scans,
         "critical_findings": critical_findings,
         "active_agents": active_agents,
@@ -370,7 +389,16 @@ async def dashboard_overview(request: Request):
         "findings_last_7d": findings_last_7d,
         "compliance_pct": compliance_pct,
         "timestamp": time.time(),
+        "_cache": "miss",
     }
+
+    try:
+        cache_manager = CacheManager(await get_redis())
+        await cache_manager.set(cache_key, response_body, ttl=timedelta(seconds=30), tags=["dashboard", "overview"])
+    except Exception as exc:
+        logger.warning("Dashboard overview cache write skipped: %s", exc)
+
+    return response_body
 
 
 
