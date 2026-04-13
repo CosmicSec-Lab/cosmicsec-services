@@ -22,6 +22,9 @@ from cosmicsec_platform.contracts.runtime_metadata import HYBRID_SCHEMA, HYBRID_
 from cosmicsec_platform.middleware.hybrid_router import HybridRouter
 from cosmicsec_platform.middleware.policy_registry import ROUTE_POLICIES
 from cosmicsec_platform.middleware.static_profiles import STATIC_PROFILES
+from services.common.exceptions import CosmicSecException
+from services.common.logging import clear_context, set_request_id, set_trace_id, setup_structured_logging
+from services.common.versioning import APIVersionMiddleware
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -35,7 +38,7 @@ app = FastAPI(
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = setup_structured_logging("api_gateway")
 
 # Rate limiting
 def get_user_identifier(request: Request) -> str:
@@ -86,6 +89,31 @@ app.add_middleware(
 # GZip compression
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
+
+@app.middleware("http")
+async def api_version_middleware(request: Request, call_next):
+    """Apply API version extraction and response headers."""
+    return await APIVersionMiddleware.process_request(request, call_next)
+
+
+@app.middleware("http")
+async def request_context_middleware(request: Request, call_next):
+    """Attach request/trace IDs to log context and response headers."""
+    trace_id = request.headers.get("X-Trace-Id") or str(uuid.uuid4())
+    request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
+    set_trace_id(trace_id)
+    set_request_id(request_id)
+
+    try:
+        response = await call_next(request)
+    finally:
+        clear_context()
+
+    response.headers["X-Trace-Id"] = trace_id
+    response.headers["X-Request-Id"] = request_id
+    return response
+
+
 # Request timing middleware
 @app.middleware("http")
 async def add_process_time_header(request: Request, call_next):
@@ -95,6 +123,17 @@ async def add_process_time_header(request: Request, call_next):
     response.headers["X-Process-Time"] = str(process_time)
     logger.info(f"{request.method} {request.url.path} - {response.status_code} - {process_time:.3f}s")
     return response
+
+
+@app.exception_handler(CosmicSecException)
+async def cosmicsec_exception_handler(request: Request, exc: CosmicSecException):
+    logger.warning(
+        "Handled CosmicSecException",
+        path=request.url.path,
+        error_code=exc.error_code.value,
+        status_code=exc.status_code,
+    )
+    return JSONResponse(status_code=exc.status_code, content=exc.to_dict())
 
 
 @app.middleware("http")
