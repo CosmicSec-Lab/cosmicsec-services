@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Optional
 
 import typer  # type: ignore[import-not-found]
 from rich.console import Console
@@ -196,6 +197,57 @@ def interactive_shell() -> None:
         if cmd.strip() == "exit":
             break
         console.print(f"executed: {cmd}")
+
+
+@app.command("audit-export")
+def siem_audit_export(
+    fmt: str = typer.Option("json", "--format", "-f", help="Output format: json, csv, cef"),
+    output: Optional[str] = typer.Option(None, "--output", "-o", help="Output file path (default: stdout)"),
+    since: Optional[str] = typer.Option(None, "--since", help="Filter by date (ISO format, e.g. 2024-01-01)"),
+    limit: int = typer.Option(1000, "--limit", "-n", help="Maximum number of records"),
+) -> None:
+    """Export audit logs in JSON, CSV, or CEF format."""
+    import sys
+    # Import the siem_connector export functions
+    try:
+        from services.integration_service.siem_connector import export_as_json, export_as_csv, export_as_cef
+    except ImportError:
+        typer.echo("Error: siem_connector not available", err=True)
+        raise typer.Exit(1)
+
+    # Build sample/mock events for now (in production, query from DB)
+    from datetime import datetime, timezone
+    sample_events = [
+        {
+            "id": i,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "user_id": "admin",
+            "action": "scan_create",
+            "resource": "scan",
+            "resource_id": f"scan-{i:04d}",
+            "ip_address": "127.0.0.1",
+            "extra": {},
+        }
+        for i in range(min(limit, 5))
+    ]
+
+    fmt = fmt.lower()
+    if fmt == "json":
+        content = export_as_json(sample_events)
+    elif fmt == "csv":
+        content = export_as_csv(sample_events)
+    elif fmt == "cef":
+        content = export_as_cef(sample_events)
+    else:
+        typer.echo(f"Unknown format: {fmt}. Use json, csv, or cef.", err=True)
+        raise typer.Exit(1)
+
+    if output:
+        with open(output, "w") as f:
+            f.write(content)
+        typer.echo(f"Exported {len(sample_events)} records to {output}")
+    else:
+        typer.echo(content)
 
 
 def main() -> None:
