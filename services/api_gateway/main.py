@@ -1882,9 +1882,10 @@ async def list_agents(request: Request) -> JSONResponse:
     else:
         agents = [a for a in _registered_agents.values() if a.get("user_id") == calling_user]
 
-    # Strip internal fields before returning
+    # Return only safe, public fields — explicit allowlist to prevent future leakage
+    _AGENT_PUBLIC_FIELDS = {"agent_id", "manifest", "registered_at", "last_seen_at", "status"}
     safe_agents = [
-        {k: v for k, v in a.items() if k != "user_id"}
+        {k: v for k, v in a.items() if k in _AGENT_PUBLIC_FIELDS}
         for a in agents
     ]
     return JSONResponse(content={"agents": safe_agents, "total": len(safe_agents)})

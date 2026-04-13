@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Any
 import os
 import secrets
+import hmac
 import logging
 import hashlib
 import base64
@@ -812,9 +813,12 @@ async def validate_api_key(request: Request):
     key = request.headers.get("X-API-Key", "")
     if not key:
         raise HTTPException(status_code=401, detail="X-API-Key header required")
-    key_hash = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    # API keys are random tokens (not user-chosen passwords), so SHA-256 is
+    # appropriate here.  We use hmac.compare_digest to prevent timing attacks.
+    candidate_hash = hashlib.sha256(key.encode("utf-8")).hexdigest()
     for key_id, data in fake_api_keys_db.items():
-        if data.get("key_hash") == key_hash:
+        stored_hash = data.get("key_hash", "")
+        if stored_hash and hmac.compare_digest(stored_hash, candidate_hash):
             return {"valid": True, "key_id": key_id, "user_id": data["owner"]}
     raise HTTPException(status_code=401, detail="Invalid API key")
 
