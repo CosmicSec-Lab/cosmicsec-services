@@ -2,7 +2,7 @@
 CosmicSec Authentication Service
 Handles user authentication, JWT tokens, OAuth2, and session management
 """
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel, EmailStr, Field
 from passlib.context import CryptContext
@@ -800,6 +800,34 @@ async def list_api_keys(current_user: User = Depends(get_current_user)):
         if data["owner"] == current_user.email
     ]
     return {"items": owned}
+
+
+@app.get("/apikeys/validate")
+async def validate_api_key(request: Request):
+    """Validate an API key passed via X-API-Key header.
+
+    Returns user_id on success so that services can bind keys to users
+    without sharing raw credentials.
+    """
+    key = request.headers.get("X-API-Key", "")
+    if not key:
+        raise HTTPException(status_code=401, detail="X-API-Key header required")
+    key_hash = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    for key_id, data in fake_api_keys_db.items():
+        if data.get("key_hash") == key_hash:
+            return {"valid": True, "key_id": key_id, "user_id": data["owner"]}
+    raise HTTPException(status_code=401, detail="Invalid API key")
+
+
+@app.delete("/apikeys/{key_id}")
+async def delete_api_key(key_id: str, current_user: User = Depends(get_current_user)):
+    """Revoke an API key owned by the current user."""
+    entry = fake_api_keys_db.get(key_id)
+    if entry is None or entry.get("owner") != current_user.email:
+        raise HTTPException(status_code=404, detail="Key not found")
+    del fake_api_keys_db[key_id]
+    _audit("apikey.revoke", current_user.email, f"key_id={key_id}")
+    return {"revoked": True, "key_id": key_id}
 
 
 @app.get("/sessions/{session_id}")

@@ -263,6 +263,55 @@ async def refresh_token(request: Request):
     )
 
 
+@app.post("/api/auth/apikeys")
+@limiter.limit("30/minute")
+async def create_api_key(request: Request):
+    """Create a new API key — proxied to auth service."""
+    data = await request.json()
+    headers = {}
+    if request.headers.get("Authorization"):
+        headers["Authorization"] = request.headers.get("Authorization")
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(f"{SERVICE_URLS['auth']}/apikeys", json=data, headers=headers, timeout=10.0)
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except Exception as e:
+            logger.error("Auth service error: %s", e)
+            raise HTTPException(status_code=503, detail="Authentication service unavailable")
+
+
+@app.get("/api/auth/apikeys")
+@limiter.limit("60/minute")
+async def list_api_keys(request: Request):
+    """List API keys for the current user — proxied to auth service."""
+    headers = {}
+    if request.headers.get("Authorization"):
+        headers["Authorization"] = request.headers.get("Authorization")
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(f"{SERVICE_URLS['auth']}/apikeys", headers=headers, timeout=10.0)
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except Exception as e:
+            logger.error("Auth service error: %s", e)
+            raise HTTPException(status_code=503, detail="Authentication service unavailable")
+
+
+@app.delete("/api/auth/apikeys/{key_id}")
+@limiter.limit("30/minute")
+async def delete_api_key(request: Request, key_id: str):
+    """Revoke an API key — proxied to auth service."""
+    headers = {}
+    if request.headers.get("Authorization"):
+        headers["Authorization"] = request.headers.get("Authorization")
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.delete(f"{SERVICE_URLS['auth']}/apikeys/{key_id}", headers=headers, timeout=10.0)
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except Exception as e:
+            logger.error("Auth service error: %s", e)
+            raise HTTPException(status_code=503, detail="Authentication service unavailable")
+
+
 @app.get("/api/gdpr/export")
 @limiter.limit("20/minute")
 async def gdpr_export(request: Request):
@@ -1725,16 +1774,52 @@ _agent_ws_connections: dict[str, "WebSocket"] = {}
 async def register_agent(request: Request) -> JSONResponse:
     """Register a local CLI agent and its tool manifest.
 
-    Requires ``X-API-Key`` header.  Returns a stable ``agent_id`` so the agent
-    can reconnect across sessions.
+    Validates ``X-API-Key`` against the auth service.  The ``user_id`` is
+    derived server-side from the key — it is never trusted from the request body.
+    Returns a stable ``agent_id`` so the agent can reconnect across sessions.
     """
     api_key = request.headers.get("X-API-Key")
     if not api_key:
         raise HTTPException(status_code=401, detail="X-API-Key header required")
 
+    # Validate the API key against the auth service
+    user_id = "anonymous"
+    try:
+        async with httpx.AsyncClient() as http_client:
+            auth_resp = await http_client.get(
+                f"{SERVICE_URLS['auth']}/apikeys/validate",
+                headers={"X-API-Key": api_key},
+                timeout=5.0,
+            )
+            if auth_resp.status_code == 200:
+                user_id = auth_resp.json().get("user_id", "anonymous")
+            elif auth_resp.status_code in (401, 403):
+                raise HTTPException(status_code=401, detail="Invalid API key")
+            # Other errors (503, etc.) → allow registration with degraded user_id
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("Could not validate API key with auth service: %s — proceeding in degraded mode", exc)
+
     body = await request.json()
     manifest = body.get("manifest", {})
-    user_id = body.get("user_id", "anonymous")
+
+    # Reuse existing agent_id if provided and already registered by this user
+    requested_id = body.get("agent_id")
+    if requested_id and requested_id in _registered_agents:
+        existing = _registered_agents[requested_id]
+        if existing.get("user_id") == user_id:
+            agent_id = requested_id
+            existing.update({"manifest": manifest, "last_seen_at": time.time(), "status": "registered"})
+            logger.info("Agent %s re-registered for user %s", agent_id, user_id)
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "agent_id": agent_id,
+                    "registered": True,
+                    "message": f"Agent re-registered with {len(manifest.get('tools', []))} tool(s)",
+                },
+            )
 
     agent_id = str(uuid.uuid4())
     _registered_agents[agent_id] = {
@@ -1760,26 +1845,87 @@ async def register_agent(request: Request) -> JSONResponse:
 @app.get("/api/agents")
 @limiter.limit("60/minute")
 async def list_agents(request: Request) -> JSONResponse:
-    """Return all registered agents.  Requires JWT ``Authorization`` header."""
+    """Return agents belonging to the authenticated user.
+
+    Requires a valid JWT ``Authorization: Bearer <token>`` header.
+    Admin users see all agents; regular users see only their own.
+    """
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Bearer token required")
 
-    agents = list(_registered_agents.values())
-    return JSONResponse(content={"agents": agents, "total": len(agents)})
+    token = auth[len("Bearer "):]
+    # Validate token and extract user_id from auth service
+    calling_user = None
+    is_admin = False
+    try:
+        async with httpx.AsyncClient() as http_client:
+            verify_resp = await http_client.get(
+                f"{SERVICE_URLS['auth']}/me",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=5.0,
+            )
+            if verify_resp.status_code == 200:
+                me = verify_resp.json()
+                calling_user = me.get("email") or me.get("user_id")
+                is_admin = me.get("role") == "admin"
+            else:
+                raise HTTPException(status_code=401, detail="Invalid or expired token")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("Could not validate token with auth service: %s", exc)
+        raise HTTPException(status_code=503, detail="Authentication service unavailable")
+
+    if is_admin:
+        agents = list(_registered_agents.values())
+    else:
+        agents = [a for a in _registered_agents.values() if a.get("user_id") == calling_user]
+
+    # Strip internal fields before returning
+    safe_agents = [
+        {k: v for k, v in a.items() if k != "user_id"}
+        for a in agents
+    ]
+    return JSONResponse(content={"agents": safe_agents, "total": len(safe_agents)})
 
 
 @app.websocket("/ws/agent/{agent_id}")
 async def agent_websocket(websocket: WebSocket, agent_id: str) -> None:
     """WebSocket endpoint for a connected CLI agent.
 
-    Authenticates via ``api_key`` query parameter.  Receives finding JSON from
-    the agent and echoes task assignments back.  Sends a heartbeat every 30 s.
+    Authenticates via ``api_key`` query parameter.  The key is validated against
+    the auth service and the ``agent_id`` must be already registered under that key's
+    owner before the socket is accepted.  Sends a heartbeat every 30 s.
     """
     api_key = websocket.query_params.get("api_key") or websocket.headers.get("x-api-key")
     if not api_key:
         await websocket.close(code=4001)
         return
+
+    # Validate API key and verify the agent belongs to this key's owner
+    try:
+        async with httpx.AsyncClient() as http_client:
+            auth_resp = await http_client.get(
+                f"{SERVICE_URLS['auth']}/apikeys/validate",
+                headers={"X-API-Key": api_key},
+                timeout=5.0,
+            )
+            if auth_resp.status_code in (401, 403):
+                await websocket.close(code=4001)
+                return
+            if auth_resp.status_code == 200:
+                key_owner = auth_resp.json().get("user_id", "")
+                registered = _registered_agents.get(agent_id)
+                if registered and registered.get("user_id") not in (key_owner, "anonymous"):
+                    logger.warning(
+                        "Agent %s ownership mismatch: key owner %s, registered owner %s",
+                        agent_id, key_owner, registered.get("user_id"),
+                    )
+                    await websocket.close(code=4003)
+                    return
+    except Exception as exc:
+        logger.warning("Auth service unreachable during WebSocket auth: %s — proceeding in degraded mode", exc)
 
     await websocket.accept()
     _agent_ws_connections[agent_id] = websocket
@@ -1830,9 +1976,6 @@ async def _agent_heartbeat(websocket: "WebSocket", agent_id: str) -> None:
             await websocket.send_json({"type": "heartbeat", "ts": time.time()})
     except Exception:
         pass
-
-
-# Import json for WebSocket message parsing (already available via stdlib)
 
 
 if __name__ == "__main__":

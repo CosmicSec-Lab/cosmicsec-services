@@ -8,11 +8,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
-import uuid
-from typing import Optional
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -26,9 +25,21 @@ app = FastAPI(
     version="0.1.0",
 )
 
+# ---------------------------------------------------------------------------
+# CORS — explicit origins; no wildcard when credentials are used
+# ---------------------------------------------------------------------------
+_ALLOWED_ORIGINS = [
+    o.strip()
+    for o in os.environ.get(
+        "ALLOWED_ORIGINS",
+        "http://localhost:3000,http://localhost:8000",
+    ).split(",")
+    if o.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -40,6 +51,12 @@ app.add_middleware(
 
 # agent_id → { websocket, connected_at, last_seen_at, manifest }
 _connections: dict[str, dict] = {}
+
+
+# ---------------------------------------------------------------------------
+# Internal relay key — shared secret for service-to-service dispatch calls
+# ---------------------------------------------------------------------------
+_RELAY_SECRET = os.environ.get("RELAY_INTERNAL_SECRET", "")
 
 
 # ---------------------------------------------------------------------------
@@ -79,11 +96,18 @@ async def list_agents() -> JSONResponse:
 
 
 @app.post("/relay/dispatch-task")
-async def dispatch_task(payload: DispatchTaskRequest) -> JSONResponse:
+async def dispatch_task(payload: DispatchTaskRequest, request: Request) -> JSONResponse:
     """Send a task message to a specific connected agent.
 
-    Returns 404 if the agent is not currently connected.
+    Protected by ``X-Relay-Secret`` header (must match ``RELAY_INTERNAL_SECRET``
+    environment variable).  Returns 404 if the agent is not currently connected.
     """
+    # Service-to-service auth via shared secret
+    if _RELAY_SECRET:
+        provided = request.headers.get("X-Relay-Secret", "")
+        if not provided or provided != _RELAY_SECRET:
+            raise HTTPException(status_code=403, detail="Forbidden")
+
     agent_id = payload.agent_id
     if agent_id not in _connections:
         raise HTTPException(status_code=404, detail=f"Agent {agent_id!r} is not connected")
@@ -91,13 +115,14 @@ async def dispatch_task(payload: DispatchTaskRequest) -> JSONResponse:
     ws: WebSocket = _connections[agent_id]["websocket"]
     try:
         await ws.send_json({"type": "task", "payload": payload.task})
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Failed to send task: {exc}") from exc
+    except Exception:
+        logger.exception("Failed to dispatch task to agent %s", agent_id)
+        raise HTTPException(status_code=503, detail="Failed to deliver task to agent")
 
     return JSONResponse(content={"dispatched": True, "agent_id": agent_id})
 
 
-@app.websocket("/ws/agent/{agent_id}")
+@app.websocket("/ws/relay/agent/{agent_id}")
 async def agent_ws(websocket: WebSocket, agent_id: str) -> None:
     """Primary WebSocket endpoint for CLI agent connections.
 
