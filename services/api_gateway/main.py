@@ -547,6 +547,9 @@ async def list_api_keys(request: Request):
 @limiter.limit("30/minute")
 async def delete_api_key(request: Request, key_id: str):
     """Revoke an API key — proxied to auth service."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", key_id):
+        raise HTTPException(status_code=400, detail="Invalid key_id format")
+
     headers = {}
     if request.headers.get("Authorization"):
         headers["Authorization"] = request.headers.get("Authorization")
