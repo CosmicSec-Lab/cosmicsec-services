@@ -256,6 +256,16 @@ async def health_check():
 @limiter.limit("100/minute")
 async def api_status(request: Request):
     """Get detailed status of all microservices"""
+    cache_key = "api:status:v1"
+    try:
+        cache_manager = CacheManager(await get_redis())
+        cached = await cache_manager.get(cache_key)
+        if isinstance(cached, dict):
+            cached["_cache"] = "hit"
+            return cached
+    except Exception as exc:
+        logger.warning("API status cache read skipped: %s", exc)
+
     service_status = {}
 
     async with httpx.AsyncClient() as client:
@@ -272,17 +282,34 @@ async def api_status(request: Request):
                     "error": str(e)
                 }
 
-    return {
+    response_body = {
         "gateway": "operational",
         "services": service_status,
-        "timestamp": time.time()
+        "timestamp": time.time(),
+        "_cache": "miss",
     }
+    try:
+        cache_manager = CacheManager(await get_redis())
+        await cache_manager.set(cache_key, response_body, ttl=timedelta(seconds=15), tags=["status"])
+    except Exception as exc:
+        logger.warning("API status cache write skipped: %s", exc)
+    return response_body
 
 
 @app.get("/api/dashboard/summary")
 @limiter.limit("30/minute")
 async def dashboard_summary(request: Request):
     """Executive dashboard summary for system health and key metrics."""
+    cache_key = "dashboard:summary:v1"
+    try:
+        cache_manager = CacheManager(await get_redis())
+        cached = await cache_manager.get(cache_key)
+        if isinstance(cached, dict):
+            cached["_cache"] = "hit"
+            return cached
+    except Exception as exc:
+        logger.warning("Dashboard summary cache read skipped: %s", exc)
+
     async with httpx.AsyncClient() as client:
         results = {}
         # Scan stats
@@ -313,10 +340,17 @@ async def dashboard_summary(request: Request):
         except Exception:
             results["report_service"] = {"error": "unavailable"}
 
-    return {
+    response_body = {
         "summary": results,
         "timestamp": time.time(),
+        "_cache": "miss",
     }
+    try:
+        cache_manager = CacheManager(await get_redis())
+        await cache_manager.set(cache_key, response_body, ttl=timedelta(seconds=30), tags=["dashboard"])
+    except Exception as exc:
+        logger.warning("Dashboard summary cache write skipped: %s", exc)
+    return response_body
 
 @app.get("/api/dashboard/overview")
 @limiter.limit("60/minute")
