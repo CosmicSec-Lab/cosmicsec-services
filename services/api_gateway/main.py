@@ -37,6 +37,51 @@ from services.common.logging import (
 from services.common.observability import setup_observability
 from services.common.versioning import APIVersionMiddleware
 
+# ---------------------------------------------------------------------------
+# Security helpers — path-parameter validation & log sanitization
+# ---------------------------------------------------------------------------
+
+# Compiled patterns for path parameter validation
+_RE_ALPHANUMERIC_ID = re.compile(r"^[A-Za-z0-9_\-]{1,128}$")
+_RE_EMAIL = re.compile(r"^[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9.\-]{1,253}\.[A-Za-z]{2,}$")
+_RE_PLUGIN_NAME = re.compile(r"^[A-Za-z0-9_\-]{1,128}$")
+_RE_UUID = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
+)
+
+
+def _validate_path_id(value: str, label: str = "id") -> str:
+    """Validate an alphanumeric path parameter to prevent SSRF path injection.
+
+    Accepts letters, digits, hyphens and underscores (max 128 chars).
+    Raises HTTP 400 if the value is invalid.
+    """
+    if not _RE_ALPHANUMERIC_ID.match(value):
+        raise HTTPException(
+            status_code=400, detail=f"Invalid {label}: must be alphanumeric (max 128 chars)"
+        )
+    return value
+
+
+def _validate_email_param(value: str) -> str:
+    """Validate an email path parameter to prevent SSRF path injection."""
+    if not _RE_EMAIL.match(value):
+        raise HTTPException(status_code=400, detail="Invalid email format in path")
+    return value
+
+
+def _sanitize_log(value: object, max_len: int = 200) -> str:
+    """Sanitize a user-provided value before including it in a log message.
+
+    Removes newline and carriage-return characters to prevent log injection,
+    and truncates to ``max_len`` characters.
+    """
+    text = str(value) if value is not None else ""
+    # Strip log-injection control characters
+    text = text.replace("\n", "\\n").replace("\r", "\\r").replace("\x00", "")
+    return text[:max_len]
+
+
 # Initialize FastAPI app
 app = FastAPI(
     title="CosmicSec API Gateway",
@@ -1108,6 +1153,7 @@ async def admin_create_user(request: Request):
 @app.put("/api/admin/users/{email}")
 @limiter.limit("30/minute")
 async def admin_update_user(request: Request, email: str):
+    email = _validate_email_param(email)
     payload = await request.json()
     async with httpx.AsyncClient() as client:
         response = await client.put(
@@ -1119,6 +1165,7 @@ async def admin_update_user(request: Request, email: str):
 @app.delete("/api/admin/users/{email}")
 @limiter.limit("30/minute")
 async def admin_delete_user(request: Request, email: str):
+    email = _validate_email_param(email)
     async with httpx.AsyncClient() as client:
         response = await client.delete(f"{SERVICE_URLS['auth']}/users/{email}", timeout=10.0)
         return JSONResponse(status_code=response.status_code, content=response.json())
@@ -1188,6 +1235,7 @@ async def list_orgs(request: Request):
 @app.post("/api/orgs/{org_id}/members")
 @limiter.limit("30/minute")
 async def add_org_member(request: Request, org_id: str):
+    org_id = _validate_path_id(org_id, "org_id")
     payload = await request.json()
     async with httpx.AsyncClient() as client:
         response = await client.post(
@@ -1199,6 +1247,7 @@ async def add_org_member(request: Request, org_id: str):
 @app.get("/api/orgs/{org_id}/members")
 @limiter.limit("60/minute")
 async def list_org_members(request: Request, org_id: str):
+    org_id = _validate_path_id(org_id, "org_id")
     async with httpx.AsyncClient() as client:
         response = await client.get(f"{SERVICE_URLS['auth']}/orgs/{org_id}/members", timeout=10.0)
         return JSONResponse(status_code=response.status_code, content=response.json())
@@ -1207,6 +1256,7 @@ async def list_org_members(request: Request, org_id: str):
 @app.post("/api/orgs/{org_id}/workspaces")
 @limiter.limit("30/minute")
 async def create_workspace(request: Request, org_id: str):
+    org_id = _validate_path_id(org_id, "org_id")
     payload = await request.json()
     async with httpx.AsyncClient() as client:
         response = await client.post(
@@ -1218,6 +1268,7 @@ async def create_workspace(request: Request, org_id: str):
 @app.get("/api/orgs/{org_id}/workspaces")
 @limiter.limit("60/minute")
 async def list_workspaces(request: Request, org_id: str):
+    org_id = _validate_path_id(org_id, "org_id")
     async with httpx.AsyncClient() as client:
         response = await client.get(
             f"{SERVICE_URLS['auth']}/orgs/{org_id}/workspaces", timeout=10.0
@@ -1228,6 +1279,7 @@ async def list_workspaces(request: Request, org_id: str):
 @app.get("/api/orgs/{org_id}/quotas")
 @limiter.limit("60/minute")
 async def get_org_quotas(request: Request, org_id: str):
+    org_id = _validate_path_id(org_id, "org_id")
     async with httpx.AsyncClient() as client:
         response = await client.get(f"{SERVICE_URLS['auth']}/orgs/{org_id}/quotas", timeout=10.0)
         return JSONResponse(status_code=response.status_code, content=response.json())
@@ -1236,6 +1288,7 @@ async def get_org_quotas(request: Request, org_id: str):
 @app.post("/api/orgs/{org_id}/quotas")
 @limiter.limit("20/minute")
 async def set_org_quotas(request: Request, org_id: str):
+    org_id = _validate_path_id(org_id, "org_id")
     payload = await request.json()
     async with httpx.AsyncClient() as client:
         response = await client.post(
@@ -1456,6 +1509,7 @@ async def scan_monitor_job_detail(request: Request, job_id: str):
 @app.post("/api/scan/monitor/jobs/{job_id}/pause")
 @limiter.limit("20/minute")
 async def scan_monitor_pause(request: Request, job_id: str):
+    job_id = _validate_path_id(job_id, "job_id")
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.post(
@@ -1469,6 +1523,7 @@ async def scan_monitor_pause(request: Request, job_id: str):
 @app.post("/api/scan/monitor/jobs/{job_id}/resume")
 @limiter.limit("20/minute")
 async def scan_monitor_resume(request: Request, job_id: str):
+    job_id = _validate_path_id(job_id, "job_id")
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.post(
@@ -1714,6 +1769,7 @@ async def ai_anomaly_batch(request: Request):
 @app.post("/api/collab/rooms/{room_id}/reports")
 @limiter.limit("30/minute")
 async def collab_create_report_section(request: Request, room_id: str):
+    room_id = _validate_path_id(room_id, "room_id")
     data = await request.json()
     async with httpx.AsyncClient() as client:
         try:
@@ -1728,6 +1784,7 @@ async def collab_create_report_section(request: Request, room_id: str):
 @app.get("/api/collab/rooms/{room_id}/reports")
 @limiter.limit("60/minute")
 async def collab_list_report_sections(request: Request, room_id: str):
+    room_id = _validate_path_id(room_id, "room_id")
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.get(
@@ -1818,6 +1875,7 @@ async def marketplace_publish(request: Request):
 @app.post("/api/plugins/{name}/rate")
 @limiter.limit("20/minute")
 async def plugin_rate(request: Request, name: str):
+    name = _validate_path_id(name, "plugin name")
     data = await request.json()
     async with httpx.AsyncClient() as client:
         try:
@@ -1832,6 +1890,7 @@ async def plugin_rate(request: Request, name: str):
 @app.get("/api/plugins/{name}/rating")
 @limiter.limit("60/minute")
 async def plugin_rating(request: Request, name: str):
+    name = _validate_path_id(name, "plugin name")
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.get(f"{SERVICE_URLS['plugins']}/plugins/{name}/rating", timeout=5.0)
@@ -1854,6 +1913,7 @@ async def plugins_updates(request: Request):
 @app.post("/api/plugins/{name}/auto-update")
 @limiter.limit("10/minute")
 async def plugin_auto_update(request: Request, name: str):
+    name = _validate_path_id(name, "plugin name")
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.post(
@@ -2257,8 +2317,8 @@ async def agent_websocket(websocket: WebSocket, agent_id: str) -> None:
                     logger.warning(
                         "Agent %s ownership mismatch: key owner %s, registered owner %s",
                         agent_id,
-                        key_owner,
-                        registered.get("user_id"),
+                        _sanitize_log(key_owner),
+                        _sanitize_log(registered.get("user_id")),
                     )
                     await websocket.close(code=4003)
                     return
@@ -2291,9 +2351,17 @@ async def agent_websocket(websocket: WebSocket, agent_id: str) -> None:
 
             if msg_type == "finding":
                 finding = msg.get("payload", {})
-                logger.info("Agent %s submitted finding: %s", agent_id, finding.get("title"))
+                logger.info(
+                    "Agent %s submitted finding: %s",
+                    agent_id,
+                    _sanitize_log(finding.get("title")),
+                )
             elif msg_type == "scan_complete":
-                logger.info("Agent %s scan complete: %s", agent_id, msg.get("scan_id"))
+                logger.info(
+                    "Agent %s scan complete: %s",
+                    agent_id,
+                    _sanitize_log(msg.get("scan_id")),
+                )
             else:
                 logger.debug("Agent %s unknown message type: %s", agent_id, msg_type)
 

@@ -174,7 +174,7 @@ class ContinuousMonitor:
         logger.info(
             "Scheduled monitoring job %s for %s every %ds",
             job_id,
-            target,
+            target.replace("\n", "\\n").replace("\r", "\\r")[:200],
             job.interval_seconds,
         )
         return job_id
