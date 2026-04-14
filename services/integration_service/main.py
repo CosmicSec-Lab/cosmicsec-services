@@ -2,13 +2,14 @@
 
 Provides connector endpoints for SIEM, ticketing, notifications, and external system forwarding.
 """
+
 from __future__ import annotations
 
 import os
 import secrets
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import httpx
 from fastapi import Depends, FastAPI
@@ -21,10 +22,10 @@ from services.common.models import IntegrationConfigModel
 app = FastAPI(title="CosmicSec Integration Service", version="1.0.0")
 
 # In-memory event logs (transient — forwarding audit trail)
-siem_events: List[Dict[str, Any]] = []
-tickets: List[Dict[str, Any]] = []
-notifications: List[Dict[str, Any]] = []
-webhook_events: List[Dict[str, Any]] = []
+siem_events: list[dict[str, Any]] = []
+tickets: list[dict[str, Any]] = []
+notifications: list[dict[str, Any]] = []
+webhook_events: list[dict[str, Any]] = []
 
 # Default forwarding endpoints (override via env)
 SIEM_FORWARD_URL = os.getenv("SIEM_FORWARD_URL")
@@ -43,36 +44,36 @@ class SIEMEvent(BaseModel):
     source: str
     severity: str = Field(default="info")
     message: str
-    data: Optional[Dict[str, Any]] = None
+    data: dict[str, Any] | None = None
 
 
 class TicketCreate(BaseModel):
     project: str
     summary: str
-    description: Optional[str] = None
-    priority: Optional[str] = Field(default="Medium")
-    labels: Optional[List[str]] = None
+    description: str | None = None
+    priority: str | None = Field(default="Medium")
+    labels: list[str] | None = None
 
 
 class NotificationRequest(BaseModel):
     channel: str
     message: str
-    attributes: Optional[Dict[str, Any]] = None
+    attributes: dict[str, Any] | None = None
 
 
 class WebhookRequest(BaseModel):
     target_url: str
     event_type: str
-    payload: Dict[str, Any]
+    payload: dict[str, Any]
 
 
 class IntegrationConfigCreate(BaseModel):
     integration_type: str
     name: str
-    config: Dict[str, Any] = Field(default_factory=dict)
+    config: dict[str, Any] = Field(default_factory=dict)
 
 
-async def _forward_post(url: Optional[str], payload: Dict[str, Any]) -> bool:
+async def _forward_post(url: str | None, payload: dict[str, Any]) -> bool:
     if not url:
         return False
     async with httpx.AsyncClient() as client:
@@ -83,7 +84,7 @@ async def _forward_post(url: Optional[str], payload: Dict[str, Any]) -> bool:
             return False
 
 
-def _notification_entry(notification_type: str, payload: NotificationRequest) -> Dict[str, Any]:
+def _notification_entry(notification_type: str, payload: NotificationRequest) -> dict[str, Any]:
     return {
         "id": secrets.token_urlsafe(8),
         "type": notification_type,
@@ -107,8 +108,11 @@ async def health() -> dict:
 # Integration config management (DB-backed)
 # ---------------------------------------------------------------------------
 
+
 @app.post("/configs", status_code=201)
-async def create_integration_config(payload: IntegrationConfigCreate, db: Session = Depends(get_db)) -> dict:
+async def create_integration_config(
+    payload: IntegrationConfigCreate, db: Session = Depends(get_db)
+) -> dict:
     """Persist an integration configuration to the database."""
     config_id = f"cfg-{uuid.uuid4().hex[:8]}"
     record = IntegrationConfigModel(
@@ -126,7 +130,7 @@ async def create_integration_config(payload: IntegrationConfigCreate, db: Sessio
 
 @app.get("/configs")
 async def list_integration_configs(
-    integration_type: Optional[str] = None,
+    integration_type: str | None = None,
     db: Session = Depends(get_db),
 ) -> dict:
     """List all stored integration configurations."""
@@ -140,6 +144,7 @@ async def list_integration_configs(
 @app.delete("/configs/{config_id}")
 async def delete_integration_config(config_id: str, db: Session = Depends(get_db)) -> dict:
     from fastapi import HTTPException
+
     record = db.query(IntegrationConfigModel).filter(IntegrationConfigModel.id == config_id).first()
     if not record:
         raise HTTPException(status_code=404, detail="Config not found")
@@ -151,7 +156,11 @@ async def delete_integration_config(config_id: str, db: Session = Depends(get_db
 @app.post("/siem/ingest")
 async def ingest_siem(event: SIEMEvent) -> dict:
     """Ingest an event for SIEM consolidation or forwarding."""
-    entry = {**event.model_dump(), "id": secrets.token_urlsafe(8), "received_at": datetime.now(timezone.utc).isoformat()}
+    entry = {
+        **event.model_dump(),
+        "id": secrets.token_urlsafe(8),
+        "received_at": datetime.now(timezone.utc).isoformat(),
+    }
     siem_events.append(entry)
     forwarded = await _forward_post(SIEM_FORWARD_URL, entry)
     return {"status": "stored", "event_id": entry["id"], "forwarded": forwarded}
@@ -159,17 +168,25 @@ async def ingest_siem(event: SIEMEvent) -> dict:
 
 @app.post("/siem/splunk")
 async def ingest_splunk(event: SIEMEvent) -> dict:
-    return await ingest_siem(SIEMEvent(source="splunk", severity=event.severity, message=event.message, data=event.data))
+    return await ingest_siem(
+        SIEMEvent(source="splunk", severity=event.severity, message=event.message, data=event.data)
+    )
 
 
 @app.post("/siem/qradar")
 async def ingest_qradar(event: SIEMEvent) -> dict:
-    return await ingest_siem(SIEMEvent(source="qradar", severity=event.severity, message=event.message, data=event.data))
+    return await ingest_siem(
+        SIEMEvent(source="qradar", severity=event.severity, message=event.message, data=event.data)
+    )
 
 
 @app.post("/siem/sentinel")
 async def ingest_sentinel(event: SIEMEvent) -> dict:
-    return await ingest_siem(SIEMEvent(source="sentinel", severity=event.severity, message=event.message, data=event.data))
+    return await ingest_siem(
+        SIEMEvent(
+            source="sentinel", severity=event.severity, message=event.message, data=event.data
+        )
+    )
 
 
 @app.get("/siem/events")
@@ -209,7 +226,12 @@ async def create_servicenow_ticket(ticket: TicketCreate) -> dict:
     }
     tickets.append(entry)
     forwarded = await _forward_post(SERVICENOW_API_URL, entry)
-    return {"status": "created", "incident_id": incident_id, "ticket": entry, "forwarded": forwarded}
+    return {
+        "status": "created",
+        "incident_id": incident_id,
+        "ticket": entry,
+        "forwarded": forwarded,
+    }
 
 
 @app.post("/ticket/github")
@@ -226,7 +248,12 @@ async def create_github_issue(ticket: TicketCreate) -> dict:
     }
     tickets.append(entry)
     forwarded = await _forward_post(GITHUB_ISSUES_API_URL, entry)
-    return {"status": "created", "issue_number": issue_number, "ticket": entry, "forwarded": forwarded}
+    return {
+        "status": "created",
+        "issue_number": issue_number,
+        "ticket": entry,
+        "forwarded": forwarded,
+    }
 
 
 @app.post("/ticket/webhook")
@@ -273,7 +300,11 @@ async def notify_pagerduty(payload: NotificationRequest) -> dict:
     notifications.append(entry)
     forwarded = await _forward_post(
         PAGERDUTY_EVENTS_URL,
-        {"routing_key": "simulated", "event_action": "trigger", "payload": {"summary": payload.message}},
+        {
+            "routing_key": "simulated",
+            "event_action": "trigger",
+            "payload": {"summary": payload.message},
+        },
     )
     return {"status": "queued", "notification_id": entry["id"], "forwarded": forwarded}
 
@@ -293,7 +324,9 @@ async def notify_email(payload: NotificationRequest) -> dict:
 async def notify_sms(payload: NotificationRequest) -> dict:
     entry = _notification_entry("sms", payload)
     notifications.append(entry)
-    forwarded = await _forward_post(TWILIO_API_URL, {"to": payload.channel, "body": payload.message})
+    forwarded = await _forward_post(
+        TWILIO_API_URL, {"to": payload.channel, "body": payload.message}
+    )
     return {"status": "queued", "notification_id": entry["id"], "forwarded": forwarded}
 
 
@@ -322,7 +355,7 @@ async def threat_intel_domain(domain: str) -> dict:
 
 
 @app.post("/ci/build")
-async def ci_build(trigger: Dict[str, Any]) -> dict:
+async def ci_build(trigger: dict[str, Any]) -> dict:
     build_id = secrets.token_urlsafe(10)
     return {
         "status": "queued",
@@ -335,6 +368,7 @@ async def ci_build(trigger: Dict[str, Any]) -> dict:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _config_to_dict(c: IntegrationConfigModel) -> dict:
     return {

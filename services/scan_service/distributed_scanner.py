@@ -4,12 +4,13 @@ Phase 2 — Distributed Scanning Coordinator.
 Provides in-memory node registry and target-to-node assignment with
 round-robin + health/weight filtering.
 """
+
 from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 
 @dataclass
@@ -18,11 +19,11 @@ class ScanNode:
     region: str
     capacity: int = 4
     healthy: bool = True
-    tags: List[str] = field(default_factory=list)
+    tags: list[str] = field(default_factory=list)
     active_jobs: int = 0
     last_heartbeat: str = field(default_factory=lambda: datetime.utcnow().isoformat())
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "node_id": self.node_id,
             "region": self.region,
@@ -39,14 +40,18 @@ class DistributedScanCoordinator:
     """Simple in-memory coordinator for distributed scan assignment."""
 
     def __init__(self) -> None:
-        self._nodes: Dict[str, ScanNode] = {}
+        self._nodes: dict[str, ScanNode] = {}
 
-    def register_node(self, node_id: str, region: str, capacity: int = 4, tags: Optional[List[str]] = None) -> Dict[str, Any]:
+    def register_node(
+        self, node_id: str, region: str, capacity: int = 4, tags: list[str] | None = None
+    ) -> dict[str, Any]:
         node = ScanNode(node_id=node_id, region=region, capacity=max(1, capacity), tags=tags or [])
         self._nodes[node_id] = node
         return node.to_dict()
 
-    def heartbeat(self, node_id: str, healthy: bool = True, active_jobs: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    def heartbeat(
+        self, node_id: str, healthy: bool = True, active_jobs: int | None = None
+    ) -> dict[str, Any] | None:
         node = self._nodes.get(node_id)
         if node is None:
             return None
@@ -56,19 +61,20 @@ class DistributedScanCoordinator:
         node.last_heartbeat = datetime.utcnow().isoformat()
         return node.to_dict()
 
-    def list_nodes(self) -> List[Dict[str, Any]]:
+    def list_nodes(self) -> list[dict[str, Any]]:
         return [n.to_dict() for n in self._nodes.values()]
 
     def assign_target(
         self,
         target: str,
         replicas: int = 1,
-        region_hint: Optional[str] = None,
-        required_tags: Optional[List[str]] = None,
-    ) -> Dict[str, Any]:
+        region_hint: str | None = None,
+        required_tags: list[str] | None = None,
+    ) -> dict[str, Any]:
         tags = set(required_tags or [])
         candidates = [
-            n for n in self._nodes.values()
+            n
+            for n in self._nodes.values()
             if n.healthy
             and n.active_jobs < n.capacity
             and (region_hint is None or n.region == region_hint)
@@ -86,7 +92,7 @@ class DistributedScanCoordinator:
         seed = int(hashlib.sha256(target.encode("utf-8")).hexdigest(), 16)
         candidates.sort(key=lambda n: (n.active_jobs / n.capacity, n.node_id))
 
-        selected: List[ScanNode] = []
+        selected: list[ScanNode] = []
         for i in range(min(max(1, replicas), len(candidates))):
             idx = (seed + i) % len(candidates)
             node = candidates[idx]

@@ -1,4 +1,5 @@
 """SIEM connector — export audit logs to Splunk, Elastic SIEM, or flat files."""
+
 from __future__ import annotations
 
 import csv
@@ -49,7 +50,9 @@ async def send_to_splunk(events: list[dict[str, Any]], hec_url: str, hec_token: 
         return False
 
 
-async def send_to_elastic_siem(events: list[dict[str, Any]], elastic_url: str, api_key: str) -> bool:
+async def send_to_elastic_siem(
+    events: list[dict[str, Any]], elastic_url: str, api_key: str
+) -> bool:
     """Send audit events to Elastic SIEM via Bulk API."""
     bulk_body = ""
     for ev in events:

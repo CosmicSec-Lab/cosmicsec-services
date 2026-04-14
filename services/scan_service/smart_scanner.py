@@ -10,17 +10,19 @@ AI-driven scan path optimisation:
 The engine probes the target if httpx is available, or falls back to
 URL-pattern-only fingerprinting in offline/simulation mode.
 """
+
 from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 _HTTPX_AVAILABLE = False
 try:
     import httpx  # type: ignore[import-not-found]
+
     _HTTPX_AVAILABLE = True
 except Exception:
     pass
@@ -31,80 +33,242 @@ except Exception:
 
 # Each rule: match_type (header|body|url), key (for headers), pattern regex,
 #            tech name, attack-surface tags, risk multiplier (1.0 = normal)
-_FINGERPRINTS: List[Dict[str, Any]] = [
+_FINGERPRINTS: list[dict[str, Any]] = [
     # ---- HTTP header-based ----
-    {"match": "header", "key": "x-powered-by",  "pattern": r"php",       "tech": "PHP",            "tags": ["sqli", "lfi", "rce"],                "risk": 1.3},
-    {"match": "header", "key": "x-powered-by",  "pattern": r"asp\.net",  "tech": "ASP.NET",        "tags": ["sqli", "xxe", "path_traversal"],      "risk": 1.2},
-    {"match": "header", "key": "x-powered-by",  "pattern": r"express",   "tech": "Express.js",     "tags": ["xss", "sqli", "api"],                 "risk": 1.0},
-    {"match": "header", "key": "server",         "pattern": r"nginx",     "tech": "Nginx",          "tags": ["misconfig", "web"],                   "risk": 0.9},
-    {"match": "header", "key": "server",         "pattern": r"apache",    "tech": "Apache",         "tags": ["misconfig", "web", "lfi"],            "risk": 1.0},
-    {"match": "header", "key": "server",         "pattern": r"iis",       "tech": "IIS",            "tags": ["path_traversal", "misconfig"],        "risk": 1.1},
-    {"match": "header", "key": "x-generator",    "pattern": r"wordpress", "tech": "WordPress",      "tags": ["cms", "sqli", "plugin_vulns"],        "risk": 1.4},
-    {"match": "header", "key": "x-drupal-cache", "pattern": r".*",        "tech": "Drupal",         "tags": ["cms", "rce", "sqli"],                 "risk": 1.3},
-
+    {
+        "match": "header",
+        "key": "x-powered-by",
+        "pattern": r"php",
+        "tech": "PHP",
+        "tags": ["sqli", "lfi", "rce"],
+        "risk": 1.3,
+    },
+    {
+        "match": "header",
+        "key": "x-powered-by",
+        "pattern": r"asp\.net",
+        "tech": "ASP.NET",
+        "tags": ["sqli", "xxe", "path_traversal"],
+        "risk": 1.2,
+    },
+    {
+        "match": "header",
+        "key": "x-powered-by",
+        "pattern": r"express",
+        "tech": "Express.js",
+        "tags": ["xss", "sqli", "api"],
+        "risk": 1.0,
+    },
+    {
+        "match": "header",
+        "key": "server",
+        "pattern": r"nginx",
+        "tech": "Nginx",
+        "tags": ["misconfig", "web"],
+        "risk": 0.9,
+    },
+    {
+        "match": "header",
+        "key": "server",
+        "pattern": r"apache",
+        "tech": "Apache",
+        "tags": ["misconfig", "web", "lfi"],
+        "risk": 1.0,
+    },
+    {
+        "match": "header",
+        "key": "server",
+        "pattern": r"iis",
+        "tech": "IIS",
+        "tags": ["path_traversal", "misconfig"],
+        "risk": 1.1,
+    },
+    {
+        "match": "header",
+        "key": "x-generator",
+        "pattern": r"wordpress",
+        "tech": "WordPress",
+        "tags": ["cms", "sqli", "plugin_vulns"],
+        "risk": 1.4,
+    },
+    {
+        "match": "header",
+        "key": "x-drupal-cache",
+        "pattern": r".*",
+        "tech": "Drupal",
+        "tags": ["cms", "rce", "sqli"],
+        "risk": 1.3,
+    },
     # ---- Response body patterns ----
-    {"match": "body", "pattern": r"wp-content|wp-admin|wp-includes",       "tech": "WordPress",      "tags": ["cms", "sqli", "plugin_vulns", "brute_force"], "risk": 1.4},
-    {"match": "body", "pattern": r"Drupal\.settings|drupal\.js",           "tech": "Drupal",         "tags": ["cms", "rce"],                        "risk": 1.3},
-    {"match": "body", "pattern": r"__VIEWSTATE|__EVENTTARGET",             "tech": "ASP.NET WebForms","tags": ["sqli", "path_traversal"],            "risk": 1.2},
-    {"match": "body", "pattern": r"laravel_session|csrfToken.*laravel",    "tech": "Laravel",        "tags": ["sqli", "rce", "deserialization"],     "risk": 1.3},
-    {"match": "body", "pattern": r"rails|csrf-token.*rails",               "tech": "Ruby on Rails",  "tags": ["sqli", "rce", "deserialization"],     "risk": 1.2},
-    {"match": "body", "pattern": r"react|reactdom|__NEXT_DATA__",          "tech": "React/Next.js",  "tags": ["xss", "api"],                        "risk": 0.9},
-    {"match": "body", "pattern": r"ng-version=|angular\.js",               "tech": "Angular",        "tags": ["xss", "api"],                        "risk": 0.9},
-    {"match": "body", "pattern": r"swagger-ui|\"openapi\":",               "tech": "OpenAPI/Swagger", "tags": ["api", "sqli", "auth_bypass"],       "risk": 1.1},
-    {"match": "body", "pattern": r"\"__schema\"|graphql",                  "tech": "GraphQL",        "tags": ["api", "introspection", "sqli"],       "risk": 1.2},
-    {"match": "body", "pattern": r"jira|atlassian\.com",                   "tech": "Jira/Confluence","tags": ["ssrf", "rce", "auth_bypass"],         "risk": 1.3},
-
+    {
+        "match": "body",
+        "pattern": r"wp-content|wp-admin|wp-includes",
+        "tech": "WordPress",
+        "tags": ["cms", "sqli", "plugin_vulns", "brute_force"],
+        "risk": 1.4,
+    },
+    {
+        "match": "body",
+        "pattern": r"Drupal\.settings|drupal\.js",
+        "tech": "Drupal",
+        "tags": ["cms", "rce"],
+        "risk": 1.3,
+    },
+    {
+        "match": "body",
+        "pattern": r"__VIEWSTATE|__EVENTTARGET",
+        "tech": "ASP.NET WebForms",
+        "tags": ["sqli", "path_traversal"],
+        "risk": 1.2,
+    },
+    {
+        "match": "body",
+        "pattern": r"laravel_session|csrfToken.*laravel",
+        "tech": "Laravel",
+        "tags": ["sqli", "rce", "deserialization"],
+        "risk": 1.3,
+    },
+    {
+        "match": "body",
+        "pattern": r"rails|csrf-token.*rails",
+        "tech": "Ruby on Rails",
+        "tags": ["sqli", "rce", "deserialization"],
+        "risk": 1.2,
+    },
+    {
+        "match": "body",
+        "pattern": r"react|reactdom|__NEXT_DATA__",
+        "tech": "React/Next.js",
+        "tags": ["xss", "api"],
+        "risk": 0.9,
+    },
+    {
+        "match": "body",
+        "pattern": r"ng-version=|angular\.js",
+        "tech": "Angular",
+        "tags": ["xss", "api"],
+        "risk": 0.9,
+    },
+    {
+        "match": "body",
+        "pattern": r"swagger-ui|\"openapi\":",
+        "tech": "OpenAPI/Swagger",
+        "tags": ["api", "sqli", "auth_bypass"],
+        "risk": 1.1,
+    },
+    {
+        "match": "body",
+        "pattern": r"\"__schema\"|graphql",
+        "tech": "GraphQL",
+        "tags": ["api", "introspection", "sqli"],
+        "risk": 1.2,
+    },
+    {
+        "match": "body",
+        "pattern": r"jira|atlassian\.com",
+        "tech": "Jira/Confluence",
+        "tags": ["ssrf", "rce", "auth_bypass"],
+        "risk": 1.3,
+    },
     # ---- URL pattern-based ----
-    {"match": "url", "pattern": r"/wp-login|/wp-admin",                    "tech": "WordPress Admin","tags": ["brute_force", "cms"],                "risk": 1.5},
-    {"match": "url", "pattern": r"/phpmyadmin",                            "tech": "phpMyAdmin",     "tags": ["sqli", "rce", "misconfig"],          "risk": 1.6},
-    {"match": "url", "pattern": r"/admin|/_admin|/administrator",          "tech": "Admin Panel",    "tags": ["brute_force", "misconfig"],          "risk": 1.4},
-    {"match": "url", "pattern": r"/\.git/|/\.env",                         "tech": "Source Exposure","tags": ["info_disclosure"],                   "risk": 2.0},
-    {"match": "url", "pattern": r"/api/v[0-9]",                            "tech": "REST API",       "tags": ["api", "sqli", "auth_bypass"],       "risk": 1.2},
-    {"match": "url", "pattern": r"/actuator|/metrics|/health",             "tech": "Spring Actuator","tags": ["info_disclosure", "rce", "ssrf"],    "risk": 1.5},
-    {"match": "url", "pattern": r"/solr|/elasticsearch",                   "tech": "Search Engine",  "tags": ["rce", "info_disclosure"],            "risk": 1.5},
-    {"match": "url", "pattern": r"/jenkins",                               "tech": "Jenkins",        "tags": ["rce", "auth_bypass"],                "risk": 1.6},
+    {
+        "match": "url",
+        "pattern": r"/wp-login|/wp-admin",
+        "tech": "WordPress Admin",
+        "tags": ["brute_force", "cms"],
+        "risk": 1.5,
+    },
+    {
+        "match": "url",
+        "pattern": r"/phpmyadmin",
+        "tech": "phpMyAdmin",
+        "tags": ["sqli", "rce", "misconfig"],
+        "risk": 1.6,
+    },
+    {
+        "match": "url",
+        "pattern": r"/admin|/_admin|/administrator",
+        "tech": "Admin Panel",
+        "tags": ["brute_force", "misconfig"],
+        "risk": 1.4,
+    },
+    {
+        "match": "url",
+        "pattern": r"/\.git/|/\.env",
+        "tech": "Source Exposure",
+        "tags": ["info_disclosure"],
+        "risk": 2.0,
+    },
+    {
+        "match": "url",
+        "pattern": r"/api/v[0-9]",
+        "tech": "REST API",
+        "tags": ["api", "sqli", "auth_bypass"],
+        "risk": 1.2,
+    },
+    {
+        "match": "url",
+        "pattern": r"/actuator|/metrics|/health",
+        "tech": "Spring Actuator",
+        "tags": ["info_disclosure", "rce", "ssrf"],
+        "risk": 1.5,
+    },
+    {
+        "match": "url",
+        "pattern": r"/solr|/elasticsearch",
+        "tech": "Search Engine",
+        "tags": ["rce", "info_disclosure"],
+        "risk": 1.5,
+    },
+    {
+        "match": "url",
+        "pattern": r"/jenkins",
+        "tech": "Jenkins",
+        "tags": ["rce", "auth_bypass"],
+        "risk": 1.6,
+    },
 ]
 
 # Map attack-surface tags → canonical ScanType strings
-_TAG_TO_SCAN_TYPE: Dict[str, str] = {
-    "sqli":          "api",
-    "rce":           "web",
-    "lfi":           "web",
-    "path_traversal":"web",
-    "cms":           "web",
-    "api":           "api",
-    "brute_force":   "web",
-    "xss":           "web",
-    "misconfig":     "network",
-    "info_disclosure":"web",
-    "auth_bypass":   "api",
-    "deserialization":"web",
-    "ssrf":          "web",
+_TAG_TO_SCAN_TYPE: dict[str, str] = {
+    "sqli": "api",
+    "rce": "web",
+    "lfi": "web",
+    "path_traversal": "web",
+    "cms": "web",
+    "api": "api",
+    "brute_force": "web",
+    "xss": "web",
+    "misconfig": "network",
+    "info_disclosure": "web",
+    "auth_bypass": "api",
+    "deserialization": "web",
+    "ssrf": "web",
     "introspection": "api",
-    "plugin_vulns":  "web",
-    "xxe":           "api",
-    "cloud":         "cloud",
-    "container":     "container",
+    "plugin_vulns": "web",
+    "xxe": "api",
+    "cloud": "cloud",
+    "container": "container",
 }
 
 # Base priority for each tag (0–100)
-_TAG_PRIORITY: Dict[str, int] = {
+_TAG_PRIORITY: dict[str, int] = {
     "info_disclosure": 60,
-    "xss":             65,
-    "brute_force":     70,
-    "misconfig":       72,
-    "path_traversal":  75,
-    "xxe":             75,
-    "ssrf":            78,
-    "lfi":             78,
-    "plugin_vulns":    70,
-    "introspection":   60,
+    "xss": 65,
+    "brute_force": 70,
+    "misconfig": 72,
+    "path_traversal": 75,
+    "xxe": 75,
+    "ssrf": 78,
+    "lfi": 78,
+    "plugin_vulns": 70,
+    "introspection": 60,
     "deserialization": 85,
-    "auth_bypass":     85,
-    "api":             80,
-    "sqli":            88,
-    "cms":             75,
-    "rce":             95,
+    "auth_bypass": 85,
+    "api": 80,
+    "sqli": 88,
+    "cms": 75,
+    "rce": 95,
 }
 
 
@@ -112,7 +276,8 @@ _TAG_PRIORITY: Dict[str, int] = {
 # Fingerprinting
 # ---------------------------------------------------------------------------
 
-async def fingerprint_target(url: str) -> Dict[str, Any]:
+
+async def fingerprint_target(url: str) -> dict[str, Any]:
     """
     Probe a target URL to identify its technology stack.
 
@@ -122,8 +287,8 @@ async def fingerprint_target(url: str) -> Dict[str, Any]:
     if not _HTTPX_AVAILABLE:
         return _url_fingerprint(url)
 
-    technologies: List[str] = []
-    tags: List[str] = []
+    technologies: list[str] = []
+    tags: list[str] = []
     risk_multiplier = 1.0
 
     try:
@@ -172,33 +337,38 @@ async def fingerprint_target(url: str) -> Dict[str, Any]:
     }
 
 
-def _url_fingerprint(url: str) -> Dict[str, Any]:
+def _url_fingerprint(url: str) -> dict[str, Any]:
     """Static URL-pattern-only fingerprinting (no network I/O)."""
-    technologies: List[str] = []
-    tags: List[str] = []
+    technologies: list[str] = []
+    tags: list[str] = []
     risk = 1.0
 
     for fp in _FINGERPRINTS:
-        if fp["match"] == "url":
-            if re.search(fp["pattern"], url, re.IGNORECASE):
-                if fp["tech"] not in technologies:
-                    technologies.append(fp["tech"])
-                for t in fp["tags"]:
-                    if t not in tags:
-                        tags.append(t)
-                risk = max(risk, fp.get("risk", 1.0))
+        if fp["match"] == "url" and re.search(fp["pattern"], url, re.IGNORECASE):
+            if fp["tech"] not in technologies:
+                technologies.append(fp["tech"])
+            for t in fp["tags"]:
+                if t not in tags:
+                    tags.append(t)
+            risk = max(risk, fp.get("risk", 1.0))
 
-    return {"url": url, "technologies": technologies, "tags": tags, "risk_multiplier": round(risk, 2)}
+    return {
+        "url": url,
+        "technologies": technologies,
+        "tags": tags,
+        "risk_multiplier": round(risk, 2),
+    }
 
 
 # ---------------------------------------------------------------------------
 # Scan plan builder
 # ---------------------------------------------------------------------------
 
+
 def build_scan_plan(
-    fingerprint: Dict[str, Any],
-    previously_run: Optional[List[str]] = None,
-) -> Dict[str, Any]:
+    fingerprint: dict[str, Any],
+    previously_run: list[str] | None = None,
+) -> dict[str, Any]:
     """
     Build a prioritised scan plan from a fingerprint result.
 
@@ -215,8 +385,8 @@ def build_scan_plan(
     already_done = set(previously_run or [])
 
     # Aggregate priority per scan type
-    scan_scores: Dict[str, float] = {}
-    rationales: Dict[str, List[str]] = {}
+    scan_scores: dict[str, float] = {}
+    rationales: dict[str, list[str]] = {}
 
     for tag in tags:
         scan_type = _TAG_TO_SCAN_TYPE.get(tag, "web")
@@ -230,13 +400,15 @@ def build_scan_plan(
     plan = []
     for scan_type, score in sorted(scan_scores.items(), key=lambda x: -x[1]):
         already = scan_type in already_done
-        plan.append({
-            "scan_type": scan_type,
-            "priority": round(score, 1),
-            "rationale": f"Indicators: {', '.join(rationales.get(scan_type, []))}",
-            "already_performed": already,
-            "recommended": not already,
-        })
+        plan.append(
+            {
+                "scan_type": scan_type,
+                "priority": round(score, 1),
+                "rationale": f"Indicators: {', '.join(rationales.get(scan_type, []))}",
+                "already_performed": already,
+                "recommended": not already,
+            }
+        )
 
     # Coverage gaps — scan types with high priority that haven't been done
     gaps = [s["scan_type"] for s in plan if not s["already_performed"] and s["priority"] >= 70]
@@ -257,8 +429,8 @@ def build_scan_plan(
 
 async def smart_scan(
     url: str,
-    previously_run: Optional[List[str]] = None,
-) -> Dict[str, Any]:
+    previously_run: list[str] | None = None,
+) -> dict[str, Any]:
     """
     Full smart scan: fingerprint the target then generate a prioritised scan plan.
 

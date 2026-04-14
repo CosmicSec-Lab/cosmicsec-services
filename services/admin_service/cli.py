@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Optional
 
 import typer  # type: ignore[import-not-found]
 from rich.console import Console
@@ -131,7 +130,11 @@ def audit_view(limit: int = 20) -> None:
 @audit_app.command("search")
 def audit_search(term: str) -> None:
     state = load_state()
-    matched = [entry for entry in state.audit_logs if term in entry.get("action", "") or term in entry.get("detail", "")]
+    matched = [
+        entry
+        for entry in state.audit_logs
+        if term in entry.get("action", "") or term in entry.get("detail", "")
+    ]
     console.print_json(json.dumps(matched))
 
 
@@ -202,21 +205,29 @@ def interactive_shell() -> None:
 @app.command("audit-export")
 def siem_audit_export(
     fmt: str = typer.Option("json", "--format", "-f", help="Output format: json, csv, cef"),
-    output: Optional[str] = typer.Option(None, "--output", "-o", help="Output file path (default: stdout)"),
-    since: Optional[str] = typer.Option(None, "--since", help="Filter by date (ISO format, e.g. 2024-01-01)"),
+    output: str | None = typer.Option(
+        None, "--output", "-o", help="Output file path (default: stdout)"
+    ),
+    since: str | None = typer.Option(
+        None, "--since", help="Filter by date (ISO format, e.g. 2024-01-01)"
+    ),
     limit: int = typer.Option(1000, "--limit", "-n", help="Maximum number of records"),
 ) -> None:
     """Export audit logs in JSON, CSV, or CEF format."""
-    import sys
     # Import the siem_connector export functions
     try:
-        from services.integration_service.siem_connector import export_as_json, export_as_csv, export_as_cef
+        from services.integration_service.siem_connector import (
+            export_as_cef,
+            export_as_csv,
+            export_as_json,
+        )
     except ImportError:
         typer.echo("Error: siem_connector not available", err=True)
         raise typer.Exit(1)
 
     # Build sample/mock events for now (in production, query from DB)
     from datetime import datetime, timezone
+
     sample_events = [
         {
             "id": i,

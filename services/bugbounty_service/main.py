@@ -1,9 +1,10 @@
 """Phase 5 Bug Bounty service — PostgreSQL-backed via SQLAlchemy."""
+
 from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -15,7 +16,7 @@ from services.common.models import BugBountyProgramModel, BugBountySubmissionMod
 app = FastAPI(title="CosmicSec Bug Bounty Service", version="1.0.0")
 
 platforms = ["hackerone", "bugcrowd", "intigriti", "yeswehack", "synack"]
-report_templates: List[Dict[str, Any]] = [
+report_templates: list[dict[str, Any]] = [
     {"template_id": "tmpl-web-xss", "name": "Web XSS Report", "category": "web"},
     {"template_id": "tmpl-api-authz", "name": "API Authorization Report", "category": "api"},
 ]
@@ -24,7 +25,7 @@ report_templates: List[Dict[str, Any]] = [
 class ProgramCreate(BaseModel):
     platform: str
     program_name: str
-    scope: List[str] = Field(default_factory=list)
+    scope: list[str] = Field(default_factory=list)
     reward_model: str = "bounty"
 
 
@@ -34,7 +35,7 @@ class ReconRequest(BaseModel):
 
 
 class PrioritizationRequest(BaseModel):
-    findings: List[dict] = Field(default_factory=list)
+    findings: list[dict] = Field(default_factory=list)
 
 
 class SubmissionCreate(BaseModel):
@@ -42,23 +43,27 @@ class SubmissionCreate(BaseModel):
     title: str
     description: str
     severity: str = "medium"
-    poc: Optional[str] = None
+    poc: str | None = None
 
 
 class CollaborationShare(BaseModel):
     program_id: str
     title: str
     message: str
-    participants: List[str] = Field(default_factory=list)
+    participants: list[str] = Field(default_factory=list)
 
 
 # In-memory collaboration threads (non-critical, ephemeral)
-_collaboration_threads: List[Dict[str, Any]] = []
+_collaboration_threads: list[dict[str, Any]] = []
 
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "healthy", "service": "bugbounty", "timestamp": datetime.now(timezone.utc).isoformat()}
+    return {
+        "status": "healthy",
+        "service": "bugbounty",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 @app.get("/platforms")
@@ -85,7 +90,7 @@ def create_program(payload: ProgramCreate, db: Session = Depends(get_db)) -> dic
 
 
 @app.get("/programs")
-def list_programs(platform: Optional[str] = None, db: Session = Depends(get_db)) -> dict:
+def list_programs(platform: str | None = None, db: Session = Depends(get_db)) -> dict:
     query = db.query(BugBountyProgramModel)
     if platform:
         query = query.filter(BugBountyProgramModel.platform == platform.lower())
@@ -95,7 +100,11 @@ def list_programs(platform: Optional[str] = None, db: Session = Depends(get_db))
 
 @app.post("/recon/auto")
 def automated_recon(payload: ReconRequest, db: Session = Depends(get_db)) -> dict:
-    program = db.query(BugBountyProgramModel).filter(BugBountyProgramModel.id == payload.program_id).first()
+    program = (
+        db.query(BugBountyProgramModel)
+        .filter(BugBountyProgramModel.id == payload.program_id)
+        .first()
+    )
     if not program:
         raise HTTPException(status_code=404, detail="Program not found")
     assets = [payload.target, f"api.{payload.target}", f"admin.{payload.target}"]
@@ -124,7 +133,11 @@ def build_poc_template(finding: dict) -> dict:
 
 @app.post("/submissions", status_code=201)
 def create_submission(payload: SubmissionCreate, db: Session = Depends(get_db)) -> dict:
-    program = db.query(BugBountyProgramModel).filter(BugBountyProgramModel.id == payload.program_id).first()
+    program = (
+        db.query(BugBountyProgramModel)
+        .filter(BugBountyProgramModel.id == payload.program_id)
+        .first()
+    )
     if not program:
         raise HTTPException(status_code=404, detail="Program not found")
     submission_id = f"sub-{uuid.uuid4().hex[:10]}"
@@ -145,7 +158,11 @@ def create_submission(payload: SubmissionCreate, db: Session = Depends(get_db)) 
 
 @app.post("/submissions/{submission_id}/submit")
 def submit_submission(submission_id: str, db: Session = Depends(get_db)) -> dict:
-    entry = db.query(BugBountySubmissionModel).filter(BugBountySubmissionModel.id == submission_id).first()
+    entry = (
+        db.query(BugBountySubmissionModel)
+        .filter(BugBountySubmissionModel.id == submission_id)
+        .first()
+    )
     if not entry:
         raise HTTPException(status_code=404, detail="Submission not found")
     entry.status = "submitted"
@@ -168,26 +185,30 @@ def earnings_dashboard(db: Session = Depends(get_db)) -> dict:
 
 
 @app.get("/timeline")
-def timeline(program_id: Optional[str] = None, db: Session = Depends(get_db)) -> dict:
+def timeline(program_id: str | None = None, db: Session = Depends(get_db)) -> dict:
     events = []
     programs_q = db.query(BugBountyProgramModel)
     if program_id:
         programs_q = programs_q.filter(BugBountyProgramModel.id == program_id)
     for program in programs_q.all():
-        events.append({
-            "event": "program_created",
-            "program_id": program.id,
-            "at": program.created_at.isoformat() if program.created_at else None,
-        })
+        events.append(
+            {
+                "event": "program_created",
+                "program_id": program.id,
+                "at": program.created_at.isoformat() if program.created_at else None,
+            }
+        )
     subs_q = db.query(BugBountySubmissionModel)
     if program_id:
         subs_q = subs_q.filter(BugBountySubmissionModel.program_id == program_id)
     for sub in subs_q.all():
-        events.append({
-            "event": "submission_status",
-            "submission_id": sub.id,
-            "status": sub.status,
-        })
+        events.append(
+            {
+                "event": "submission_status",
+                "submission_id": sub.id,
+                "status": sub.status,
+            }
+        )
     return {"events": events, "total": len(events)}
 
 
@@ -206,7 +227,7 @@ def collaboration_share(payload: CollaborationShare) -> dict:
 
 
 @app.get("/collaboration/threads")
-def collaboration_threads_list(program_id: Optional[str] = None) -> dict:
+def collaboration_threads_list(program_id: str | None = None) -> dict:
     items = _collaboration_threads
     if program_id:
         items = [t for t in items if t["program_id"] == program_id]
@@ -221,6 +242,7 @@ def list_report_templates() -> dict:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _program_to_dict(p: BugBountyProgramModel) -> dict:
     return {

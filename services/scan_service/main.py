@@ -2,18 +2,27 @@
 CosmicSec Scan Service
 Handles security scanning operations with distributed task processing
 """
-from fastapi import FastAPI, BackgroundTasks, HTTPException, status, WebSocket, WebSocketDisconnect, Request
-from pydantic import BaseModel, HttpUrl, Field
-from typing import List, Optional, Dict
-from enum import Enum
-from datetime import datetime
-import secrets
+
 import logging
 import os
+import secrets
 from contextlib import asynccontextmanager
-from typing import Any
+from datetime import datetime
+from enum import Enum
+from typing import Any, Optional
 
 import httpx
+from fastapi import (
+    BackgroundTasks,
+    FastAPI,
+    HTTPException,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
+from pydantic import BaseModel, Field
+
 from services.common.observability import setup_observability
 
 try:
@@ -27,12 +36,11 @@ except Exception:  # pragma: no cover
     MongoClient = None
 
 # Phase 2 modules
-from .continuous_monitor import ContinuousMonitor
 from .api_fuzzer import APIFuzzer
 from .container_scanner import scan_container_artifact
-from .smart_scanner import smart_scan
+from .continuous_monitor import ContinuousMonitor
 from .distributed_scanner import DistributedScanCoordinator
-
+from .smart_scanner import smart_scan
 
 # Module-level monitor singleton — started on app startup
 _monitor = ContinuousMonitor()
@@ -78,16 +86,16 @@ class ScanStatus(str, Enum):
 # Data models
 class ScanConfig(BaseModel):
     target: str = Field(..., description="Target URL, IP, or domain")
-    scan_types: List[ScanType] = Field(..., description="Types of scans to perform")
+    scan_types: list[ScanType] = Field(..., description="Types of scans to perform")
     depth: int = Field(default=1, ge=1, le=5, description="Scan depth (1-5)")
     timeout: int = Field(default=300, ge=60, le=3600, description="Timeout in seconds")
-    options: Optional[Dict] = Field(default={}, description="Additional scan options")
+    options: Optional[dict] = Field(default={}, description="Additional scan options")
 
 
 class Scan(BaseModel):
     id: str
     target: str
-    scan_types: List[ScanType]
+    scan_types: list[ScanType]
     status: ScanStatus
     created_at: datetime
     org_id: Optional[str] = None
@@ -96,7 +104,7 @@ class Scan(BaseModel):
     completed_at: Optional[datetime] = None
     progress: int = 0
     findings_count: int = 0
-    severity_breakdown: Dict[str, int] = {}
+    severity_breakdown: dict[str, int] = {}
 
 
 class Finding(BaseModel):
@@ -116,10 +124,10 @@ scans_db = {}
 findings_db = []
 
 # Optional in-service quota override (used when auth service is not reachable)
-tenant_quotas: Dict[str, Dict[str, int]] = {}
+tenant_quotas: dict[str, dict[str, int]] = {}
 
 
-async def _fetch_org_quotas(org_id: str) -> Dict[str, int]:
+async def _fetch_org_quotas(org_id: str) -> dict[str, int]:
     """Fetch tenant quota settings from the auth service (fallback to in-memory)."""
     if org_id in tenant_quotas:
         return tenant_quotas[org_id]
@@ -144,6 +152,7 @@ def _scans_today_for_org(org_id: str) -> int:
         and scan["created_at"].date() == today
     )
 
+
 celery_app = None
 if Celery is not None:
     broker_url = os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0")
@@ -153,7 +162,9 @@ if Celery is not None:
 mongo_collection = None
 if MongoClient is not None:
     try:
-        mongo_client = MongoClient(os.getenv("MONGO_URI", "mongodb://mongodb:27017"), serverSelectionTimeoutMS=2000)
+        mongo_client = MongoClient(
+            os.getenv("MONGO_URI", "mongodb://mongodb:27017"), serverSelectionTimeoutMS=2000
+        )
         mongo_collection = mongo_client["cosmicsec"]["scan_results"]
     except Exception:
         mongo_collection = None
@@ -164,14 +175,16 @@ AUTH_SERVICE_URL = os.getenv("AUTH_SERVICE_URL", "http://auth-service:8001")
 
 class ConnectionManager:
     def __init__(self) -> None:
-        self.active_connections: Dict[str, List[WebSocket]] = {}
+        self.active_connections: dict[str, list[WebSocket]] = {}
 
     async def connect(self, scan_id: str, websocket: WebSocket) -> None:
         await websocket.accept()
         self.active_connections.setdefault(scan_id, []).append(websocket)
 
     def disconnect(self, scan_id: str, websocket: WebSocket) -> None:
-        self.active_connections[scan_id] = [ws for ws in self.active_connections.get(scan_id, []) if ws != websocket]
+        self.active_connections[scan_id] = [
+            ws for ws in self.active_connections.get(scan_id, []) if ws != websocket
+        ]
 
     async def broadcast(self, scan_id: str, message: dict) -> None:
         for ws in self.active_connections.get(scan_id, []):
@@ -189,7 +202,9 @@ async def perform_scan(scan_id: str, config: ScanConfig):
         # Update status
         scan["status"] = ScanStatus.RUNNING
         scan["started_at"] = datetime.utcnow()
-        await ws_manager.broadcast(scan_id, {"scan_id": scan_id, "status": "running", "progress": 0})
+        await ws_manager.broadcast(
+            scan_id, {"scan_id": scan_id, "status": "running", "progress": 0}
+        )
 
         # Simulate scanning process
         logger.info(f"Starting scan {scan_id} for target {config.target}")
@@ -197,49 +212,61 @@ async def perform_scan(scan_id: str, config: ScanConfig):
         # Network scan simulation
         if ScanType.NETWORK in config.scan_types:
             scan["progress"] = 25
-            await ws_manager.broadcast(scan_id, {"scan_id": scan_id, "status": "running", "progress": 25})
+            await ws_manager.broadcast(
+                scan_id, {"scan_id": scan_id, "status": "running", "progress": 25}
+            )
             logger.info(f"Scan {scan_id}: Network scan in progress...")
             # Add simulated findings
-            findings_db.append({
-                "id": secrets.token_urlsafe(16),
-                "scan_id": scan_id,
-                "title": "Open Port Detected",
-                "description": "Port 22 (SSH) is open and accessible",
-                "severity": "medium",
-                "cvss_score": 5.3,
-                "category": "network",
-                "recommendation": "Implement IP whitelisting for SSH access",
-                "detected_at": datetime.utcnow()
-            })
+            findings_db.append(
+                {
+                    "id": secrets.token_urlsafe(16),
+                    "scan_id": scan_id,
+                    "title": "Open Port Detected",
+                    "description": "Port 22 (SSH) is open and accessible",
+                    "severity": "medium",
+                    "cvss_score": 5.3,
+                    "category": "network",
+                    "recommendation": "Implement IP whitelisting for SSH access",
+                    "detected_at": datetime.utcnow(),
+                }
+            )
 
         # Web scan simulation
         if ScanType.WEB in config.scan_types:
             scan["progress"] = 50
-            await ws_manager.broadcast(scan_id, {"scan_id": scan_id, "status": "running", "progress": 50})
+            await ws_manager.broadcast(
+                scan_id, {"scan_id": scan_id, "status": "running", "progress": 50}
+            )
             logger.info(f"Scan {scan_id}: Web scan in progress...")
-            findings_db.append({
-                "id": secrets.token_urlsafe(16),
-                "scan_id": scan_id,
-                "title": "Missing Security Headers",
-                "description": "X-Frame-Options and CSP headers are missing",
-                "severity": "low",
-                "cvss_score": 3.7,
-                "category": "web",
-                "recommendation": "Implement security headers in web server configuration",
-                "detected_at": datetime.utcnow()
-            })
+            findings_db.append(
+                {
+                    "id": secrets.token_urlsafe(16),
+                    "scan_id": scan_id,
+                    "title": "Missing Security Headers",
+                    "description": "X-Frame-Options and CSP headers are missing",
+                    "severity": "low",
+                    "cvss_score": 3.7,
+                    "category": "web",
+                    "recommendation": "Implement security headers in web server configuration",
+                    "detected_at": datetime.utcnow(),
+                }
+            )
 
         # API scan simulation
         if ScanType.API in config.scan_types:
             scan["progress"] = 75
-            await ws_manager.broadcast(scan_id, {"scan_id": scan_id, "status": "running", "progress": 75})
+            await ws_manager.broadcast(
+                scan_id, {"scan_id": scan_id, "status": "running", "progress": 75}
+            )
             logger.info(f"Scan {scan_id}: API scan in progress...")
 
         # Complete scan
         scan["progress"] = 100
         scan["status"] = ScanStatus.COMPLETED
         scan["completed_at"] = datetime.utcnow()
-        await ws_manager.broadcast(scan_id, {"scan_id": scan_id, "status": "completed", "progress": 100})
+        await ws_manager.broadcast(
+            scan_id, {"scan_id": scan_id, "status": "completed", "progress": 100}
+        )
 
         # Count findings
         scan_findings = [f for f in findings_db if f["scan_id"] == scan_id]
@@ -274,17 +301,15 @@ async def perform_scan(scan_id: str, config: ScanConfig):
         logger.error(f"Scan {scan_id} failed: {str(e)}")
         scan["status"] = ScanStatus.FAILED
         scan["completed_at"] = datetime.utcnow()
-        await ws_manager.broadcast(scan_id, {"scan_id": scan_id, "status": "failed", "progress": scan.get("progress", 0)})
+        await ws_manager.broadcast(
+            scan_id, {"scan_id": scan_id, "status": "failed", "progress": scan.get("progress", 0)}
+        )
 
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "service": "scan",
-        "timestamp": datetime.utcnow().isoformat()
-    }
+    return {"status": "healthy", "service": "scan", "timestamp": datetime.utcnow().isoformat()}
 
 
 @app.post("/scans", response_model=Scan)
@@ -350,20 +375,13 @@ async def enqueue_scan(scan_id: str):
 async def get_scan(scan_id: str):
     """Get scan details by ID"""
     if scan_id not in scans_db:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Scan not found"
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scan not found")
 
     return Scan(**scans_db[scan_id])
 
 
-@app.get("/scans", response_model=List[Scan])
-async def list_scans(
-    status_filter: Optional[ScanStatus] = None,
-    limit: int = 10,
-    offset: int = 0
-):
+@app.get("/scans", response_model=list[Scan])
+async def list_scans(status_filter: Optional[ScanStatus] = None, limit: int = 10, offset: int = 0):
     """List all scans with optional filtering"""
     scans = list(scans_db.values())
 
@@ -374,19 +392,16 @@ async def list_scans(
     scans.sort(key=lambda x: x["created_at"], reverse=True)
 
     # Pagination
-    scans = scans[offset:offset + limit]
+    scans = scans[offset : offset + limit]
 
     return [Scan(**scan) for scan in scans]
 
 
-@app.get("/scans/{scan_id}/findings", response_model=List[Finding])
+@app.get("/scans/{scan_id}/findings", response_model=list[Finding])
 async def get_scan_findings(scan_id: str):
     """Get all findings for a specific scan"""
     if scan_id not in scans_db:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Scan not found"
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scan not found")
 
     scan_findings = [f for f in findings_db if f["scan_id"] == scan_id]
 
@@ -397,10 +412,7 @@ async def get_scan_findings(scan_id: str):
 async def delete_scan(scan_id: str):
     """Delete a scan and its findings"""
     if scan_id not in scans_db:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Scan not found"
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scan not found")
 
     # Delete scan
     del scans_db[scan_id]
@@ -433,7 +445,7 @@ async def get_stats():
         "running_scans": running_scans,
         "total_findings": total_findings,
         "severity_breakdown": severity_breakdown,
-        "timestamp": datetime.utcnow().isoformat()
+        "timestamp": datetime.utcnow().isoformat(),
     }
 
 
@@ -476,47 +488,64 @@ async def scan_websocket(websocket: WebSocket, scan_id: str):
 # Active Phase 2 endpoints (top-level)
 # ===========================================================================
 
+
 class ScheduleMonitorRequest(BaseModel):
     target: str = Field(..., description="Target URL, IP, or domain to monitor")
-    scan_types: List[ScanType] = Field(default=[ScanType.WEB], description="Scan types to run on each cycle")
-    interval_seconds: int = Field(default=3600, ge=60, description="Seconds between scan runs (min 60)")
+    scan_types: list[ScanType] = Field(
+        default=[ScanType.WEB], description="Scan types to run on each cycle"
+    )
+    interval_seconds: int = Field(
+        default=3600, ge=60, description="Seconds between scan runs (min 60)"
+    )
     created_by: str = Field(default="api", description="Requesting user identifier")
-    alert_on_new_critical: bool = Field(default=True, description="Emit alert when new critical findings appear")
+    alert_on_new_critical: bool = Field(
+        default=True, description="Emit alert when new critical findings appear"
+    )
 
 
 class FuzzRequest(BaseModel):
     base_url: str = Field(..., description="API base URL to fuzz")
-    openapi_spec: Optional[Dict[str, Any]] = Field(default=None, description="Optional OpenAPI 3.x spec dict")
-    attack_types: Optional[List[str]] = Field(
+    openapi_spec: Optional[dict[str, Any]] = Field(
+        default=None, description="Optional OpenAPI 3.x spec dict"
+    )
+    attack_types: Optional[list[str]] = Field(
         default=None,
         description="Attack categories: sqli, xss, path_traversal, cmd_injection, ssrf, ssti, auth_bypass",
     )
-    max_requests: int = Field(default=150, ge=10, le=500, description="Maximum HTTP requests to send")
+    max_requests: int = Field(
+        default=150, ge=10, le=500, description="Maximum HTTP requests to send"
+    )
     timeout: int = Field(default=8, ge=2, le=30, description="Per-request timeout seconds")
 
 
 class ContainerScanRequest(BaseModel):
     artifact_type: str = Field(..., description="Type of artifact: 'dockerfile' or 'kubernetes'")
-    content: str = Field(..., description="Raw text content of the Dockerfile or Kubernetes YAML manifest")
+    content: str = Field(
+        ..., description="Raw text content of the Dockerfile or Kubernetes YAML manifest"
+    )
 
 
 class SmartScanRequest(BaseModel):
     url: str = Field(..., description="Target URL to fingerprint and plan")
-    previously_run: Optional[List[str]] = Field(default=None, description="Scan types already executed")
+    previously_run: Optional[list[str]] = Field(
+        default=None, description="Scan types already executed"
+    )
 
 
 class CloudScanRequest(BaseModel):
     provider: str = Field(..., description="Cloud provider: aws | azure | gcp | k8s")
     region: Optional[str] = Field(default=None, description="Target region / cluster")
-    resource_types: Optional[List[str]] = Field(default=None, description="Resource types to scan")
-    credentials_hint: Optional[str] = Field(default=None, description="Credential profile name (no secrets)")
+    resource_types: Optional[list[str]] = Field(default=None, description="Resource types to scan")
+    credentials_hint: Optional[str] = Field(
+        default=None, description="Credential profile name (no secrets)"
+    )
 
 
 class RegisterNodeRequest(BaseModel):
     node_id: str
     region: str
     capacity: int = Field(default=4, ge=1, le=128)
-    tags: List[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
 
 
 class NodeHeartbeatRequest(BaseModel):
@@ -528,23 +557,59 @@ class DistributedAssignRequest(BaseModel):
     target: str
     replicas: int = Field(default=1, ge=1, le=10)
     region_hint: Optional[str] = None
-    required_tags: List[str] = Field(default_factory=list)
+    required_tags: list[str] = Field(default_factory=list)
 
 
-_CLOUD_FINDINGS: Dict[str, List[Dict[str, Any]]] = {
+_CLOUD_FINDINGS: dict[str, list[dict[str, Any]]] = {
     "aws": [
-        {"title": "S3 bucket with public ACL", "severity": "critical", "category": "cloud", "description": "One or more S3 buckets allow unauthenticated public access.", "recommendation": "Enable S3 Block Public Access at account level."},
-        {"title": "IAM wildcard policy attached", "severity": "high", "category": "cloud", "description": "IAM policy contains Action:* or Resource:* granting over-privilege.", "recommendation": "Replace wildcards with least-privilege policy statements."},
+        {
+            "title": "S3 bucket with public ACL",
+            "severity": "critical",
+            "category": "cloud",
+            "description": "One or more S3 buckets allow unauthenticated public access.",
+            "recommendation": "Enable S3 Block Public Access at account level.",
+        },
+        {
+            "title": "IAM wildcard policy attached",
+            "severity": "high",
+            "category": "cloud",
+            "description": "IAM policy contains Action:* or Resource:* granting over-privilege.",
+            "recommendation": "Replace wildcards with least-privilege policy statements.",
+        },
     ],
     "azure": [
-        {"title": "Azure AD legacy authentication enabled", "severity": "high", "category": "cloud", "description": "Legacy authentication protocols can bypass MFA policies.", "recommendation": "Block legacy auth via Conditional Access."},
-        {"title": "Storage account allows HTTP traffic", "severity": "medium", "category": "cloud", "description": "Storage account accepts unencrypted HTTP connections.", "recommendation": "Enforce HTTPS-only in storage account settings."},
+        {
+            "title": "Azure AD legacy authentication enabled",
+            "severity": "high",
+            "category": "cloud",
+            "description": "Legacy authentication protocols can bypass MFA policies.",
+            "recommendation": "Block legacy auth via Conditional Access.",
+        },
+        {
+            "title": "Storage account allows HTTP traffic",
+            "severity": "medium",
+            "category": "cloud",
+            "description": "Storage account accepts unencrypted HTTP connections.",
+            "recommendation": "Enforce HTTPS-only in storage account settings.",
+        },
     ],
     "gcp": [
-        {"title": "GCS bucket with allUsers permission", "severity": "critical", "category": "cloud", "description": "GCS bucket grants allUsers public access.", "recommendation": "Remove allUsers bindings and enable uniform bucket-level access."},
+        {
+            "title": "GCS bucket with allUsers permission",
+            "severity": "critical",
+            "category": "cloud",
+            "description": "GCS bucket grants allUsers public access.",
+            "recommendation": "Remove allUsers bindings and enable uniform bucket-level access.",
+        },
     ],
     "k8s": [
-        {"title": "Kubernetes API server publicly accessible", "severity": "critical", "category": "cloud", "description": "K8s API endpoint is reachable from internet.", "recommendation": "Restrict API access to private networks and trusted IPs."},
+        {
+            "title": "Kubernetes API server publicly accessible",
+            "severity": "critical",
+            "category": "cloud",
+            "description": "K8s API endpoint is reachable from internet.",
+            "recommendation": "Restrict API access to private networks and trusted IPs.",
+        },
     ],
 }
 
@@ -626,7 +691,7 @@ async def cloud_scan(payload: CloudScanRequest) -> dict:
         item["detected_at"] = datetime.utcnow().isoformat()
         stamped.append(item)
 
-    severity_breakdown: Dict[str, int] = {}
+    severity_breakdown: dict[str, int] = {}
     for f in stamped:
         s = f.get("severity", "info")
         severity_breakdown[s] = severity_breakdown.get(s, 0) + 1

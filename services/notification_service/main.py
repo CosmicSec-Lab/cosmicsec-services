@@ -3,6 +3,7 @@ CosmicSec Notification Service — Phase E event notifications.
 
 Supports email (SMTP), Slack webhooks, and generic webhooks.
 """
+
 from __future__ import annotations
 
 import smtplib
@@ -38,6 +39,7 @@ _metrics: dict[str, int] = {
 # Pydantic models
 # ---------------------------------------------------------------------------
 
+
 class NotificationConfig(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     channel: str  # "email" | "slack" | "webhook"
@@ -60,6 +62,7 @@ class TestNotificationRequest(BaseModel):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _send_email(cfg: dict, subject: str, body: str) -> None:
     msg = MIMEText(body)
@@ -97,7 +100,9 @@ def _dispatch(config: dict, event: NotificationEvent) -> None:
         elif channel == "slack":
             _send_slack(config["config"], f"{subject}\n{body}")
         elif channel == "webhook":
-            _send_webhook(config["config"], {"event_type": event.event_type, "payload": event.payload})
+            _send_webhook(
+                config["config"], {"event_type": event.event_type, "payload": event.payload}
+            )
         _metrics["notifications_sent_total"] += 1
     except Exception:
         _metrics["notification_errors_total"] += 1
@@ -107,6 +112,7 @@ def _dispatch(config: dict, event: NotificationEvent) -> None:
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+
 
 @app.get("/health")
 def health() -> dict:
@@ -162,9 +168,7 @@ def send_notification(event: NotificationEvent) -> dict:
     sent: list[str] = []
 
     target_configs = (
-        [c for c in _configs if c["channel"] in event.channels]
-        if event.channels
-        else _configs
+        [c for c in _configs if c["channel"] in event.channels] if event.channels else _configs
     )
 
     for config in target_configs:
@@ -197,4 +201,8 @@ def test_notification(req: TestNotificationRequest) -> dict:
         _dispatch(config, event)
         return {"success": True, "config_id": req.config_id, "message": req.message}
     except Exception:
-        return {"success": False, "config_id": req.config_id, "error": "Notification delivery failed"}
+        return {
+            "success": False,
+            "config_id": req.config_id,
+            "error": "Notification delivery failed",
+        }

@@ -4,13 +4,16 @@ Phase 2 — Continuous Monitoring Engine.
 Schedules recurring security scans at configurable intervals.
 Uses APScheduler when available; falls back to asyncio-based naive scheduler.
 """
+
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import secrets
+from collections.abc import Coroutine
 from datetime import datetime, timedelta
-from typing import Any, Callable, Coroutine, Dict, List, Optional
+from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +21,7 @@ _APSCHEDULER_AVAILABLE = False
 try:
     from apscheduler.schedulers.asyncio import AsyncIOScheduler  # type: ignore[import-not-found]
     from apscheduler.triggers.interval import IntervalTrigger  # type: ignore[import-not-found]
+
     _APSCHEDULER_AVAILABLE = True
 except Exception:
     pass
@@ -27,6 +31,7 @@ except Exception:
 # Data model
 # ---------------------------------------------------------------------------
 
+
 class MonitorJob:
     """Represents a single continuous monitoring job."""
 
@@ -34,7 +39,7 @@ class MonitorJob:
         self,
         job_id: str,
         target: str,
-        scan_types: List[str],
+        scan_types: list[str],
         interval_seconds: int,
         created_by: str = "system",
         alert_on_new_critical: bool = True,
@@ -46,14 +51,14 @@ class MonitorJob:
         self.created_by = created_by
         self.alert_on_new_critical = alert_on_new_critical
         self.created_at = datetime.utcnow().isoformat()
-        self.last_run: Optional[str] = None
-        self.next_run: Optional[str] = None
+        self.last_run: str | None = None
+        self.next_run: str | None = None
         self.run_count = 0
         self.status = "active"
         self.last_findings_count = 0
-        self.alerts: List[Dict[str, Any]] = []
+        self.alerts: list[dict[str, Any]] = []
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "job_id": self.job_id,
             "target": self.target,
@@ -75,6 +80,7 @@ class MonitorJob:
 # Monitor engine
 # ---------------------------------------------------------------------------
 
+
 class ContinuousMonitor:
     """
     Continuous monitoring engine that schedules and tracks recurring scans.
@@ -92,11 +98,11 @@ class ContinuousMonitor:
         await monitor.stop()
     """
 
-    def __init__(self, scan_callback: Optional[Callable[..., Coroutine[Any, Any, Any]]] = None):
-        self._jobs: Dict[str, MonitorJob] = {}
+    def __init__(self, scan_callback: Callable[..., Coroutine[Any, Any, Any]] | None = None):
+        self._jobs: dict[str, MonitorJob] = {}
         self._callback = scan_callback
-        self._scheduler: Optional[Any] = None
-        self._asyncio_tasks: Dict[str, asyncio.Task] = {}
+        self._scheduler: Any | None = None
+        self._asyncio_tasks: dict[str, asyncio.Task] = {}
         self._running = False
 
     async def start(self) -> None:
@@ -122,7 +128,7 @@ class ContinuousMonitor:
     async def schedule(
         self,
         target: str,
-        scan_types: List[str],
+        scan_types: list[str],
         interval_seconds: int,
         created_by: str = "system",
         alert_on_new_critical: bool = True,
@@ -167,7 +173,9 @@ class ContinuousMonitor:
 
         logger.info(
             "Scheduled monitoring job %s for %s every %ds",
-            job_id, target, job.interval_seconds,
+            job_id,
+            target,
+            job.interval_seconds,
         )
         return job_id
 
@@ -193,15 +201,15 @@ class ContinuousMonitor:
         job.next_run = (now + timedelta(seconds=job.interval_seconds)).isoformat()
         logger.info(
             "Running monitoring job %s for %s (run #%d)",
-            job_id, job.target, job.run_count,
+            job_id,
+            job.target,
+            job.run_count,
         )
 
         if self._callback is not None:
             try:
                 result = await self._callback(job.target, job.scan_types)
-                findings_count = (
-                    result.get("findings_count", 0) if isinstance(result, dict) else 0
-                )
+                findings_count = result.get("findings_count", 0) if isinstance(result, dict) else 0
                 job.last_findings_count = findings_count
                 # Generate alert if threshold crossed and new criticals detected
                 if job.alert_on_new_critical and isinstance(result, dict):
@@ -231,10 +239,8 @@ class ContinuousMonitor:
             return False
         job.status = "paused"
         if _APSCHEDULER_AVAILABLE and self._scheduler is not None:
-            try:
+            with contextlib.suppress(Exception):
                 self._scheduler.pause_job(job_id)
-            except Exception:
-                pass
         return True
 
     def resume(self, job_id: str) -> bool:
@@ -244,10 +250,8 @@ class ContinuousMonitor:
             return False
         job.status = "active"
         if _APSCHEDULER_AVAILABLE and self._scheduler is not None:
-            try:
+            with contextlib.suppress(Exception):
                 self._scheduler.resume_job(job_id)
-            except Exception:
-                pass
         return True
 
     def cancel(self, job_id: str) -> bool:
@@ -257,20 +261,18 @@ class ContinuousMonitor:
             return False
         job.status = "cancelled"
         if _APSCHEDULER_AVAILABLE and self._scheduler is not None:
-            try:
+            with contextlib.suppress(Exception):
                 self._scheduler.remove_job(job_id)
-            except Exception:
-                pass
         if job_id in self._asyncio_tasks:
             self._asyncio_tasks[job_id].cancel()
             del self._asyncio_tasks[job_id]
         return True
 
-    def list_jobs(self) -> List[Dict[str, Any]]:
+    def list_jobs(self) -> list[dict[str, Any]]:
         """Return all monitoring jobs as dicts."""
         return [j.to_dict() for j in self._jobs.values()]
 
-    def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+    def get_job(self, job_id: str) -> dict[str, Any] | None:
         """Return a single job dict by ID, or None."""
         job = self._jobs.get(job_id)
         return job.to_dict() if job else None

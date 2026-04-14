@@ -7,11 +7,12 @@ Provides:
 - Shared scan-state broadcasts.
 - Async REST endpoints for history, presence, and activity feed.
 """
+
 from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -38,14 +39,15 @@ app.add_middleware(
 # In-memory state for WebSocket connections only (not persisted)
 # ---------------------------------------------------------------------------
 
+
 class _Room:
     """WebSocket room with presence and broadcast."""
 
     def __init__(self, room_id: str):
         self.room_id = room_id
         self.created_at = datetime.now(timezone.utc).isoformat()
-        self.connections: Dict[str, WebSocket] = {}
-        self.scan_state: Optional[Dict[str, Any]] = None
+        self.connections: dict[str, WebSocket] = {}
+        self.scan_state: dict[str, Any] | None = None
 
     def add_connection(self, username: str, ws: WebSocket) -> None:
         self.connections[username] = ws
@@ -54,11 +56,11 @@ class _Room:
         self.connections.pop(username, None)
 
     @property
-    def present_users(self) -> List[str]:
+    def present_users(self) -> list[str]:
         return list(self.connections.keys())
 
-    async def broadcast(self, event: Dict[str, Any], exclude: Optional[str] = None) -> None:
-        dead: List[str] = []
+    async def broadcast(self, event: dict[str, Any], exclude: str | None = None) -> None:
+        dead: list[str] = []
         for user, ws in self.connections.items():
             if user == exclude:
                 continue
@@ -70,7 +72,7 @@ class _Room:
             self.connections.pop(u, None)
 
 
-_rooms: Dict[str, _Room] = {}
+_rooms: dict[str, _Room] = {}
 
 
 def _get_or_create_room(room_id: str) -> _Room:
@@ -83,10 +85,11 @@ def _get_or_create_room(room_id: str) -> _Room:
 # Pydantic models
 # ---------------------------------------------------------------------------
 
+
 class SendMessageRequest(BaseModel):
     username: str = Field(..., description="Sender username")
     text: str = Field(..., description="Message text (supports @mention)")
-    thread_id: Optional[str] = Field(default=None, description="Thread ID for replies")
+    thread_id: str | None = Field(default=None, description="Thread ID for replies")
 
 
 class ScanStateUpdate(BaseModel):
@@ -97,7 +100,7 @@ class ScanStateUpdate(BaseModel):
 
 
 class ReportSection(BaseModel):
-    section_id: Optional[str] = Field(default=None)
+    section_id: str | None = Field(default=None)
     title: str = Field(..., description="Section heading")
     content: str = Field(..., description="Markdown content for this section")
     author: str = Field(..., description="Username of the author")
@@ -108,14 +111,15 @@ class ReportSection(BaseModel):
 
 
 class ReportSectionUpdate(BaseModel):
-    title: Optional[str] = Field(default=None)
-    content: Optional[str] = Field(default=None)
+    title: str | None = Field(default=None)
+    content: str | None = Field(default=None)
     editor: str = Field(..., description="Username making this edit")
 
 
 # ---------------------------------------------------------------------------
 # WebSocket endpoint
 # ---------------------------------------------------------------------------
+
 
 @app.websocket("/ws/{room_id}")
 async def room_websocket(websocket: WebSocket, room_id: str):
@@ -136,14 +140,16 @@ async def room_websocket(websocket: WebSocket, room_id: str):
     room = _get_or_create_room(room_id)
     room.add_connection(username, websocket)
 
-    await room.broadcast({
-        "type": "presence",
-        "room": room_id,
-        "username": username,
-        "event": "joined",
-        "present_users": room.present_users,
-        "ts": datetime.now(timezone.utc).isoformat(),
-    })
+    await room.broadcast(
+        {
+            "type": "presence",
+            "room": room_id,
+            "username": username,
+            "event": "joined",
+            "present_users": room.present_users,
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }
+    )
 
     try:
         while True:
@@ -153,7 +159,7 @@ async def room_websocket(websocket: WebSocket, room_id: str):
             if ev_type == "message":
                 text = str(data.get("text", ""))
                 mentions = [w[1:] for w in text.split() if w.startswith("@")]
-                msg: Dict[str, Any] = {
+                msg: dict[str, Any] = {
                     "type": "message",
                     "room": room_id,
                     "message_id": uuid.uuid4().hex,
@@ -172,31 +178,38 @@ async def room_websocket(websocket: WebSocket, room_id: str):
                     "findings_count": data.get("findings_count", 0),
                 }
                 room.scan_state = state
-                await room.broadcast({
-                    "type": "scan_update",
-                    "room": room_id,
-                    "state": state,
-                    "updated_by": username,
-                    "ts": datetime.now(timezone.utc).isoformat(),
-                })
+                await room.broadcast(
+                    {
+                        "type": "scan_update",
+                        "room": room_id,
+                        "state": state,
+                        "updated_by": username,
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
 
             elif ev_type == "ping":
-                await websocket.send_json({"type": "pong", "ts": datetime.now(timezone.utc).isoformat()})
+                await websocket.send_json(
+                    {"type": "pong", "ts": datetime.now(timezone.utc).isoformat()}
+                )
 
     except WebSocketDisconnect:
         room.remove_connection(username)
-        await room.broadcast({
-            "type": "user_left",
-            "room": room_id,
-            "username": username,
-            "present_users": room.present_users,
-            "ts": datetime.now(timezone.utc).isoformat(),
-        })
+        await room.broadcast(
+            {
+                "type": "user_left",
+                "room": room_id,
+                "username": username,
+                "present_users": room.present_users,
+                "ts": datetime.now(timezone.utc).isoformat(),
+            }
+        )
 
 
 # ---------------------------------------------------------------------------
 # REST endpoints
 # ---------------------------------------------------------------------------
+
 
 @app.get("/health")
 async def health_check() -> dict:
@@ -252,7 +265,9 @@ async def get_scan_state(room_id: str) -> dict:
 
 
 @app.post("/rooms/{room_id}/messages")
-async def post_message(room_id: str, payload: SendMessageRequest, db: Session = Depends(get_db)) -> dict:
+async def post_message(
+    room_id: str, payload: SendMessageRequest, db: Session = Depends(get_db)
+) -> dict:
     """POST a message into a room (for non-WebSocket clients). Persisted to DB."""
     mentions = [w[1:] for w in payload.text.split() if w.startswith("@")]
     message_id = uuid.uuid4().hex
@@ -266,7 +281,7 @@ async def post_message(room_id: str, payload: SendMessageRequest, db: Session = 
     )
     db.add(msg_row)
     db.commit()
-    msg: Dict[str, Any] = {
+    msg: dict[str, Any] = {
         "type": "message",
         "room": room_id,
         "message_id": message_id,
@@ -274,7 +289,9 @@ async def post_message(room_id: str, payload: SendMessageRequest, db: Session = 
         "text": payload.text,
         "mentions": mentions,
         "thread_id": payload.thread_id,
-        "ts": msg_row.created_at.isoformat() if msg_row.created_at else datetime.now(timezone.utc).isoformat(),
+        "ts": msg_row.created_at.isoformat()
+        if msg_row.created_at
+        else datetime.now(timezone.utc).isoformat(),
     }
     room = _get_or_create_room(room_id)
     await room.broadcast(msg)
@@ -290,13 +307,15 @@ async def update_scan_state(room_id: str, payload: ScanStateUpdate) -> dict:
         "findings_count": payload.findings_count,
     }
     room.scan_state = state
-    await room.broadcast({
-        "type": "scan_update",
-        "room": room_id,
-        "state": state,
-        "updated_by": payload.updated_by,
-        "ts": datetime.now(timezone.utc).isoformat(),
-    })
+    await room.broadcast(
+        {
+            "type": "scan_update",
+            "room": room_id,
+            "state": state,
+            "updated_by": payload.updated_by,
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }
+    )
     return {"room_id": room_id, "state": state}
 
 
@@ -319,8 +338,11 @@ async def activity_feed(limit: int = 20, db: Session = Depends(get_db)) -> dict:
 # Phase 2 — Collaborative Report Editing (persisted to DB)
 # ==========================================================================
 
+
 @app.post("/rooms/{room_id}/reports", status_code=201)
-async def create_report_section(room_id: str, payload: ReportSection, db: Session = Depends(get_db)) -> dict:
+async def create_report_section(
+    room_id: str, payload: ReportSection, db: Session = Depends(get_db)
+) -> dict:
     section_id = payload.section_id or uuid.uuid4().hex
     section_row = CollabReportSectionModel(
         id=section_id,
@@ -336,60 +358,86 @@ async def create_report_section(room_id: str, payload: ReportSection, db: Sessio
     db.commit()
     db.refresh(section_row)
 
-    now = section_row.created_at.isoformat() if section_row.created_at else datetime.now(timezone.utc).isoformat()
+    now = (
+        section_row.created_at.isoformat()
+        if section_row.created_at
+        else datetime.now(timezone.utc).isoformat()
+    )
     room = _get_or_create_room(room_id)
-    await room.broadcast({
-        "type": "report_update",
-        "action": "created",
-        "room": room_id,
-        "section_id": section_id,
-        "title": payload.title,
-        "author": payload.author,
-        "ts": now,
-    })
+    await room.broadcast(
+        {
+            "type": "report_update",
+            "action": "created",
+            "room": room_id,
+            "section_id": section_id,
+            "title": payload.title,
+            "author": payload.author,
+            "ts": now,
+        }
+    )
     return _section_to_dict(section_row)
 
 
 @app.get("/rooms/{room_id}/reports")
-async def list_report_sections(room_id: str, section_type: Optional[str] = None, db: Session = Depends(get_db)) -> dict:
+async def list_report_sections(
+    room_id: str, section_type: str | None = None, db: Session = Depends(get_db)
+) -> dict:
     query = db.query(CollabReportSectionModel).filter(CollabReportSectionModel.room_id == room_id)
     if section_type:
         query = query.filter(CollabReportSectionModel.section_type == section_type)
     sections = query.order_by(CollabReportSectionModel.created_at).all()
-    return {"room_id": room_id, "sections": [_section_to_dict(s) for s in sections], "total": len(sections)}
+    return {
+        "room_id": room_id,
+        "sections": [_section_to_dict(s) for s in sections],
+        "total": len(sections),
+    }
 
 
 @app.get("/rooms/{room_id}/reports/{section_id}")
 async def get_report_section(room_id: str, section_id: str, db: Session = Depends(get_db)) -> dict:
-    section = db.query(CollabReportSectionModel).filter(
-        CollabReportSectionModel.id == section_id,
-        CollabReportSectionModel.room_id == room_id,
-    ).first()
+    section = (
+        db.query(CollabReportSectionModel)
+        .filter(
+            CollabReportSectionModel.id == section_id,
+            CollabReportSectionModel.room_id == room_id,
+        )
+        .first()
+    )
     if section is None:
         from fastapi import HTTPException
+
         raise HTTPException(status_code=404, detail="Section not found")
     return _section_to_dict(section)
 
 
 @app.put("/rooms/{room_id}/reports/{section_id}")
-async def update_report_section(room_id: str, section_id: str, payload: ReportSectionUpdate, db: Session = Depends(get_db)) -> dict:
+async def update_report_section(
+    room_id: str, section_id: str, payload: ReportSectionUpdate, db: Session = Depends(get_db)
+) -> dict:
     from fastapi import HTTPException
-    section = db.query(CollabReportSectionModel).filter(
-        CollabReportSectionModel.id == section_id,
-        CollabReportSectionModel.room_id == room_id,
-    ).first()
+
+    section = (
+        db.query(CollabReportSectionModel)
+        .filter(
+            CollabReportSectionModel.id == section_id,
+            CollabReportSectionModel.room_id == room_id,
+        )
+        .first()
+    )
     if section is None:
         raise HTTPException(status_code=404, detail="Section not found")
 
     now = datetime.now(timezone.utc).isoformat()
     history = list(section.edit_history or [])
-    history.append({
-        "revision": section.revision,
-        "title": section.title,
-        "content": section.content,
-        "updated_at": section.updated_at.isoformat() if section.updated_at else now,
-        "editor": payload.editor,
-    })
+    history.append(
+        {
+            "revision": section.revision,
+            "title": section.title,
+            "content": section.content,
+            "updated_at": section.updated_at.isoformat() if section.updated_at else now,
+            "editor": payload.editor,
+        }
+    )
     section.edit_history = history[-20:]
     if payload.title is not None:
         section.title = payload.title
@@ -400,50 +448,66 @@ async def update_report_section(room_id: str, section_id: str, payload: ReportSe
     db.refresh(section)
 
     room = _get_or_create_room(room_id)
-    await room.broadcast({
-        "type": "report_update",
-        "action": "edited",
-        "room": room_id,
-        "section_id": section_id,
-        "title": section.title,
-        "editor": payload.editor,
-        "revision": section.revision,
-        "ts": section.updated_at.isoformat() if section.updated_at else now,
-    })
+    await room.broadcast(
+        {
+            "type": "report_update",
+            "action": "edited",
+            "room": room_id,
+            "section_id": section_id,
+            "title": section.title,
+            "editor": payload.editor,
+            "revision": section.revision,
+            "ts": section.updated_at.isoformat() if section.updated_at else now,
+        }
+    )
     return _section_to_dict(section)
 
 
 @app.delete("/rooms/{room_id}/reports/{section_id}")
-async def delete_report_section(room_id: str, section_id: str, editor: str = "api", db: Session = Depends(get_db)) -> dict:
+async def delete_report_section(
+    room_id: str, section_id: str, editor: str = "api", db: Session = Depends(get_db)
+) -> dict:
     from fastapi import HTTPException
-    section = db.query(CollabReportSectionModel).filter(
-        CollabReportSectionModel.id == section_id,
-        CollabReportSectionModel.room_id == room_id,
-    ).first()
+
+    section = (
+        db.query(CollabReportSectionModel)
+        .filter(
+            CollabReportSectionModel.id == section_id,
+            CollabReportSectionModel.room_id == room_id,
+        )
+        .first()
+    )
     if section is None:
         raise HTTPException(status_code=404, detail="Section not found")
     db.delete(section)
     db.commit()
 
     room = _get_or_create_room(room_id)
-    await room.broadcast({
-        "type": "report_update",
-        "action": "deleted",
-        "room": room_id,
-        "section_id": section_id,
-        "editor": editor,
-        "ts": datetime.now(timezone.utc).isoformat(),
-    })
+    await room.broadcast(
+        {
+            "type": "report_update",
+            "action": "deleted",
+            "room": room_id,
+            "section_id": section_id,
+            "editor": editor,
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }
+    )
     return {"status": "deleted", "section_id": section_id}
 
 
 @app.get("/rooms/{room_id}/reports/{section_id}/history")
 async def get_section_history(room_id: str, section_id: str, db: Session = Depends(get_db)) -> dict:
     from fastapi import HTTPException
-    section = db.query(CollabReportSectionModel).filter(
-        CollabReportSectionModel.id == section_id,
-        CollabReportSectionModel.room_id == room_id,
-    ).first()
+
+    section = (
+        db.query(CollabReportSectionModel)
+        .filter(
+            CollabReportSectionModel.id == section_id,
+            CollabReportSectionModel.room_id == room_id,
+        )
+        .first()
+    )
     if section is None:
         raise HTTPException(status_code=404, detail="Section not found")
     return {
@@ -456,6 +520,7 @@ async def get_section_history(room_id: str, section_id: str, db: Session = Depen
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _msg_to_dict(m: CollabMessageModel) -> dict:
     return {
@@ -483,4 +548,3 @@ def _section_to_dict(s: CollabReportSectionModel) -> dict:
         "revision": s.revision,
         "edit_history": s.edit_history,
     }
-
