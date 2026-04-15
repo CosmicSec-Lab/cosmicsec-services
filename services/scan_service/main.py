@@ -7,9 +7,9 @@ import logging
 import os
 import secrets
 from contextlib import asynccontextmanager
-from datetime import datetime
-from enum import Enum
-from typing import Any, Optional
+from datetime import UTC, datetime
+from enum import StrEnum
+from typing import Any
 
 import httpx
 from fastapi import (
@@ -68,7 +68,7 @@ _observability_state = setup_observability(app, service_name="scan-service", log
 
 
 # Enums
-class ScanType(str, Enum):
+class ScanType(StrEnum):
     NETWORK = "network"
     WEB = "web"
     API = "api"
@@ -76,7 +76,7 @@ class ScanType(str, Enum):
     CONTAINER = "container"
 
 
-class ScanStatus(str, Enum):
+class ScanStatus(StrEnum):
     PENDING = "pending"
     RUNNING = "running"
     COMPLETED = "completed"
@@ -89,7 +89,7 @@ class ScanConfig(BaseModel):
     scan_types: list[ScanType] = Field(..., description="Types of scans to perform")
     depth: int = Field(default=1, ge=1, le=5, description="Scan depth (1-5)")
     timeout: int = Field(default=300, ge=60, le=3600, description="Timeout in seconds")
-    options: Optional[dict] = Field(default={}, description="Additional scan options")
+    options: dict | None = Field(default={}, description="Additional scan options")
 
 
 class Scan(BaseModel):
@@ -98,10 +98,10 @@ class Scan(BaseModel):
     scan_types: list[ScanType]
     status: ScanStatus
     created_at: datetime
-    org_id: Optional[str] = None
-    workspace_id: Optional[str] = None
-    started_at: Optional[datetime] = None
-    completed_at: Optional[datetime] = None
+    org_id: str | None = None
+    workspace_id: str | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
     progress: int = 0
     findings_count: int = 0
     severity_breakdown: dict[str, int] = {}
@@ -113,7 +113,7 @@ class Finding(BaseModel):
     title: str
     description: str
     severity: str  # critical, high, medium, low, info
-    cvss_score: Optional[float] = None
+    cvss_score: float | None = None
     category: str
     recommendation: str
     detected_at: datetime
@@ -143,7 +143,7 @@ async def _fetch_org_quotas(org_id: str) -> dict[str, int]:
 
 
 def _scans_today_for_org(org_id: str) -> int:
-    today = datetime.utcnow().date()
+    today = datetime.now(tz=UTC).date()
     return sum(
         1
         for scan in scans_db.values()
@@ -201,7 +201,7 @@ async def perform_scan(scan_id: str, config: ScanConfig):
     try:
         # Update status
         scan["status"] = ScanStatus.RUNNING
-        scan["started_at"] = datetime.utcnow()
+        scan["started_at"] = datetime.now(tz=UTC)
         await ws_manager.broadcast(
             scan_id, {"scan_id": scan_id, "status": "running", "progress": 0}
         )
@@ -227,7 +227,7 @@ async def perform_scan(scan_id: str, config: ScanConfig):
                     "cvss_score": 5.3,
                     "category": "network",
                     "recommendation": "Implement IP whitelisting for SSH access",
-                    "detected_at": datetime.utcnow(),
+                    "detected_at": datetime.now(tz=UTC),
                 }
             )
 
@@ -248,7 +248,7 @@ async def perform_scan(scan_id: str, config: ScanConfig):
                     "cvss_score": 3.7,
                     "category": "web",
                     "recommendation": "Implement security headers in web server configuration",
-                    "detected_at": datetime.utcnow(),
+                    "detected_at": datetime.now(tz=UTC),
                 }
             )
 
@@ -263,7 +263,7 @@ async def perform_scan(scan_id: str, config: ScanConfig):
         # Complete scan
         scan["progress"] = 100
         scan["status"] = ScanStatus.COMPLETED
-        scan["completed_at"] = datetime.utcnow()
+        scan["completed_at"] = datetime.now(tz=UTC)
         await ws_manager.broadcast(
             scan_id, {"scan_id": scan_id, "status": "completed", "progress": 100}
         )
@@ -289,7 +289,7 @@ async def perform_scan(scan_id: str, config: ScanConfig):
                         "status": scan["status"],
                         "findings": scan_findings,
                         "severity_breakdown": severity_breakdown,
-                        "updated_at": datetime.utcnow(),
+                        "updated_at": datetime.now(tz=UTC),
                     }
                 },
                 upsert=True,
@@ -300,7 +300,7 @@ async def perform_scan(scan_id: str, config: ScanConfig):
     except Exception as e:
         logger.error(f"Scan {scan_id} failed: {str(e)}")
         scan["status"] = ScanStatus.FAILED
-        scan["completed_at"] = datetime.utcnow()
+        scan["completed_at"] = datetime.now(tz=UTC)
         await ws_manager.broadcast(
             scan_id, {"scan_id": scan_id, "status": "failed", "progress": scan.get("progress", 0)}
         )
@@ -309,7 +309,7 @@ async def perform_scan(scan_id: str, config: ScanConfig):
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
-    return {"status": "healthy", "service": "scan", "timestamp": datetime.utcnow().isoformat()}
+    return {"status": "healthy", "service": "scan", "timestamp": datetime.now(tz=UTC).isoformat()}
 
 
 @app.post("/scans", response_model=Scan)
@@ -335,7 +335,7 @@ async def create_scan(config: ScanConfig, background_tasks: BackgroundTasks, req
         "target": config.target,
         "scan_types": config.scan_types,
         "status": ScanStatus.PENDING,
-        "created_at": datetime.utcnow(),
+        "created_at": datetime.now(tz=UTC),
         "org_id": org_id,
         "workspace_id": workspace_id,
         "started_at": None,
@@ -381,7 +381,7 @@ async def get_scan(scan_id: str):
 
 
 @app.get("/scans", response_model=list[Scan])
-async def list_scans(status_filter: Optional[ScanStatus] = None, limit: int = 10, offset: int = 0):
+async def list_scans(status_filter: ScanStatus | None = None, limit: int = 10, offset: int = 0):
     """List all scans with optional filtering"""
     scans = list(scans_db.values())
 
@@ -445,14 +445,14 @@ async def get_stats():
         "running_scans": running_scans,
         "total_findings": total_findings,
         "severity_breakdown": severity_breakdown,
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(tz=UTC).isoformat(),
     }
 
 
 class QuotaUpdateRequest(BaseModel):
     max_scans_per_day: int = Field(default=1000, ge=1, le=100000)
-    max_workspaces: Optional[int] = Field(default=None, ge=1)
-    max_users: Optional[int] = Field(default=None, ge=1)
+    max_workspaces: int | None = Field(default=None, ge=1)
+    max_users: int | None = Field(default=None, ge=1)
 
 
 @app.get("/orgs/{org_id}/quotas")
@@ -505,10 +505,10 @@ class ScheduleMonitorRequest(BaseModel):
 
 class FuzzRequest(BaseModel):
     base_url: str = Field(..., description="API base URL to fuzz")
-    openapi_spec: Optional[dict[str, Any]] = Field(
+    openapi_spec: dict[str, Any] | None = Field(
         default=None, description="Optional OpenAPI 3.x spec dict"
     )
-    attack_types: Optional[list[str]] = Field(
+    attack_types: list[str] | None = Field(
         default=None,
         description="Attack categories: sqli, xss, path_traversal, cmd_injection, ssrf, ssti, auth_bypass",
     )
@@ -527,16 +527,16 @@ class ContainerScanRequest(BaseModel):
 
 class SmartScanRequest(BaseModel):
     url: str = Field(..., description="Target URL to fingerprint and plan")
-    previously_run: Optional[list[str]] = Field(
+    previously_run: list[str] | None = Field(
         default=None, description="Scan types already executed"
     )
 
 
 class CloudScanRequest(BaseModel):
     provider: str = Field(..., description="Cloud provider: aws | azure | gcp | k8s")
-    region: Optional[str] = Field(default=None, description="Target region / cluster")
-    resource_types: Optional[list[str]] = Field(default=None, description="Resource types to scan")
-    credentials_hint: Optional[str] = Field(
+    region: str | None = Field(default=None, description="Target region / cluster")
+    resource_types: list[str] | None = Field(default=None, description="Resource types to scan")
+    credentials_hint: str | None = Field(
         default=None, description="Credential profile name (no secrets)"
     )
 
@@ -550,13 +550,13 @@ class RegisterNodeRequest(BaseModel):
 
 class NodeHeartbeatRequest(BaseModel):
     healthy: bool = True
-    active_jobs: Optional[int] = Field(default=None, ge=0)
+    active_jobs: int | None = Field(default=None, ge=0)
 
 
 class DistributedAssignRequest(BaseModel):
     target: str
     replicas: int = Field(default=1, ge=1, le=10)
-    region_hint: Optional[str] = None
+    region_hint: str | None = None
     required_tags: list[str] = Field(default_factory=list)
 
 
@@ -688,7 +688,7 @@ async def cloud_scan(payload: CloudScanRequest) -> dict:
     for f in findings:
         item = dict(f)
         item["id"] = secrets.token_urlsafe(8)
-        item["detected_at"] = datetime.utcnow().isoformat()
+        item["detected_at"] = datetime.now(tz=UTC).isoformat()
         stamped.append(item)
 
     severity_breakdown: dict[str, int] = {}
@@ -702,7 +702,7 @@ async def cloud_scan(payload: CloudScanRequest) -> dict:
         "findings": stamped,
         "findings_count": len(stamped),
         "severity_breakdown": severity_breakdown,
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(tz=UTC).isoformat(),
     }
 
 

@@ -9,9 +9,9 @@ import hmac
 import logging
 import os
 import secrets
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 from urllib.parse import urlencode
 
 import bcrypt as bcrypt_lib
@@ -80,9 +80,9 @@ class Token(BaseModel):
 
 
 class TokenData(BaseModel):
-    email: Optional[str] = None
-    user_id: Optional[str] = None
-    role: Optional[str] = None
+    email: str | None = None
+    user_id: str | None = None
+    role: str | None = None
 
 
 class User(BaseModel):
@@ -119,9 +119,9 @@ class RefreshRequest(BaseModel):
 
 
 class UserUpdate(BaseModel):
-    full_name: Optional[str] = None
-    role: Optional[str] = None
-    is_active: Optional[bool] = None
+    full_name: str | None = None
+    role: str | None = None
+    is_active: bool | None = None
 
 
 class RoleAssignRequest(BaseModel):
@@ -160,7 +160,7 @@ class OrganizationCreate(BaseModel):
 
 class WorkspaceCreate(BaseModel):
     name: str
-    description: Optional[str] = None
+    description: str | None = None
     quota_scans_per_day: int = Field(default=100, ge=1, le=100000)
 
 
@@ -170,9 +170,9 @@ class OrganizationMemberAssign(BaseModel):
 
 
 class TenantQuotaUpdate(BaseModel):
-    max_users: Optional[int] = Field(default=None, ge=1, le=100000)
-    max_workspaces: Optional[int] = Field(default=None, ge=1, le=100000)
-    max_scans_per_day: Optional[int] = Field(default=None, ge=1, le=1000000)
+    max_users: int | None = Field(default=None, ge=1, le=100000)
+    max_workspaces: int | None = Field(default=None, ge=1, le=100000)
+    max_scans_per_day: int | None = Field(default=None, ge=1, le=1000000)
 
 
 class BillingCustomerCreate(BaseModel):
@@ -234,7 +234,7 @@ tenant_data_residency: dict[str, dict[str, str]] = {}
 vault_store: dict[str, dict[str, str]] = {}
 
 
-def _hash_audit_entry(entry: dict[str, Any], previous_hash: Optional[str]) -> str:
+def _hash_audit_entry(entry: dict[str, Any], previous_hash: str | None) -> str:
     """Generate a tamper-evident hash chain for audit logs."""
     import hashlib
     import json
@@ -247,8 +247,8 @@ def _hash_audit_entry(entry: dict[str, Any], previous_hash: Optional[str]) -> st
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def _audit_entry(action: str, actor: str, detail: str, org_id: Optional[str] = None) -> None:
-    ts = datetime.utcnow().isoformat()
+def _audit_entry(action: str, actor: str, detail: str, org_id: str | None = None) -> None:
+    ts = datetime.now(tz=UTC).isoformat()
     entry = {
         "timestamp": ts,
         "action": action,
@@ -263,7 +263,7 @@ def _audit_entry(action: str, actor: str, detail: str, org_id: Optional[str] = N
 
 def _cleanup_retention() -> None:
     """Delete old entries based on tenant retention policies."""
-    now = datetime.utcnow()
+    now = datetime.now(tz=UTC)
     kept: list[dict[str, Any]] = []
     for entry in audit_logs:
         org = entry.get("org_id")
@@ -405,15 +405,15 @@ def get_password_hash(password: str) -> str:
 
 
 # JWT utilities
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+def create_access_token(data: dict, expires_delta: timedelta | None = None) -> str:
     """Create JWT access token"""
     to_encode = data.copy()
     if expires_delta:
-        expire = datetime.utcnow() + expires_delta
+        expire = datetime.now(tz=UTC) + expires_delta
     else:
-        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        expire = datetime.now(tz=UTC) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
 
-    to_encode.update({"exp": expire, "iat": datetime.utcnow(), "type": "access"})
+    to_encode.update({"exp": expire, "iat": datetime.now(tz=UTC), "type": "access"})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
@@ -421,9 +421,9 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
 def create_refresh_token(data: dict) -> str:
     """Create JWT refresh token"""
     to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    expire = datetime.now(tz=UTC) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
 
-    to_encode.update({"exp": expire, "iat": datetime.utcnow(), "type": "refresh"})
+    to_encode.update({"exp": expire, "iat": datetime.now(tz=UTC), "type": "refresh"})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
@@ -485,7 +485,7 @@ def require_permission(action: str):
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
-    return {"status": "healthy", "service": "auth", "timestamp": datetime.utcnow().isoformat()}
+    return {"status": "healthy", "service": "auth", "timestamp": datetime.now(tz=UTC).isoformat()}
 
 
 @app.post("/register", response_model=dict)
@@ -508,7 +508,7 @@ async def register(user_data: UserCreate):
         "hashed_password": hashed_password,
         "role": user_data.role,
         "is_active": True,
-        "created_at": datetime.utcnow(),
+        "created_at": datetime.now(tz=UTC),
     }
 
     fake_users_db[user_data.email] = new_user
@@ -713,7 +713,7 @@ async def oauth_start(provider: str):
 
 
 @app.get("/oauth2/{provider}/callback")
-async def oauth_callback(provider: str, code: str, state: Optional[str] = None):
+async def oauth_callback(provider: str, code: str, state: str | None = None):
     """OAuth callback placeholder that validates provider and returns exchange metadata."""
     provider = provider.lower()
     if provider not in {"google", "github", "microsoft"}:
@@ -763,7 +763,7 @@ async def create_api_key(current_user: User = Depends(get_current_user)):
     fake_api_keys_db[key_id] = {
         "owner": current_user.email,
         "key_hash": hashlib.sha256(raw_key.encode("utf-8")).hexdigest(),
-        "created_at": datetime.utcnow().isoformat(),
+        "created_at": datetime.now(tz=UTC).isoformat(),
     }
     _audit("apikey.create", current_user.email, f"key_id={key_id}")
     return {"key_id": key_id, "api_key": raw_key}
@@ -865,7 +865,7 @@ async def create_user(
         "hashed_password": get_password_hash(user_data.password),
         "role": user_data.role,
         "is_active": True,
-        "created_at": datetime.utcnow(),
+        "created_at": datetime.now(tz=UTC),
     }
     fake_users_db[user_data.email] = new_user
     _audit("user.create", current_user.email, f"created={user_data.email}")
@@ -928,8 +928,8 @@ async def update_config(
 
 @app.get("/audit-logs")
 async def get_audit_logs(
-    action: Optional[str] = None,
-    actor: Optional[str] = None,
+    action: str | None = None,
+    actor: str | None = None,
     current_user: User = Depends(require_permission("manage")),
 ):
     logs = audit_logs
@@ -1015,7 +1015,7 @@ async def create_organization(
         "slug": payload.slug,
         "plan": payload.plan,
         "branding": payload.branding,
-        "created_at": datetime.utcnow().isoformat(),
+        "created_at": datetime.now(tz=UTC).isoformat(),
         "created_by": current_user.email,
     }
     organizations_db[org_id] = org
@@ -1100,7 +1100,7 @@ async def create_workspace(
         "name": payload.name,
         "description": payload.description,
         "quota_scans_per_day": payload.quota_scans_per_day,
-        "created_at": datetime.utcnow().isoformat(),
+        "created_at": datetime.now(tz=UTC).isoformat(),
     }
     current.append(ws)
     _audit_org("workspace.create", current_user.email, org_id, f"workspace={payload.name}")
@@ -1161,7 +1161,7 @@ async def create_billing_customer(
         "customer_id": customer_id,
         "billing_email": payload.billing_email,
         "provider": payload.provider,
-        "created_at": datetime.utcnow().isoformat(),
+        "created_at": datetime.now(tz=UTC).isoformat(),
     }
     _audit_org(
         "org.billing.customer.create", current_user.email, org_id, f"provider={payload.provider}"
@@ -1181,7 +1181,7 @@ async def set_billing_subscription(
     state["subscription"] = {
         "plan": payload.plan,
         "status": payload.status,
-        "updated_at": datetime.utcnow().isoformat(),
+        "updated_at": datetime.now(tz=UTC).isoformat(),
     }
     _audit_org(
         "org.billing.subscription.update", current_user.email, org_id, f"plan={payload.plan}"
@@ -1204,7 +1204,7 @@ async def create_billing_invoice(
         "currency": payload.currency.upper(),
         "description": payload.description,
         "status": "issued",
-        "issued_at": datetime.utcnow().isoformat(),
+        "issued_at": datetime.now(tz=UTC).isoformat(),
     }
     state.setdefault("invoices", []).append(invoice)
     _audit_org(

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from statistics import mean
 from typing import Any
 
@@ -151,7 +151,7 @@ def health() -> dict:
     return {
         "status": "healthy",
         "service": "phase5",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
     }
 
 
@@ -197,7 +197,7 @@ def soc_alert_dashboard(db: Session = Depends(get_db)) -> dict:
 @app.post("/soc/incidents")
 def soc_incident_create(payload: IncidentCreate, db: Session = Depends(get_db)) -> dict:
     incident_id = f"inc-{uuid.uuid4().hex[:8]}"
-    timeline = [{"step": "created", "at": datetime.now(timezone.utc).isoformat()}]
+    timeline = [{"step": "created", "at": datetime.now(UTC).isoformat()}]
     incident = Phase5IncidentModel(
         id=incident_id,
         title=payload.title,
@@ -248,7 +248,7 @@ def soc_shift_handoff(payload: ShiftHandoff) -> dict:
     return {
         "status": "recorded",
         "handoff": payload.model_dump(),
-        "at": datetime.now(timezone.utc).isoformat(),
+        "at": datetime.now(UTC).isoformat(),
     }
 
 
@@ -698,5 +698,5 @@ def executive_resource_optimization() -> dict:
 def executive_reports() -> dict:
     return {
         "reports": ["board_kpi_deck", "quarterly_roi", "risk_reduction_trend"],
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": datetime.now(UTC).isoformat(),
     }

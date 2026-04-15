@@ -11,9 +11,9 @@ import asyncio
 import contextlib
 import logging
 import secrets
-from collections.abc import Coroutine
-from datetime import datetime, timedelta
-from typing import Any, Callable
+from collections.abc import Callable, Coroutine
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +50,7 @@ class MonitorJob:
         self.interval_seconds = interval_seconds
         self.created_by = created_by
         self.alert_on_new_critical = alert_on_new_critical
-        self.created_at = datetime.utcnow().isoformat()
+        self.created_at = datetime.now(tz=UTC).isoformat()
         self.last_run: str | None = None
         self.next_run: str | None = None
         self.run_count = 0
@@ -155,7 +155,7 @@ class ContinuousMonitor:
             created_by=created_by,
             alert_on_new_critical=alert_on_new_critical,
         )
-        next_run_dt = datetime.utcnow() + timedelta(seconds=job.interval_seconds)
+        next_run_dt = datetime.now(tz=UTC) + timedelta(seconds=job.interval_seconds)
         job.next_run = next_run_dt.isoformat()
         self._jobs[job_id] = job
 
@@ -195,7 +195,7 @@ class ContinuousMonitor:
         if job is None or job.status != "active":
             return
 
-        now = datetime.utcnow()
+        now = datetime.now(tz=UTC)
         job.last_run = now.isoformat()
         job.run_count += 1
         job.next_run = (now + timedelta(seconds=job.interval_seconds)).isoformat()

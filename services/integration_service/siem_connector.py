@@ -6,7 +6,7 @@ import csv
 import io
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 def _to_cef(event: dict[str, Any]) -> str:
     """Convert an audit log event to CEF (Common Event Format) string."""
-    timestamp = event.get("created_at", datetime.now(timezone.utc).isoformat())
+    timestamp = event.get("created_at", datetime.now(UTC).isoformat())
     user_id = event.get("user_id", "unknown")
     action = event.get("action", "unknown")
     resource = event.get("resource", "")

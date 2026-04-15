@@ -8,9 +8,9 @@ import json
 import logging
 import re
 import time
+import urllib.parse
 import uuid
 from datetime import timedelta
-from typing import Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, status
@@ -70,6 +70,26 @@ def _validate_email_param(value: str) -> str:
     return value
 
 
+def _validate_plugin_name(value: str) -> str:
+    """Validate a plugin name path parameter.
+
+    Same character set as ``_validate_path_id`` but uses the dedicated plugin
+    regex so the ``_RE_PLUGIN_NAME`` pattern is exercised.
+    """
+    if not _RE_PLUGIN_NAME.match(value):
+        raise HTTPException(
+            status_code=400, detail="Invalid plugin name: must be alphanumeric (max 128 chars)"
+        )
+    return value
+
+
+def _validate_uuid_param(value: str, label: str = "id") -> str:
+    """Validate a UUID path parameter."""
+    if not _RE_UUID.match(value):
+        raise HTTPException(status_code=400, detail=f"Invalid {label}: must be a valid UUID")
+    return value
+
+
 def _sanitize_log(value: object, max_len: int = 200) -> str:
     """Sanitize a user-provided value before including it in a log message.
 
@@ -80,6 +100,38 @@ def _sanitize_log(value: object, max_len: int = 200) -> str:
     # Strip log-injection control characters
     text = text.replace("\n", "\\n").replace("\r", "\\r").replace("\x00", "")
     return text[:max_len]
+
+
+# ---------------------------------------------------------------------------
+# Internal service URL builder — prevents SSRF by constructing URLs from
+# a frozen allowlist of service base URLs.  User-controlled path segments
+# MUST be validated *before* being passed here.
+# ---------------------------------------------------------------------------
+
+# Immutable copy so application code cannot mutate the registry at runtime.
+_FROZEN_SERVICE_URLS: dict[str, str] = {}
+
+
+def _init_service_urls(urls: dict[str, str]) -> None:
+    """Freeze the service URL registry (called once at module level)."""
+    global _FROZEN_SERVICE_URLS  # noqa: PLW0603
+    _FROZEN_SERVICE_URLS = dict(urls)
+
+
+def _build_service_url(service: str, path: str) -> str:
+    """Build an internal service URL from the frozen allowlist.
+
+    ``service`` must be a key in ``SERVICE_URLS``.
+    ``path`` must start with ``/``.  Only the scheme, host, and port of the
+    base URL are used; the path is appended with ``urllib.parse.urljoin``.
+    """
+    base = _FROZEN_SERVICE_URLS.get(service)
+    if base is None:
+        raise ValueError(f"Unknown service: {service}")
+    # Ensure path starts with /
+    if not path.startswith("/"):
+        path = "/" + path
+    return urllib.parse.urljoin(base, path)
 
 
 # Initialize FastAPI app
@@ -249,6 +301,9 @@ SERVICE_URLS = {
     "notification": "http://notification-service:8012",
 }
 
+# Freeze the URL registry for the SSRF-safe URL builder
+_init_service_urls(SERVICE_URLS)
+
 # Runtime observability and GraphQL wiring
 _observability_state = setup_observability(app, service_name="api-gateway", logger=logger)
 _graphql_enabled = mount_graphql(app, service_urls=SERVICE_URLS, logger=logger)
@@ -372,28 +427,28 @@ async def dashboard_summary(request: Request):
         results = {}
         # Scan stats
         try:
-            resp = await client.get(f"{SERVICE_URLS['scan']}/stats", timeout=5.0)
+            resp = await client.get(_build_service_url("scan", "/stats"), timeout=5.0)
             results["scan_stats"] = resp.json()
         except Exception:
             results["scan_stats"] = {"error": "unavailable"}
 
         # Active collaboration stats
         try:
-            resp = await client.get(f"{SERVICE_URLS['collab']}/activity-feed", timeout=5.0)
+            resp = await client.get(_build_service_url("collab", "/activity-feed"), timeout=5.0)
             results["collab_activity"] = {"total_events": resp.json().get("total_events", 0)}
         except Exception:
             results["collab_activity"] = {"error": "unavailable"}
 
         # Plugin ecosystem status
         try:
-            resp = await client.get(f"{SERVICE_URLS['plugins']}/plugins", timeout=5.0)
+            resp = await client.get(_build_service_url("plugins", "/plugins"), timeout=5.0)
             results["plugins"] = {"total": len(resp.json().get("plugins", []))}
         except Exception:
             results["plugins"] = {"error": "unavailable"}
 
         # Integration service signals
         try:
-            resp = await client.get(f"{SERVICE_URLS['report']}/health", timeout=5.0)
+            resp = await client.get(_build_service_url("report", "/health"), timeout=5.0)
             results["report_service"] = resp.json()
         except Exception:
             results["report_service"] = {"error": "unavailable"}
@@ -439,7 +494,7 @@ async def dashboard_overview(request: Request):
     async with httpx.AsyncClient() as client:
         # Scan stats
         try:
-            resp = await client.get(f"{SERVICE_URLS['scan']}/stats", timeout=3.0)
+            resp = await client.get(_build_service_url("scan", "/stats"), timeout=3.0)
             if resp.status_code == 200:
                 data = resp.json()
                 total_scans = data.get("total_scans", 0)
@@ -450,7 +505,7 @@ async def dashboard_overview(request: Request):
 
         # Agent sessions
         try:
-            resp = await client.get(f"{SERVICE_URLS['scan']}/agents", timeout=3.0)
+            resp = await client.get(_build_service_url("scan", "/agents"), timeout=3.0)
             if resp.status_code == 200:
                 data = resp.json()
                 active_agents = len(
@@ -462,7 +517,7 @@ async def dashboard_overview(request: Request):
         # Bug bounty open count
         try:
             resp = await client.get(
-                f"{SERVICE_URLS['bugbounty']}/submissions?status=open&limit=100", timeout=3.0
+                _build_service_url("bugbounty", "/submissions?status=open&limit=100"), timeout=3.0
             )
             if resp.status_code == 200:
                 data = resp.json()
@@ -508,7 +563,7 @@ async def register(request: Request):
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(
-                f"{SERVICE_URLS['auth']}/register", json=data, timeout=10.0
+                _build_service_url("auth", "/register"), json=data, timeout=10.0
             )
             return JSONResponse(status_code=response.status_code, content=response.json())
         except Exception as e:
@@ -562,7 +617,7 @@ async def create_api_key(request: Request):
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(
-                f"{SERVICE_URLS['auth']}/apikeys", json=data, headers=headers, timeout=10.0
+                _build_service_url("auth", "/apikeys"), json=data, headers=headers, timeout=10.0
             )
             return JSONResponse(status_code=response.status_code, content=response.json())
         except Exception as e:
@@ -580,7 +635,7 @@ async def list_api_keys(request: Request):
     async with httpx.AsyncClient() as client:
         try:
             response = await client.get(
-                f"{SERVICE_URLS['auth']}/apikeys", headers=headers, timeout=10.0
+                _build_service_url("auth", "/apikeys"), headers=headers, timeout=10.0
             )
             return JSONResponse(status_code=response.status_code, content=response.json())
         except Exception as e:
@@ -601,7 +656,7 @@ async def delete_api_key(request: Request, key_id: str):
     async with httpx.AsyncClient() as client:
         try:
             response = await client.delete(
-                f"{SERVICE_URLS['auth']}/apikeys/{key_id}", headers=headers, timeout=10.0
+                _build_service_url("auth", f"/apikeys/{key_id}"), headers=headers, timeout=10.0
             )
             return JSONResponse(status_code=response.status_code, content=response.json())
         except Exception as e:
@@ -616,7 +671,7 @@ async def gdpr_export(request: Request):
     async with httpx.AsyncClient() as client:
         try:
             response = await client.get(
-                f"{SERVICE_URLS['auth']}/gdpr/export", params=params, timeout=10.0
+                _build_service_url("auth", "/gdpr/export"), params=params, timeout=10.0
             )
             return JSONResponse(status_code=response.status_code, content=response.json())
         except Exception as e:
@@ -631,7 +686,7 @@ async def gdpr_delete(request: Request):
     async with httpx.AsyncClient() as client:
         try:
             response = await client.delete(
-                f"{SERVICE_URLS['auth']}/gdpr/delete", params=params, timeout=10.0
+                _build_service_url("auth", "/gdpr/delete"), params=params, timeout=10.0
             )
             return JSONResponse(status_code=response.status_code, content=response.json())
         except Exception as e:
@@ -752,7 +807,7 @@ async def ai_analyze_agent(request: Request):
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(
-                f"{SERVICE_URLS['ai']}/analyze/agent",
+                _build_service_url("ai", "/analyze/agent"),
                 json=data,
                 timeout=30.0,
             )
@@ -770,7 +825,7 @@ async def ai_mitre(request: Request):
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(
-                f"{SERVICE_URLS['ai']}/analyze/mitre",
+                _build_service_url("ai", "/analyze/mitre"),
                 json=data,
                 timeout=10.0,
             )
@@ -788,7 +843,7 @@ async def ai_nl_query(request: Request):
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(
-                f"{SERVICE_URLS['ai']}/query",
+                _build_service_url("ai", "/query"),
                 json=data,
                 timeout=20.0,
             )
@@ -806,7 +861,7 @@ async def ai_kb_ingest(request: Request):
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(
-                f"{SERVICE_URLS['ai']}/kb/ingest",
+                _build_service_url("ai", "/kb/ingest"),
                 json=data,
                 timeout=10.0,
             )
@@ -821,7 +876,7 @@ async def ai_kb_stats(request: Request):
     """Return ChromaDB knowledge base statistics."""
     async with httpx.AsyncClient() as client:
         try:
-            response = await client.get(f"{SERVICE_URLS['ai']}/kb/stats", timeout=5.0)
+            response = await client.get(_build_service_url("ai", "/kb/stats"), timeout=5.0)
             return JSONResponse(status_code=response.status_code, content=response.json())
         except Exception:
             raise HTTPException(status_code=503, detail="AI service unavailable")
@@ -1100,7 +1155,7 @@ async def threat_intel_ip(request: Request):
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.get(
-                f"{SERVICE_URLS['report']}/threat-intel/ip", params=params, timeout=5.0
+                _build_service_url("report", "/threat-intel/ip"), params=params, timeout=5.0
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
@@ -1114,7 +1169,7 @@ async def threat_intel_domain(request: Request):
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.get(
-                f"{SERVICE_URLS['report']}/threat-intel/domain", params=params, timeout=5.0
+                _build_service_url("report", "/threat-intel/domain"), params=params, timeout=5.0
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
@@ -1127,7 +1182,7 @@ async def ci_build(request: Request):
     data = await request.json()
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.post(f"{SERVICE_URLS['report']}/ci/build", json=data, timeout=10.0)
+            resp = await client.post(_build_service_url("report", "/ci/build"), json=data, timeout=10.0)
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
             raise HTTPException(status_code=503, detail="Integration service unavailable")
@@ -1137,7 +1192,7 @@ async def ci_build(request: Request):
 @limiter.limit("60/minute")
 async def admin_list_users(request: Request):
     async with httpx.AsyncClient() as client:
-        response = await client.get(f"{SERVICE_URLS['auth']}/users", timeout=10.0)
+        response = await client.get(_build_service_url("auth", "/users"), timeout=10.0)
         return JSONResponse(status_code=response.status_code, content=response.json())
 
 
@@ -1146,7 +1201,7 @@ async def admin_list_users(request: Request):
 async def admin_create_user(request: Request):
     payload = await request.json()
     async with httpx.AsyncClient() as client:
-        response = await client.post(f"{SERVICE_URLS['auth']}/users", json=payload, timeout=10.0)
+        response = await client.post(_build_service_url("auth", "/users"), json=payload, timeout=10.0)
         return JSONResponse(status_code=response.status_code, content=response.json())
 
 
@@ -1157,7 +1212,7 @@ async def admin_update_user(request: Request, email: str):
     payload = await request.json()
     async with httpx.AsyncClient() as client:
         response = await client.put(
-            f"{SERVICE_URLS['auth']}/users/{email}", json=payload, timeout=10.0
+            _build_service_url("auth", f"/users/{email}"), json=payload, timeout=10.0
         )
         return JSONResponse(status_code=response.status_code, content=response.json())
 
@@ -1167,7 +1222,7 @@ async def admin_update_user(request: Request, email: str):
 async def admin_delete_user(request: Request, email: str):
     email = _validate_email_param(email)
     async with httpx.AsyncClient() as client:
-        response = await client.delete(f"{SERVICE_URLS['auth']}/users/{email}", timeout=10.0)
+        response = await client.delete(_build_service_url("auth", f"/users/{email}"), timeout=10.0)
         return JSONResponse(status_code=response.status_code, content=response.json())
 
 
@@ -1177,7 +1232,7 @@ async def admin_assign_role(request: Request):
     payload = await request.json()
     async with httpx.AsyncClient() as client:
         response = await client.post(
-            f"{SERVICE_URLS['auth']}/roles/assign", json=payload, timeout=10.0
+            _build_service_url("auth", "/roles/assign"), json=payload, timeout=10.0
         )
         return JSONResponse(status_code=response.status_code, content=response.json())
 
@@ -1186,7 +1241,7 @@ async def admin_assign_role(request: Request):
 @limiter.limit("60/minute")
 async def admin_get_config(request: Request):
     async with httpx.AsyncClient() as client:
-        response = await client.get(f"{SERVICE_URLS['auth']}/config", timeout=10.0)
+        response = await client.get(_build_service_url("auth", "/config"), timeout=10.0)
         return JSONResponse(status_code=response.status_code, content=response.json())
 
 
@@ -1195,7 +1250,7 @@ async def admin_get_config(request: Request):
 async def admin_set_config(request: Request):
     payload = await request.json()
     async with httpx.AsyncClient() as client:
-        response = await client.post(f"{SERVICE_URLS['auth']}/config", json=payload, timeout=10.0)
+        response = await client.post(_build_service_url("auth", "/config"), json=payload, timeout=10.0)
         return JSONResponse(status_code=response.status_code, content=response.json())
 
 
@@ -1205,7 +1260,7 @@ async def admin_get_audit_logs(request: Request):
     query = dict(request.query_params)
     async with httpx.AsyncClient() as client:
         response = await client.get(
-            f"{SERVICE_URLS['auth']}/audit-logs", params=query, timeout=10.0
+            _build_service_url("auth", "/audit-logs"), params=query, timeout=10.0
         )
         return JSONResponse(status_code=response.status_code, content=response.json())
 
@@ -1220,7 +1275,7 @@ async def admin_get_audit_logs(request: Request):
 async def create_org(request: Request):
     payload = await request.json()
     async with httpx.AsyncClient() as client:
-        response = await client.post(f"{SERVICE_URLS['auth']}/orgs", json=payload, timeout=10.0)
+        response = await client.post(_build_service_url("auth", "/orgs"), json=payload, timeout=10.0)
         return JSONResponse(status_code=response.status_code, content=response.json())
 
 
@@ -1228,7 +1283,7 @@ async def create_org(request: Request):
 @limiter.limit("60/minute")
 async def list_orgs(request: Request):
     async with httpx.AsyncClient() as client:
-        response = await client.get(f"{SERVICE_URLS['auth']}/orgs", timeout=10.0)
+        response = await client.get(_build_service_url("auth", "/orgs"), timeout=10.0)
         return JSONResponse(status_code=response.status_code, content=response.json())
 
 
@@ -1239,7 +1294,7 @@ async def add_org_member(request: Request, org_id: str):
     payload = await request.json()
     async with httpx.AsyncClient() as client:
         response = await client.post(
-            f"{SERVICE_URLS['auth']}/orgs/{org_id}/members", json=payload, timeout=10.0
+            _build_service_url("auth", f"/orgs/{org_id}/members"), json=payload, timeout=10.0
         )
         return JSONResponse(status_code=response.status_code, content=response.json())
 
@@ -1249,7 +1304,7 @@ async def add_org_member(request: Request, org_id: str):
 async def list_org_members(request: Request, org_id: str):
     org_id = _validate_path_id(org_id, "org_id")
     async with httpx.AsyncClient() as client:
-        response = await client.get(f"{SERVICE_URLS['auth']}/orgs/{org_id}/members", timeout=10.0)
+        response = await client.get(_build_service_url("auth", f"/orgs/{org_id}/members"), timeout=10.0)
         return JSONResponse(status_code=response.status_code, content=response.json())
 
 
@@ -1260,7 +1315,7 @@ async def create_workspace(request: Request, org_id: str):
     payload = await request.json()
     async with httpx.AsyncClient() as client:
         response = await client.post(
-            f"{SERVICE_URLS['auth']}/orgs/{org_id}/workspaces", json=payload, timeout=10.0
+            _build_service_url("auth", f"/orgs/{org_id}/workspaces"), json=payload, timeout=10.0
         )
         return JSONResponse(status_code=response.status_code, content=response.json())
 
@@ -1271,7 +1326,7 @@ async def list_workspaces(request: Request, org_id: str):
     org_id = _validate_path_id(org_id, "org_id")
     async with httpx.AsyncClient() as client:
         response = await client.get(
-            f"{SERVICE_URLS['auth']}/orgs/{org_id}/workspaces", timeout=10.0
+            _build_service_url("auth", f"/orgs/{org_id}/workspaces"), timeout=10.0
         )
         return JSONResponse(status_code=response.status_code, content=response.json())
 
@@ -1281,7 +1336,7 @@ async def list_workspaces(request: Request, org_id: str):
 async def get_org_quotas(request: Request, org_id: str):
     org_id = _validate_path_id(org_id, "org_id")
     async with httpx.AsyncClient() as client:
-        response = await client.get(f"{SERVICE_URLS['auth']}/orgs/{org_id}/quotas", timeout=10.0)
+        response = await client.get(_build_service_url("auth", f"/orgs/{org_id}/quotas"), timeout=10.0)
         return JSONResponse(status_code=response.status_code, content=response.json())
 
 
@@ -1292,7 +1347,7 @@ async def set_org_quotas(request: Request, org_id: str):
     payload = await request.json()
     async with httpx.AsyncClient() as client:
         response = await client.post(
-            f"{SERVICE_URLS['auth']}/orgs/{org_id}/quotas", json=payload, timeout=10.0
+            _build_service_url("auth", f"/orgs/{org_id}/quotas"), json=payload, timeout=10.0
         )
         return JSONResponse(status_code=response.status_code, content=response.json())
 
@@ -1329,7 +1384,7 @@ async def dashboard_stream(websocket: WebSocket):
 async def collab_list_rooms(request: Request):
     async with httpx.AsyncClient() as client:
         try:
-            response = await client.get(f"{SERVICE_URLS['collab']}/rooms", timeout=5.0)
+            response = await client.get(_build_service_url("collab", "/rooms"), timeout=5.0)
             return JSONResponse(status_code=response.status_code, content=response.json())
         except Exception:
             raise HTTPException(status_code=503, detail="Collab service unavailable")
@@ -1342,7 +1397,7 @@ async def collab_get_messages(request: Request, room_id: str):
     async with httpx.AsyncClient() as client:
         try:
             response = await client.get(
-                f"{SERVICE_URLS['collab']}/rooms/{room_id}/messages",
+                _build_service_url("collab", f"/rooms/{room_id}/messages"),
                 params=params,
                 timeout=5.0,
             )
@@ -1358,7 +1413,7 @@ async def collab_post_message(request: Request, room_id: str):
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(
-                f"{SERVICE_URLS['collab']}/rooms/{room_id}/messages",
+                _build_service_url("collab", f"/rooms/{room_id}/messages"),
                 json=data,
                 timeout=5.0,
             )
@@ -1373,7 +1428,7 @@ async def collab_presence(request: Request, room_id: str):
     async with httpx.AsyncClient() as client:
         try:
             response = await client.get(
-                f"{SERVICE_URLS['collab']}/rooms/{room_id}/presence", timeout=5.0
+                _build_service_url("collab", f"/rooms/{room_id}/presence"), timeout=5.0
             )
             return JSONResponse(status_code=response.status_code, content=response.json())
         except Exception:
@@ -1387,7 +1442,7 @@ async def collab_activity_feed(request: Request):
     async with httpx.AsyncClient() as client:
         try:
             response = await client.get(
-                f"{SERVICE_URLS['collab']}/activity-feed", params=params, timeout=5.0
+                _build_service_url("collab", "/activity-feed"), params=params, timeout=5.0
             )
             return JSONResponse(status_code=response.status_code, content=response.json())
         except Exception:
@@ -1404,7 +1459,7 @@ async def collab_activity_feed(request: Request):
 async def plugins_list(request: Request):
     async with httpx.AsyncClient() as client:
         try:
-            response = await client.get(f"{SERVICE_URLS['plugins']}/plugins", timeout=5.0)
+            response = await client.get(_build_service_url("plugins", "/plugins"), timeout=5.0)
             return JSONResponse(status_code=response.status_code, content=response.json())
         except Exception:
             raise HTTPException(status_code=503, detail="Plugin registry unavailable")
@@ -1413,9 +1468,10 @@ async def plugins_list(request: Request):
 @app.get("/api/plugins/{name}")
 @limiter.limit("60/minute")
 async def plugin_detail(request: Request, name: str):
+    name = _validate_plugin_name(name)
     async with httpx.AsyncClient() as client:
         try:
-            response = await client.get(f"{SERVICE_URLS['plugins']}/plugins/{name}", timeout=5.0)
+            response = await client.get(_build_service_url("plugins", f"/plugins/{name}"), timeout=5.0)
             return JSONResponse(status_code=response.status_code, content=response.json())
         except Exception:
             raise HTTPException(status_code=503, detail="Plugin registry unavailable")
@@ -1424,11 +1480,12 @@ async def plugin_detail(request: Request, name: str):
 @app.post("/api/plugins/{name}/run")
 @limiter.limit("20/minute")
 async def plugin_run(request: Request, name: str):
+    name = _validate_plugin_name(name)
     data = await request.json()
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(
-                f"{SERVICE_URLS['plugins']}/plugins/{name}/run",
+                _build_service_url("plugins", f"/plugins/{name}/run"),
                 json=data,
                 timeout=30.0,
             )
@@ -1440,10 +1497,11 @@ async def plugin_run(request: Request, name: str):
 @app.post("/api/plugins/{name}/enable")
 @limiter.limit("20/minute")
 async def plugin_enable(request: Request, name: str):
+    name = _validate_plugin_name(name)
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(
-                f"{SERVICE_URLS['plugins']}/plugins/{name}/enable", timeout=5.0
+                _build_service_url("plugins", f"/plugins/{name}/enable"), timeout=5.0
             )
             return JSONResponse(status_code=response.status_code, content=response.json())
         except Exception:
@@ -1453,10 +1511,11 @@ async def plugin_enable(request: Request, name: str):
 @app.post("/api/plugins/{name}/disable")
 @limiter.limit("20/minute")
 async def plugin_disable(request: Request, name: str):
+    name = _validate_plugin_name(name)
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(
-                f"{SERVICE_URLS['plugins']}/plugins/{name}/disable", timeout=5.0
+                _build_service_url("plugins", f"/plugins/{name}/disable"), timeout=5.0
             )
             return JSONResponse(status_code=response.status_code, content=response.json())
         except Exception:
@@ -1477,7 +1536,7 @@ async def scan_monitor_schedule(request: Request):
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.post(
-                f"{SERVICE_URLS['scan']}/monitor/schedule", json=data, timeout=10.0
+                _build_service_url("scan", "/monitor/schedule"), json=data, timeout=10.0
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
@@ -1489,7 +1548,7 @@ async def scan_monitor_schedule(request: Request):
 async def scan_monitor_jobs(request: Request):
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.get(f"{SERVICE_URLS['scan']}/monitor/jobs", timeout=5.0)
+            resp = await client.get(_build_service_url("scan", "/monitor/jobs"), timeout=5.0)
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
             raise HTTPException(status_code=503, detail="Scan service unavailable")
@@ -1500,7 +1559,7 @@ async def scan_monitor_jobs(request: Request):
 async def scan_monitor_job_detail(request: Request, job_id: str):
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.get(f"{SERVICE_URLS['scan']}/monitor/jobs/{job_id}", timeout=5.0)
+            resp = await client.get(_build_service_url("scan", f"/monitor/jobs/{job_id}"), timeout=5.0)
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
             raise HTTPException(status_code=503, detail="Scan service unavailable")
@@ -1513,7 +1572,7 @@ async def scan_monitor_pause(request: Request, job_id: str):
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.post(
-                f"{SERVICE_URLS['scan']}/monitor/jobs/{job_id}/pause", timeout=5.0
+                _build_service_url("scan", f"/monitor/jobs/{job_id}/pause"), timeout=5.0
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
@@ -1527,7 +1586,7 @@ async def scan_monitor_resume(request: Request, job_id: str):
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.post(
-                f"{SERVICE_URLS['scan']}/monitor/jobs/{job_id}/resume", timeout=5.0
+                _build_service_url("scan", f"/monitor/jobs/{job_id}/resume"), timeout=5.0
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
@@ -1539,7 +1598,7 @@ async def scan_monitor_resume(request: Request, job_id: str):
 async def scan_monitor_cancel(request: Request, job_id: str):
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.delete(f"{SERVICE_URLS['scan']}/monitor/jobs/{job_id}", timeout=5.0)
+            resp = await client.delete(_build_service_url("scan", f"/monitor/jobs/{job_id}"), timeout=5.0)
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
             raise HTTPException(status_code=503, detail="Scan service unavailable")
@@ -1555,7 +1614,7 @@ async def scans_fuzz(request: Request):
     data = await request.json()
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.post(f"{SERVICE_URLS['scan']}/scans/fuzz", json=data, timeout=60.0)
+            resp = await client.post(_build_service_url("scan", "/scans/fuzz"), json=data, timeout=60.0)
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
             raise HTTPException(status_code=503, detail="Scan service unavailable")
@@ -1572,7 +1631,7 @@ async def scans_container(request: Request):
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.post(
-                f"{SERVICE_URLS['scan']}/scans/container", json=data, timeout=30.0
+                _build_service_url("scan", "/scans/container"), json=data, timeout=30.0
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
@@ -1590,7 +1649,7 @@ async def scans_smart_plan(request: Request):
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.post(
-                f"{SERVICE_URLS['scan']}/scans/smart-plan", json=data, timeout=30.0
+                _build_service_url("scan", "/scans/smart-plan"), json=data, timeout=30.0
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
@@ -1607,7 +1666,7 @@ async def scans_cloud(request: Request):
     data = await request.json()
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.post(f"{SERVICE_URLS['scan']}/scans/cloud", json=data, timeout=30.0)
+            resp = await client.post(_build_service_url("scan", "/scans/cloud"), json=data, timeout=30.0)
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
             raise HTTPException(status_code=503, detail="Scan service unavailable")
@@ -1623,7 +1682,7 @@ async def scan_register_node(request: Request):
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.post(
-                f"{SERVICE_URLS['scan']}/distributed/nodes/register", json=data, timeout=10.0
+                _build_service_url("scan", "/distributed/nodes/register"), json=data, timeout=10.0
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
@@ -1635,7 +1694,7 @@ async def scan_register_node(request: Request):
 async def scan_list_nodes(request: Request):
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.get(f"{SERVICE_URLS['scan']}/distributed/nodes", timeout=5.0)
+            resp = await client.get(_build_service_url("scan", "/distributed/nodes"), timeout=5.0)
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
             raise HTTPException(status_code=503, detail="Scan service unavailable")
@@ -1648,7 +1707,7 @@ async def scan_node_heartbeat(request: Request, node_id: str):
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.post(
-                f"{SERVICE_URLS['scan']}/distributed/nodes/{node_id}/heartbeat",
+                _build_service_url("scan", f"/distributed/nodes/{node_id}/heartbeat"),
                 json=data,
                 timeout=5.0,
             )
@@ -1664,7 +1723,7 @@ async def scan_distributed_assign(request: Request):
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.post(
-                f"{SERVICE_URLS['scan']}/distributed/assign", json=data, timeout=10.0
+                _build_service_url("scan", "/distributed/assign"), json=data, timeout=10.0
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
@@ -1677,7 +1736,7 @@ async def scan_distributed_complete(request: Request, node_id: str):
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.post(
-                f"{SERVICE_URLS['scan']}/distributed/nodes/{node_id}/complete",
+                _build_service_url("scan", f"/distributed/nodes/{node_id}/complete"),
                 timeout=5.0,
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
@@ -1698,7 +1757,7 @@ async def ai_agent_autonomous(request: Request):
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.post(
-                f"{SERVICE_URLS['ai']}/agent/autonomous", json=data, timeout=60.0
+                _build_service_url("ai", "/agent/autonomous"), json=data, timeout=60.0
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
@@ -1713,7 +1772,7 @@ async def ai_exploit_suggest(request: Request):
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.post(
-                f"{SERVICE_URLS['ai']}/exploit/suggest", json=data, timeout=30.0
+                _build_service_url("ai", "/exploit/suggest"), json=data, timeout=30.0
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
@@ -1727,7 +1786,7 @@ async def ai_anomaly_fit(request: Request):
     data = await request.json()
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.post(f"{SERVICE_URLS['ai']}/anomaly/fit", json=data, timeout=30.0)
+            resp = await client.post(_build_service_url("ai", "/anomaly/fit"), json=data, timeout=30.0)
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
             raise HTTPException(status_code=503, detail="AI service unavailable")
@@ -1741,7 +1800,7 @@ async def ai_anomaly_detect(request: Request):
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.post(
-                f"{SERVICE_URLS['ai']}/anomaly/detect", json=data, timeout=15.0
+                _build_service_url("ai", "/anomaly/detect"), json=data, timeout=15.0
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
@@ -1755,7 +1814,7 @@ async def ai_anomaly_batch(request: Request):
     data = await request.json()
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.post(f"{SERVICE_URLS['ai']}/anomaly/batch", json=data, timeout=30.0)
+            resp = await client.post(_build_service_url("ai", "/anomaly/batch"), json=data, timeout=30.0)
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
             raise HTTPException(status_code=503, detail="AI service unavailable")
@@ -1774,7 +1833,7 @@ async def collab_create_report_section(request: Request, room_id: str):
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.post(
-                f"{SERVICE_URLS['collab']}/rooms/{room_id}/reports", json=data, timeout=10.0
+                _build_service_url("collab", f"/rooms/{room_id}/reports"), json=data, timeout=10.0
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
@@ -1788,7 +1847,7 @@ async def collab_list_report_sections(request: Request, room_id: str):
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.get(
-                f"{SERVICE_URLS['collab']}/rooms/{room_id}/reports", timeout=5.0
+                _build_service_url("collab", f"/rooms/{room_id}/reports"), timeout=5.0
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
@@ -1802,7 +1861,7 @@ async def collab_update_report_section(request: Request, room_id: str, section_i
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.put(
-                f"{SERVICE_URLS['collab']}/rooms/{room_id}/reports/{section_id}",
+                _build_service_url("collab", f"/rooms/{room_id}/reports/{section_id}"),
                 json=data,
                 timeout=10.0,
             )
@@ -1817,7 +1876,7 @@ async def collab_delete_report_section(request: Request, room_id: str, section_i
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.delete(
-                f"{SERVICE_URLS['collab']}/rooms/{room_id}/reports/{section_id}",
+                _build_service_url("collab", f"/rooms/{room_id}/reports/{section_id}"),
                 timeout=5.0,
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
@@ -1831,7 +1890,7 @@ async def collab_section_history(request: Request, room_id: str, section_id: str
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.get(
-                f"{SERVICE_URLS['collab']}/rooms/{room_id}/reports/{section_id}/history",
+                _build_service_url("collab", f"/rooms/{room_id}/reports/{section_id}/history"),
                 timeout=5.0,
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
@@ -1850,7 +1909,7 @@ async def marketplace_list(request: Request):
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.get(
-                f"{SERVICE_URLS['plugins']}/marketplace", params=params, timeout=5.0
+                _build_service_url("plugins", "/marketplace"), params=params, timeout=5.0
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
@@ -1865,7 +1924,7 @@ async def marketplace_publish(request: Request):
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.post(
-                f"{SERVICE_URLS['plugins']}/marketplace/publish", json=data, timeout=10.0
+                _build_service_url("plugins", "/marketplace/publish"), json=data, timeout=10.0
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
@@ -1875,12 +1934,12 @@ async def marketplace_publish(request: Request):
 @app.post("/api/plugins/{name}/rate")
 @limiter.limit("20/minute")
 async def plugin_rate(request: Request, name: str):
-    name = _validate_path_id(name, "plugin name")
+    name = _validate_plugin_name(name)
     data = await request.json()
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.post(
-                f"{SERVICE_URLS['plugins']}/plugins/{name}/rate", json=data, timeout=5.0
+                _build_service_url("plugins", f"/plugins/{name}/rate"), json=data, timeout=5.0
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
@@ -1890,10 +1949,10 @@ async def plugin_rate(request: Request, name: str):
 @app.get("/api/plugins/{name}/rating")
 @limiter.limit("60/minute")
 async def plugin_rating(request: Request, name: str):
-    name = _validate_path_id(name, "plugin name")
+    name = _validate_plugin_name(name)
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.get(f"{SERVICE_URLS['plugins']}/plugins/{name}/rating", timeout=5.0)
+            resp = await client.get(_build_service_url("plugins", f"/plugins/{name}/rating"), timeout=5.0)
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
             raise HTTPException(status_code=503, detail="Plugin registry unavailable")
@@ -1904,7 +1963,7 @@ async def plugin_rating(request: Request, name: str):
 async def plugins_updates(request: Request):
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.get(f"{SERVICE_URLS['plugins']}/plugins/updates", timeout=5.0)
+            resp = await client.get(_build_service_url("plugins", "/plugins/updates"), timeout=5.0)
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
             raise HTTPException(status_code=503, detail="Plugin registry unavailable")
@@ -1913,11 +1972,11 @@ async def plugins_updates(request: Request):
 @app.post("/api/plugins/{name}/auto-update")
 @limiter.limit("10/minute")
 async def plugin_auto_update(request: Request, name: str):
-    name = _validate_path_id(name, "plugin name")
+    name = _validate_plugin_name(name)
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.post(
-                f"{SERVICE_URLS['plugins']}/plugins/{name}/auto-update", timeout=10.0
+                _build_service_url("plugins", f"/plugins/{name}/auto-update"), timeout=10.0
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
@@ -1930,7 +1989,7 @@ async def community_repositories(request: Request):
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.get(
-                f"{SERVICE_URLS['plugins']}/community/repositories", timeout=5.0
+                _build_service_url("plugins", "/community/repositories"), timeout=5.0
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
@@ -1944,7 +2003,7 @@ async def community_register_repository(request: Request):
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.post(
-                f"{SERVICE_URLS['plugins']}/community/repositories", json=data, timeout=10.0
+                _build_service_url("plugins", "/community/repositories"), json=data, timeout=10.0
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
@@ -1957,7 +2016,7 @@ async def community_sync_repository(request: Request, repo_id: str):
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.post(
-                f"{SERVICE_URLS['plugins']}/community/repositories/{repo_id}/sync",
+                _build_service_url("plugins", f"/community/repositories/{repo_id}/sync"),
                 timeout=20.0,
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
@@ -1966,7 +2025,7 @@ async def community_sync_repository(request: Request, repo_id: str):
 
 
 async def _proxy_get(
-    service: str, path: str, params: Optional[dict] = None, timeout: float = 10.0
+    service: str, path: str, params: dict | None = None, timeout: float = 10.0
 ) -> JSONResponse:
     async with httpx.AsyncClient() as client:
         try:
@@ -2140,7 +2199,7 @@ async def bugbounty_report_templates(request: Request):
 @limiter.limit("120/minute")
 async def phase5_proxy(request: Request, path: str):
     params = dict(request.query_params)
-    url = f"{SERVICE_URLS['phase5']}/{path}"
+    url = _build_service_url("phase5", f"/{path}")
     async with httpx.AsyncClient() as client:
         try:
             if request.method == "GET":
@@ -2181,7 +2240,7 @@ async def register_agent(request: Request) -> JSONResponse:
     try:
         async with httpx.AsyncClient() as http_client:
             auth_resp = await http_client.get(
-                f"{SERVICE_URLS['auth']}/apikeys/validate",
+                _build_service_url("auth", "/apikeys/validate"),
                 headers={"X-API-Key": api_key},
                 timeout=5.0,
             )
@@ -2202,6 +2261,8 @@ async def register_agent(request: Request) -> JSONResponse:
 
     # Reuse existing agent_id if provided and already registered by this user
     requested_id = body.get("agent_id")
+    if requested_id:
+        requested_id = _validate_uuid_param(requested_id, "agent_id")
     if requested_id and requested_id in _registered_agents:
         existing = _registered_agents[requested_id]
         if existing.get("user_id") == user_id:
@@ -2259,7 +2320,7 @@ async def list_agents(request: Request) -> JSONResponse:
     try:
         async with httpx.AsyncClient() as http_client:
             verify_resp = await http_client.get(
-                f"{SERVICE_URLS['auth']}/me",
+                _build_service_url("auth", "/me"),
                 headers={"Authorization": f"Bearer {token}"},
                 timeout=5.0,
             )
@@ -2294,6 +2355,13 @@ async def agent_websocket(websocket: WebSocket, agent_id: str) -> None:
     the auth service and the ``agent_id`` must be already registered under that key's
     owner before the socket is accepted.  Sends a heartbeat every 30 s.
     """
+    # Validate agent_id to prevent log injection / path traversal
+    if not _RE_ALPHANUMERIC_ID.match(agent_id):
+        await websocket.close(code=4002)
+        return
+    # Create a sanitized copy for all log messages
+    safe_agent_id = _sanitize_log(agent_id)
+
     api_key = websocket.query_params.get("api_key") or websocket.headers.get("x-api-key")
     if not api_key:
         await websocket.close(code=4001)
@@ -2303,7 +2371,7 @@ async def agent_websocket(websocket: WebSocket, agent_id: str) -> None:
     try:
         async with httpx.AsyncClient() as http_client:
             auth_resp = await http_client.get(
-                f"{SERVICE_URLS['auth']}/apikeys/validate",
+                _build_service_url("auth", "/apikeys/validate"),
                 headers={"X-API-Key": api_key},
                 timeout=5.0,
             )
@@ -2316,7 +2384,7 @@ async def agent_websocket(websocket: WebSocket, agent_id: str) -> None:
                 if registered and registered.get("user_id") not in (key_owner, "anonymous"):
                     logger.warning(
                         "Agent %s ownership mismatch: key owner %s, registered owner %s",
-                        agent_id,
+                        safe_agent_id,
                         _sanitize_log(key_owner),
                         _sanitize_log(registered.get("user_id")),
                     )
@@ -2332,7 +2400,7 @@ async def agent_websocket(websocket: WebSocket, agent_id: str) -> None:
     if agent_id in _registered_agents:
         _registered_agents[agent_id]["status"] = "connected"
 
-    logger.info("Agent %s WebSocket connected", agent_id)
+    logger.info("Agent %s WebSocket connected", safe_agent_id)
 
     heartbeat_task = asyncio.create_task(_agent_heartbeat(websocket, agent_id))
 
@@ -2342,7 +2410,7 @@ async def agent_websocket(websocket: WebSocket, agent_id: str) -> None:
             try:
                 msg = json.loads(raw)
             except Exception:
-                logger.warning("Agent %s sent non-JSON message", agent_id)
+                logger.warning("Agent %s sent non-JSON message", safe_agent_id)
                 continue
 
             msg_type = msg.get("type")
@@ -2353,20 +2421,20 @@ async def agent_websocket(websocket: WebSocket, agent_id: str) -> None:
                 finding = msg.get("payload", {})
                 logger.info(
                     "Agent %s submitted finding: %s",
-                    agent_id,
+                    safe_agent_id,
                     _sanitize_log(finding.get("title")),
                 )
             elif msg_type == "scan_complete":
                 logger.info(
                     "Agent %s scan complete: %s",
-                    agent_id,
+                    safe_agent_id,
                     _sanitize_log(msg.get("scan_id")),
                 )
             else:
-                logger.debug("Agent %s unknown message type: %s", agent_id, msg_type)
+                logger.debug("Agent %s unknown message type: %s", safe_agent_id, msg_type)
 
     except WebSocketDisconnect:
-        logger.info("Agent %s WebSocket disconnected", agent_id)
+        logger.info("Agent %s WebSocket disconnected", safe_agent_id)
     finally:
         heartbeat_task.cancel()
         _agent_ws_connections.pop(agent_id, None)
