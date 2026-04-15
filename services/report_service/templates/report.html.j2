@@ -1,0 +1,11 @@
+<html><body>
+<h1>CosmicSec Report</h1>
+<p>Scan ID: {{ scan_id }}</p>
+<p>Generated: {{ generated_at }}</p>
+<table border='1' cellspacing='0' cellpadding='5'>
+  <tr><th>Title</th><th>Severity</th><th>Category</th><th>Description</th></tr>
+  {% for f in findings %}
+  <tr><td>{{ f.get("title", "") }}</td><td>{{ f.get("severity", "") }}</td><td>{{ f.get("category", "") }}</td><td>{{ f.get("description", "") }}</td></tr>
+  {% endfor %}
+</table>
+</body></html>

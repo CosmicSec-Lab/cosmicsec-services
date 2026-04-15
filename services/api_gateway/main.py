@@ -6,6 +6,7 @@ Main entry point for all API requests with routing, authentication, and rate lim
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 import urllib.parse
@@ -168,7 +169,7 @@ def get_user_identifier(request: Request) -> str:
                 sub = claims.get("sub") or claims.get("user_id")
                 if sub:
                     return f"user:{sub}"
-        except Exception:
+        except (ValueError, json.JSONDecodeError):
             pass
     return get_remote_address(request)
 
@@ -189,16 +190,69 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # CORS middleware
+_cors_origins_raw = os.environ.get(
+    "COSMICSEC_CORS_ORIGINS", "http://localhost:3000,http://localhost:4173"
+)
+_cors_origins = [o.strip() for o in _cors_origins_raw.split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure this properly in production
-    allow_credentials=True,
+    allow_origins=_cors_origins,
+    allow_credentials="*" not in _cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # GZip compression
 app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+# ---------------------------------------------------------------------------
+# Maximum request body size (1 MB default, 10 MB for upload endpoints)
+# ---------------------------------------------------------------------------
+_MAX_BODY_DEFAULT = 1 * 1024 * 1024  # 1 MB
+_MAX_BODY_UPLOAD = 10 * 1024 * 1024  # 10 MB
+_UPLOAD_PATH_PREFIXES = ("/api/upload", "/api/reports/upload", "/api/plugins/upload")
+
+
+@app.middleware("http")
+async def request_body_size_limit_middleware(request: Request, call_next):
+    """Reject requests whose Content-Length exceeds the allowed maximum."""
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            length = int(content_length)
+        except ValueError:
+            return JSONResponse(status_code=400, content={"detail": "Invalid Content-Length"})
+        limit = (
+            _MAX_BODY_UPLOAD
+            if request.url.path.startswith(_UPLOAD_PATH_PREFIXES)
+            else _MAX_BODY_DEFAULT
+        )
+        if length > limit:
+            return JSONResponse(
+                status_code=413,
+                content={"detail": f"Request body too large (max {limit} bytes)"},
+            )
+    return await call_next(request)
+
+
+# ---------------------------------------------------------------------------
+# HTTP Security Headers
+# ---------------------------------------------------------------------------
+
+
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    """Add standard HTTP security headers to every response."""
+    response = await call_next(request)
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-XSS-Protection"] = "0"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    host = request.headers.get("host", "")
+    if not host.startswith("localhost") and not host.startswith("127.0.0.1"):
+        response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
+    return response
 
 
 @app.middleware("http")
@@ -390,7 +444,7 @@ async def api_status(request: Request):
                     "status": "healthy" if response.status_code == 200 else "unhealthy",
                     "response_time": response.elapsed.total_seconds(),
                 }
-            except Exception as e:
+            except httpx.HTTPError as e:
                 service_status[service_name] = {"status": "unreachable", "error": str(e)}
 
     response_body = {
@@ -429,28 +483,28 @@ async def dashboard_summary(request: Request):
         try:
             resp = await client.get(_build_service_url("scan", "/stats"), timeout=5.0)
             results["scan_stats"] = resp.json()
-        except Exception:
+        except httpx.HTTPError:
             results["scan_stats"] = {"error": "unavailable"}
 
         # Active collaboration stats
         try:
             resp = await client.get(_build_service_url("collab", "/activity-feed"), timeout=5.0)
             results["collab_activity"] = {"total_events": resp.json().get("total_events", 0)}
-        except Exception:
+        except httpx.HTTPError:
             results["collab_activity"] = {"error": "unavailable"}
 
         # Plugin ecosystem status
         try:
             resp = await client.get(_build_service_url("plugins", "/plugins"), timeout=5.0)
             results["plugins"] = {"total": len(resp.json().get("plugins", []))}
-        except Exception:
+        except httpx.HTTPError:
             results["plugins"] = {"error": "unavailable"}
 
         # Integration service signals
         try:
             resp = await client.get(_build_service_url("report", "/health"), timeout=5.0)
             results["report_service"] = resp.json()
-        except Exception:
+        except httpx.HTTPError:
             results["report_service"] = {"error": "unavailable"}
 
     response_body = {
@@ -500,7 +554,7 @@ async def dashboard_overview(request: Request):
                 total_scans = data.get("total_scans", 0)
                 critical_findings = data.get("critical_findings", 0)
                 findings_last_7d = data.get("findings_last_7d", 0)
-        except Exception:
+        except httpx.HTTPError:
             pass
 
         # Agent sessions
@@ -511,7 +565,7 @@ async def dashboard_overview(request: Request):
                 active_agents = len(
                     [a for a in data.get("agents", []) if a.get("status") == "online"]
                 )
-        except Exception:
+        except httpx.HTTPError:
             pass
 
         # Bug bounty open count
@@ -522,7 +576,7 @@ async def dashboard_overview(request: Request):
             if resp.status_code == 200:
                 data = resp.json()
                 open_bugs = len(data.get("items", []))
-        except Exception:
+        except httpx.HTTPError:
             pass
 
     # Derive security score (0-100) from available metrics
@@ -566,7 +620,7 @@ async def register(request: Request):
                 _build_service_url("auth", "/register"), json=data, timeout=10.0
             )
             return JSONResponse(status_code=response.status_code, content=response.json())
-        except Exception as e:
+        except httpx.HTTPError as e:
             logger.error(f"Auth service error: {e}")
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -620,7 +674,7 @@ async def create_api_key(request: Request):
                 _build_service_url("auth", "/apikeys"), json=data, headers=headers, timeout=10.0
             )
             return JSONResponse(status_code=response.status_code, content=response.json())
-        except Exception as e:
+        except httpx.HTTPError as e:
             logger.error("Auth service error: %s", e)
             raise HTTPException(status_code=503, detail="Authentication service unavailable")
 
@@ -638,7 +692,7 @@ async def list_api_keys(request: Request):
                 _build_service_url("auth", "/apikeys"), headers=headers, timeout=10.0
             )
             return JSONResponse(status_code=response.status_code, content=response.json())
-        except Exception as e:
+        except httpx.HTTPError as e:
             logger.error("Auth service error: %s", e)
             raise HTTPException(status_code=503, detail="Authentication service unavailable")
 
@@ -659,7 +713,7 @@ async def delete_api_key(request: Request, key_id: str):
                 _build_service_url("auth", f"/apikeys/{key_id}"), headers=headers, timeout=10.0
             )
             return JSONResponse(status_code=response.status_code, content=response.json())
-        except Exception as e:
+        except httpx.HTTPError as e:
             logger.error("Auth service error: %s", e)
             raise HTTPException(status_code=503, detail="Authentication service unavailable")
 
@@ -674,7 +728,7 @@ async def gdpr_export(request: Request):
                 _build_service_url("auth", "/gdpr/export"), params=params, timeout=10.0
             )
             return JSONResponse(status_code=response.status_code, content=response.json())
-        except Exception as e:
+        except httpx.HTTPError as e:
             logger.error(f"Auth service error: {e}")
             raise HTTPException(status_code=503, detail="Authentication service unavailable")
 
@@ -689,7 +743,7 @@ async def gdpr_delete(request: Request):
                 _build_service_url("auth", "/gdpr/delete"), params=params, timeout=10.0
             )
             return JSONResponse(status_code=response.status_code, content=response.json())
-        except Exception as e:
+        except httpx.HTTPError as e:
             logger.error(f"Auth service error: {e}")
             raise HTTPException(status_code=503, detail="Authentication service unavailable")
 
@@ -812,7 +866,7 @@ async def ai_analyze_agent(request: Request):
                 timeout=30.0,
             )
             return JSONResponse(status_code=response.status_code, content=response.json())
-        except Exception as e:
+        except httpx.HTTPError as e:
             logger.error(f"AI service error: {e}")
             raise HTTPException(status_code=503, detail="AI service unavailable")
 
@@ -830,7 +884,7 @@ async def ai_mitre(request: Request):
                 timeout=10.0,
             )
             return JSONResponse(status_code=response.status_code, content=response.json())
-        except Exception as e:
+        except httpx.HTTPError as e:
             logger.error(f"AI service error: {e}")
             raise HTTPException(status_code=503, detail="AI service unavailable")
 
@@ -848,7 +902,7 @@ async def ai_nl_query(request: Request):
                 timeout=20.0,
             )
             return JSONResponse(status_code=response.status_code, content=response.json())
-        except Exception as e:
+        except httpx.HTTPError as e:
             logger.error(f"AI service error: {e}")
             raise HTTPException(status_code=503, detail="AI service unavailable")
 
@@ -866,7 +920,7 @@ async def ai_kb_ingest(request: Request):
                 timeout=10.0,
             )
             return JSONResponse(status_code=response.status_code, content=response.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="AI service unavailable")
 
 
@@ -878,7 +932,7 @@ async def ai_kb_stats(request: Request):
         try:
             response = await client.get(_build_service_url("ai", "/kb/stats"), timeout=5.0)
             return JSONResponse(status_code=response.status_code, content=response.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="AI service unavailable")
 
 
@@ -1158,7 +1212,7 @@ async def threat_intel_ip(request: Request):
                 _build_service_url("report", "/threat-intel/ip"), params=params, timeout=5.0
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Integration service unavailable")
 
 
@@ -1172,7 +1226,7 @@ async def threat_intel_domain(request: Request):
                 _build_service_url("report", "/threat-intel/domain"), params=params, timeout=5.0
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Integration service unavailable")
 
 
@@ -1184,7 +1238,7 @@ async def ci_build(request: Request):
         try:
             resp = await client.post(_build_service_url("report", "/ci/build"), json=data, timeout=10.0)
             return JSONResponse(status_code=resp.status_code, content=resp.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Integration service unavailable")
 
 
@@ -1386,7 +1440,7 @@ async def collab_list_rooms(request: Request):
         try:
             response = await client.get(_build_service_url("collab", "/rooms"), timeout=5.0)
             return JSONResponse(status_code=response.status_code, content=response.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Collab service unavailable")
 
 
@@ -1402,7 +1456,7 @@ async def collab_get_messages(request: Request, room_id: str):
                 timeout=5.0,
             )
             return JSONResponse(status_code=response.status_code, content=response.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Collab service unavailable")
 
 
@@ -1418,7 +1472,7 @@ async def collab_post_message(request: Request, room_id: str):
                 timeout=5.0,
             )
             return JSONResponse(status_code=response.status_code, content=response.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Collab service unavailable")
 
 
@@ -1431,7 +1485,7 @@ async def collab_presence(request: Request, room_id: str):
                 _build_service_url("collab", f"/rooms/{room_id}/presence"), timeout=5.0
             )
             return JSONResponse(status_code=response.status_code, content=response.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Collab service unavailable")
 
 
@@ -1445,7 +1499,7 @@ async def collab_activity_feed(request: Request):
                 _build_service_url("collab", "/activity-feed"), params=params, timeout=5.0
             )
             return JSONResponse(status_code=response.status_code, content=response.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Collab service unavailable")
 
 
@@ -1461,7 +1515,7 @@ async def plugins_list(request: Request):
         try:
             response = await client.get(_build_service_url("plugins", "/plugins"), timeout=5.0)
             return JSONResponse(status_code=response.status_code, content=response.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Plugin registry unavailable")
 
 
@@ -1473,7 +1527,7 @@ async def plugin_detail(request: Request, name: str):
         try:
             response = await client.get(_build_service_url("plugins", f"/plugins/{name}"), timeout=5.0)
             return JSONResponse(status_code=response.status_code, content=response.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Plugin registry unavailable")
 
 
@@ -1490,7 +1544,7 @@ async def plugin_run(request: Request, name: str):
                 timeout=30.0,
             )
             return JSONResponse(status_code=response.status_code, content=response.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Plugin registry unavailable")
 
 
@@ -1504,7 +1558,7 @@ async def plugin_enable(request: Request, name: str):
                 _build_service_url("plugins", f"/plugins/{name}/enable"), timeout=5.0
             )
             return JSONResponse(status_code=response.status_code, content=response.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Plugin registry unavailable")
 
 
@@ -1518,7 +1572,7 @@ async def plugin_disable(request: Request, name: str):
                 _build_service_url("plugins", f"/plugins/{name}/disable"), timeout=5.0
             )
             return JSONResponse(status_code=response.status_code, content=response.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Plugin registry unavailable")
 
 
@@ -1539,7 +1593,7 @@ async def scan_monitor_schedule(request: Request):
                 _build_service_url("scan", "/monitor/schedule"), json=data, timeout=10.0
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Scan service unavailable")
 
 
@@ -1550,7 +1604,7 @@ async def scan_monitor_jobs(request: Request):
         try:
             resp = await client.get(_build_service_url("scan", "/monitor/jobs"), timeout=5.0)
             return JSONResponse(status_code=resp.status_code, content=resp.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Scan service unavailable")
 
 
@@ -1561,7 +1615,7 @@ async def scan_monitor_job_detail(request: Request, job_id: str):
         try:
             resp = await client.get(_build_service_url("scan", f"/monitor/jobs/{job_id}"), timeout=5.0)
             return JSONResponse(status_code=resp.status_code, content=resp.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Scan service unavailable")
 
 
@@ -1575,7 +1629,7 @@ async def scan_monitor_pause(request: Request, job_id: str):
                 _build_service_url("scan", f"/monitor/jobs/{job_id}/pause"), timeout=5.0
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Scan service unavailable")
 
 
@@ -1589,7 +1643,7 @@ async def scan_monitor_resume(request: Request, job_id: str):
                 _build_service_url("scan", f"/monitor/jobs/{job_id}/resume"), timeout=5.0
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Scan service unavailable")
 
 
@@ -1600,7 +1654,7 @@ async def scan_monitor_cancel(request: Request, job_id: str):
         try:
             resp = await client.delete(_build_service_url("scan", f"/monitor/jobs/{job_id}"), timeout=5.0)
             return JSONResponse(status_code=resp.status_code, content=resp.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Scan service unavailable")
 
 
@@ -1616,7 +1670,7 @@ async def scans_fuzz(request: Request):
         try:
             resp = await client.post(_build_service_url("scan", "/scans/fuzz"), json=data, timeout=60.0)
             return JSONResponse(status_code=resp.status_code, content=resp.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Scan service unavailable")
 
 
@@ -1634,7 +1688,7 @@ async def scans_container(request: Request):
                 _build_service_url("scan", "/scans/container"), json=data, timeout=30.0
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Scan service unavailable")
 
 
@@ -1652,7 +1706,7 @@ async def scans_smart_plan(request: Request):
                 _build_service_url("scan", "/scans/smart-plan"), json=data, timeout=30.0
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Scan service unavailable")
 
 
@@ -1668,7 +1722,7 @@ async def scans_cloud(request: Request):
         try:
             resp = await client.post(_build_service_url("scan", "/scans/cloud"), json=data, timeout=30.0)
             return JSONResponse(status_code=resp.status_code, content=resp.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Scan service unavailable")
 
 
@@ -1685,7 +1739,7 @@ async def scan_register_node(request: Request):
                 _build_service_url("scan", "/distributed/nodes/register"), json=data, timeout=10.0
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Scan service unavailable")
 
 
@@ -1696,7 +1750,7 @@ async def scan_list_nodes(request: Request):
         try:
             resp = await client.get(_build_service_url("scan", "/distributed/nodes"), timeout=5.0)
             return JSONResponse(status_code=resp.status_code, content=resp.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Scan service unavailable")
 
 
@@ -1712,7 +1766,7 @@ async def scan_node_heartbeat(request: Request, node_id: str):
                 timeout=5.0,
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Scan service unavailable")
 
 
@@ -1726,7 +1780,7 @@ async def scan_distributed_assign(request: Request):
                 _build_service_url("scan", "/distributed/assign"), json=data, timeout=10.0
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Scan service unavailable")
 
 
@@ -1740,7 +1794,7 @@ async def scan_distributed_complete(request: Request, node_id: str):
                 timeout=5.0,
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Scan service unavailable")
 
 
@@ -1760,7 +1814,7 @@ async def ai_agent_autonomous(request: Request):
                 _build_service_url("ai", "/agent/autonomous"), json=data, timeout=60.0
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="AI service unavailable")
 
 
@@ -1775,7 +1829,7 @@ async def ai_exploit_suggest(request: Request):
                 _build_service_url("ai", "/exploit/suggest"), json=data, timeout=30.0
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="AI service unavailable")
 
 
@@ -1788,7 +1842,7 @@ async def ai_anomaly_fit(request: Request):
         try:
             resp = await client.post(_build_service_url("ai", "/anomaly/fit"), json=data, timeout=30.0)
             return JSONResponse(status_code=resp.status_code, content=resp.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="AI service unavailable")
 
 
@@ -1803,7 +1857,7 @@ async def ai_anomaly_detect(request: Request):
                 _build_service_url("ai", "/anomaly/detect"), json=data, timeout=15.0
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="AI service unavailable")
 
 
@@ -1816,7 +1870,7 @@ async def ai_anomaly_batch(request: Request):
         try:
             resp = await client.post(_build_service_url("ai", "/anomaly/batch"), json=data, timeout=30.0)
             return JSONResponse(status_code=resp.status_code, content=resp.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="AI service unavailable")
 
 
@@ -1836,7 +1890,7 @@ async def collab_create_report_section(request: Request, room_id: str):
                 _build_service_url("collab", f"/rooms/{room_id}/reports"), json=data, timeout=10.0
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Collab service unavailable")
 
 
@@ -1850,7 +1904,7 @@ async def collab_list_report_sections(request: Request, room_id: str):
                 _build_service_url("collab", f"/rooms/{room_id}/reports"), timeout=5.0
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Collab service unavailable")
 
 
@@ -1866,7 +1920,7 @@ async def collab_update_report_section(request: Request, room_id: str, section_i
                 timeout=10.0,
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Collab service unavailable")
 
 
@@ -1880,7 +1934,7 @@ async def collab_delete_report_section(request: Request, room_id: str, section_i
                 timeout=5.0,
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Collab service unavailable")
 
 
@@ -1894,7 +1948,7 @@ async def collab_section_history(request: Request, room_id: str, section_id: str
                 timeout=5.0,
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Collab service unavailable")
 
 
@@ -1912,7 +1966,7 @@ async def marketplace_list(request: Request):
                 _build_service_url("plugins", "/marketplace"), params=params, timeout=5.0
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Plugin registry unavailable")
 
 
@@ -1927,7 +1981,7 @@ async def marketplace_publish(request: Request):
                 _build_service_url("plugins", "/marketplace/publish"), json=data, timeout=10.0
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Plugin registry unavailable")
 
 
@@ -1942,7 +1996,7 @@ async def plugin_rate(request: Request, name: str):
                 _build_service_url("plugins", f"/plugins/{name}/rate"), json=data, timeout=5.0
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Plugin registry unavailable")
 
 
@@ -1954,7 +2008,7 @@ async def plugin_rating(request: Request, name: str):
         try:
             resp = await client.get(_build_service_url("plugins", f"/plugins/{name}/rating"), timeout=5.0)
             return JSONResponse(status_code=resp.status_code, content=resp.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Plugin registry unavailable")
 
 
@@ -1965,7 +2019,7 @@ async def plugins_updates(request: Request):
         try:
             resp = await client.get(_build_service_url("plugins", "/plugins/updates"), timeout=5.0)
             return JSONResponse(status_code=resp.status_code, content=resp.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Plugin registry unavailable")
 
 
@@ -1979,7 +2033,7 @@ async def plugin_auto_update(request: Request, name: str):
                 _build_service_url("plugins", f"/plugins/{name}/auto-update"), timeout=10.0
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Plugin registry unavailable")
 
 
@@ -1992,7 +2046,7 @@ async def community_repositories(request: Request):
                 _build_service_url("plugins", "/community/repositories"), timeout=5.0
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Plugin registry unavailable")
 
 
@@ -2006,7 +2060,7 @@ async def community_register_repository(request: Request):
                 _build_service_url("plugins", "/community/repositories"), json=data, timeout=10.0
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Plugin registry unavailable")
 
 
@@ -2020,7 +2074,7 @@ async def community_sync_repository(request: Request, repo_id: str):
                 timeout=20.0,
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Plugin registry unavailable")
 
 
@@ -2033,7 +2087,7 @@ async def _proxy_get(
                 f"{SERVICE_URLS[service]}{path}", params=params, timeout=timeout
             )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail=f"{service} service unavailable")
 
 
@@ -2042,7 +2096,7 @@ async def _proxy_post(service: str, path: str, data: dict, timeout: float = 10.0
         try:
             resp = await client.post(f"{SERVICE_URLS[service]}{path}", json=data, timeout=timeout)
             return JSONResponse(status_code=resp.status_code, content=resp.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail=f"{service} service unavailable")
 
 
@@ -2208,7 +2262,7 @@ async def phase5_proxy(request: Request, path: str):
                 data = await request.json()
                 resp = await client.post(url, json=data, params=params, timeout=20.0)
             return JSONResponse(status_code=resp.status_code, content=resp.json())
-        except Exception:
+        except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="phase5 service unavailable")
 
 
@@ -2251,7 +2305,7 @@ async def register_agent(request: Request) -> JSONResponse:
             # Other errors (503, etc.) → allow registration with degraded user_id
     except HTTPException:
         raise
-    except Exception as exc:
+    except httpx.HTTPError as exc:
         logger.warning(
             "Could not validate API key with auth service: %s — proceeding in degraded mode", exc
         )
@@ -2332,7 +2386,7 @@ async def list_agents(request: Request) -> JSONResponse:
                 raise HTTPException(status_code=401, detail="Invalid or expired token")
     except HTTPException:
         raise
-    except Exception as exc:
+    except httpx.HTTPError as exc:
         logger.warning("Could not validate token with auth service: %s", exc)
         raise HTTPException(status_code=503, detail="Authentication service unavailable")
 
@@ -2390,7 +2444,7 @@ async def agent_websocket(websocket: WebSocket, agent_id: str) -> None:
                     )
                     await websocket.close(code=4003)
                     return
-    except Exception as exc:
+    except httpx.HTTPError as exc:
         logger.warning(
             "Auth service unreachable during WebSocket auth: %s — proceeding in degraded mode", exc
         )
@@ -2409,7 +2463,7 @@ async def agent_websocket(websocket: WebSocket, agent_id: str) -> None:
             raw = await websocket.receive_text()
             try:
                 msg = json.loads(raw)
-            except Exception:
+            except json.JSONDecodeError:
                 logger.warning("Agent %s sent non-JSON message", safe_agent_id)
                 continue
 

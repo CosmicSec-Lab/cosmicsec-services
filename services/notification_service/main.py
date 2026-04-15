@@ -104,7 +104,7 @@ def _dispatch(config: dict, event: NotificationEvent) -> None:
                 config["config"], {"event_type": event.event_type, "payload": event.payload}
             )
         _metrics["notifications_sent_total"] += 1
-    except Exception:
+    except (smtplib.SMTPException, httpx.HTTPError, OSError):
         _metrics["notification_errors_total"] += 1
         raise
 
@@ -175,7 +175,7 @@ def send_notification(event: NotificationEvent) -> dict:
         try:
             _dispatch(config, event)
             sent.append(config["id"])
-        except Exception:
+        except (smtplib.SMTPException, httpx.HTTPError, OSError):
             errors.append(f"Failed to send to config {config['id']}")
 
     return {
@@ -200,7 +200,7 @@ def test_notification(req: TestNotificationRequest) -> dict:
     try:
         _dispatch(config, event)
         return {"success": True, "config_id": req.config_id, "message": req.message}
-    except Exception:
+    except (smtplib.SMTPException, httpx.HTTPError, OSError):
         return {
             "success": False,
             "config_id": req.config_id,

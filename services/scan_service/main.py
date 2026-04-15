@@ -27,12 +27,12 @@ from services.common.observability import setup_observability
 
 try:
     from celery import Celery
-except Exception:  # pragma: no cover
+except ImportError:  # pragma: no cover
     Celery = None
 
 try:
     from pymongo import MongoClient
-except Exception:  # pragma: no cover
+except ImportError:  # pragma: no cover
     MongoClient = None
 
 # Phase 2 modules
@@ -137,7 +137,7 @@ async def _fetch_org_quotas(org_id: str) -> dict[str, int]:
             resp = await client.get(f"{AUTH_SERVICE_URL}/orgs/{org_id}/quotas", timeout=5.0)
             if resp.status_code == 200:
                 return resp.json().get("quotas", {})
-    except Exception:
+    except httpx.HTTPError:
         pass
     return {}
 

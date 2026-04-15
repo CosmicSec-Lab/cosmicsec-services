@@ -10,6 +10,8 @@ Provides:
 
 from __future__ import annotations
 
+import json
+import logging
 import uuid
 from datetime import UTC, datetime
 from typing import Any
@@ -20,7 +22,10 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from services.common.db import get_db
+from services.common.jwt_utils import decode_token
 from services.common.models import CollabMessageModel, CollabReportSectionModel
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="CosmicSec Collaboration Service",
@@ -66,7 +71,7 @@ class _Room:
                 continue
             try:
                 await ws.send_json(event)
-            except Exception:
+            except (WebSocketDisconnect, RuntimeError, OSError):
                 dead.append(user)
         for u in dead:
             self.connections.pop(u, None)
@@ -127,7 +132,7 @@ async def room_websocket(websocket: WebSocket, room_id: str):
     Join a collaboration room over WebSocket.
 
     Query params:
-        username — required, identifies the connecting user.
+        token — JWT token for authentication (required).
 
     Events emitted as JSON:
         {type: "presence",    room, present_users}
@@ -135,7 +140,23 @@ async def room_websocket(websocket: WebSocket, room_id: str):
         {type: "scan_update", room, state, updated_by, ts}
         {type: "user_left",   room, username, present_users}
     """
-    username: str = websocket.query_params.get("username", f"user_{uuid.uuid4().hex[:6]}")
+    token: str | None = websocket.query_params.get("token")
+    if not token:
+        await websocket.close(code=4001)
+        return
+
+    claims = decode_token(token)
+    if claims is None:
+        await websocket.close(code=4001)
+        return
+
+    user_id: str = claims.get("user_id", "")
+    username: str = claims.get("email") or claims.get("sub") or user_id or f"user_{uuid.uuid4().hex[:6]}"
+    if not user_id:
+        logger.warning("JWT token missing user_id claim")
+        await websocket.close(code=4001)
+        return
+
     await websocket.accept()
     room = _get_or_create_room(room_id)
     room.add_connection(username, websocket)
@@ -153,7 +174,20 @@ async def room_websocket(websocket: WebSocket, room_id: str):
 
     try:
         while True:
-            data = await websocket.receive_json()
+            try:
+                data = await websocket.receive_json()
+            except (json.JSONDecodeError, ValueError):
+                await websocket.send_json(
+                    {"type": "error", "detail": "Invalid JSON payload"}
+                )
+                continue
+
+            if not isinstance(data, dict) or "type" not in data:
+                await websocket.send_json(
+                    {"type": "error", "detail": "Message must be a JSON object with a 'type' field"}
+                )
+                continue
+
             ev_type = data.get("type", "message")
 
             if ev_type == "message":

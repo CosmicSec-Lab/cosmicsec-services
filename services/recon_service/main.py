@@ -27,7 +27,7 @@ def _dns_recon(target: str) -> dict:
     try:
         _, _, ips = socket.gethostbyname_ex(target)
         result["ips"] = sorted(set(ips))
-    except Exception as exc:
+    except OSError as exc:
         result["errors"].append(str(exc))
     return result
 
@@ -47,7 +47,7 @@ async def _shodan_lookup(client: httpx.AsyncClient, target: str) -> dict:
             "subdomains": body.get("subdomains", [])[:25],
             "data_preview": body.get("data", [])[:5],
         }
-    except Exception as exc:
+    except (httpx.HTTPError, ValueError) as exc:
         return {"enabled": True, "error": str(exc)}
 
 
@@ -63,7 +63,7 @@ async def _virustotal_lookup(client: httpx.AsyncClient, target: str) -> dict:
         response.raise_for_status()
         stats = response.json().get("data", {}).get("attributes", {}).get("last_analysis_stats", {})
         return {"enabled": True, "analysis_stats": stats}
-    except Exception as exc:
+    except (httpx.HTTPError, ValueError) as exc:
         return {"enabled": True, "error": str(exc)}
 
 
@@ -82,7 +82,7 @@ async def _crtsh_lookup(client: httpx.AsyncClient, target: str) -> dict:
                 if clean and clean.endswith(target.lower()):
                     names.add(clean)
         return {"enabled": True, "subdomains": sorted(names)[:50]}
-    except Exception as exc:
+    except (httpx.HTTPError, ValueError) as exc:
         return {"enabled": True, "error": str(exc)}
 
 
@@ -101,7 +101,7 @@ async def _rdap_lookup(client: httpx.AsyncClient, target: str) -> dict:
             "events_preview": events[:3],
             "nameservers": nameservers[:10],
         }
-    except Exception as exc:
+    except (httpx.HTTPError, ValueError) as exc:
         return {"enabled": True, "error": str(exc)}
 
 
