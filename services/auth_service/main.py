@@ -11,7 +11,7 @@ import os
 import secrets
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 from urllib.parse import urlencode
 
 import bcrypt as bcrypt_lib
@@ -80,9 +80,9 @@ class Token(BaseModel):
 
 
 class TokenData(BaseModel):
-    email: Optional[str] = None
-    user_id: Optional[str] = None
-    role: Optional[str] = None
+    email: str | None = None
+    user_id: str | None = None
+    role: str | None = None
 
 
 class User(BaseModel):
@@ -119,9 +119,9 @@ class RefreshRequest(BaseModel):
 
 
 class UserUpdate(BaseModel):
-    full_name: Optional[str] = None
-    role: Optional[str] = None
-    is_active: Optional[bool] = None
+    full_name: str | None = None
+    role: str | None = None
+    is_active: bool | None = None
 
 
 class RoleAssignRequest(BaseModel):
@@ -160,7 +160,7 @@ class OrganizationCreate(BaseModel):
 
 class WorkspaceCreate(BaseModel):
     name: str
-    description: Optional[str] = None
+    description: str | None = None
     quota_scans_per_day: int = Field(default=100, ge=1, le=100000)
 
 
@@ -170,9 +170,9 @@ class OrganizationMemberAssign(BaseModel):
 
 
 class TenantQuotaUpdate(BaseModel):
-    max_users: Optional[int] = Field(default=None, ge=1, le=100000)
-    max_workspaces: Optional[int] = Field(default=None, ge=1, le=100000)
-    max_scans_per_day: Optional[int] = Field(default=None, ge=1, le=1000000)
+    max_users: int | None = Field(default=None, ge=1, le=100000)
+    max_workspaces: int | None = Field(default=None, ge=1, le=100000)
+    max_scans_per_day: int | None = Field(default=None, ge=1, le=1000000)
 
 
 class BillingCustomerCreate(BaseModel):
@@ -234,7 +234,7 @@ tenant_data_residency: dict[str, dict[str, str]] = {}
 vault_store: dict[str, dict[str, str]] = {}
 
 
-def _hash_audit_entry(entry: dict[str, Any], previous_hash: Optional[str]) -> str:
+def _hash_audit_entry(entry: dict[str, Any], previous_hash: str | None) -> str:
     """Generate a tamper-evident hash chain for audit logs."""
     import hashlib
     import json
@@ -247,7 +247,7 @@ def _hash_audit_entry(entry: dict[str, Any], previous_hash: Optional[str]) -> st
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def _audit_entry(action: str, actor: str, detail: str, org_id: Optional[str] = None) -> None:
+def _audit_entry(action: str, actor: str, detail: str, org_id: str | None = None) -> None:
     ts = datetime.utcnow().isoformat()
     entry = {
         "timestamp": ts,
@@ -405,7 +405,7 @@ def get_password_hash(password: str) -> str:
 
 
 # JWT utilities
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+def create_access_token(data: dict, expires_delta: timedelta | None = None) -> str:
     """Create JWT access token"""
     to_encode = data.copy()
     if expires_delta:
@@ -713,7 +713,7 @@ async def oauth_start(provider: str):
 
 
 @app.get("/oauth2/{provider}/callback")
-async def oauth_callback(provider: str, code: str, state: Optional[str] = None):
+async def oauth_callback(provider: str, code: str, state: str | None = None):
     """OAuth callback placeholder that validates provider and returns exchange metadata."""
     provider = provider.lower()
     if provider not in {"google", "github", "microsoft"}:
@@ -928,8 +928,8 @@ async def update_config(
 
 @app.get("/audit-logs")
 async def get_audit_logs(
-    action: Optional[str] = None,
-    actor: Optional[str] = None,
+    action: str | None = None,
+    actor: str | None = None,
     current_user: User = Depends(require_permission("manage")),
 ):
     logs = audit_logs

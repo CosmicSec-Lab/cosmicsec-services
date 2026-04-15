@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC
 from pathlib import Path
 
 import typer  # type: ignore[import-not-found]
@@ -226,12 +227,12 @@ def siem_audit_export(
         raise typer.Exit(1)
 
     # Build sample/mock events for now (in production, query from DB)
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     sample_events = [
         {
             "id": i,
-            "created_at": datetime.now(timezone.utc).isoformat(),
+            "created_at": datetime.now(UTC).isoformat(),
             "user_id": "admin",
             "action": "scan_create",
             "resource": "scan",

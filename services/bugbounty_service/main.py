@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException
@@ -62,7 +62,7 @@ def health() -> dict:
     return {
         "status": "healthy",
         "service": "bugbounty",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
     }
 
 
@@ -166,7 +166,7 @@ def submit_submission(submission_id: str, db: Session = Depends(get_db)) -> dict
     if not entry:
         raise HTTPException(status_code=404, detail="Submission not found")
     entry.status = "submitted"
-    entry.submitted_at = datetime.now(timezone.utc)
+    entry.submitted_at = datetime.now(UTC)
     db.commit()
     db.refresh(entry)
     return _submission_to_dict(entry)
@@ -220,7 +220,7 @@ def collaboration_share(payload: CollaborationShare) -> dict:
         "title": payload.title,
         "message": payload.message,
         "participants": payload.participants,
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": datetime.now(UTC).isoformat(),
     }
     _collaboration_threads.append(entry)
     return entry

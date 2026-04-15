@@ -11,9 +11,9 @@ import asyncio
 import contextlib
 import logging
 import secrets
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine
 from datetime import datetime, timedelta
-from typing import Any, Callable
+from typing import Any
 
 logger = logging.getLogger(__name__)
 

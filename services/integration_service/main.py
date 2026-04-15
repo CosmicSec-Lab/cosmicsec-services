@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 import secrets
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -91,7 +91,7 @@ def _notification_entry(notification_type: str, payload: NotificationRequest) ->
         "channel": payload.channel,
         "message": payload.message,
         "attributes": payload.attributes or {},
-        "sent_at": datetime.now(timezone.utc).isoformat(),
+        "sent_at": datetime.now(UTC).isoformat(),
     }
 
 
@@ -100,7 +100,7 @@ async def health() -> dict:
     return {
         "status": "healthy",
         "service": "integration",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
     }
 
 
@@ -159,7 +159,7 @@ async def ingest_siem(event: SIEMEvent) -> dict:
     entry = {
         **event.model_dump(),
         "id": secrets.token_urlsafe(8),
-        "received_at": datetime.now(timezone.utc).isoformat(),
+        "received_at": datetime.now(UTC).isoformat(),
     }
     siem_events.append(entry)
     forwarded = await _forward_post(SIEM_FORWARD_URL, entry)
@@ -204,7 +204,7 @@ async def create_jira_ticket(ticket: TicketCreate) -> dict:
         "description": ticket.description,
         "priority": ticket.priority,
         "labels": ticket.labels or [],
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": datetime.now(UTC).isoformat(),
     }
     tickets.append(entry)
     forwarded = await _forward_post(JIRA_API_URL, entry)
@@ -222,7 +222,7 @@ async def create_servicenow_ticket(ticket: TicketCreate) -> dict:
         "description": ticket.description,
         "priority": ticket.priority,
         "labels": ticket.labels or [],
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": datetime.now(UTC).isoformat(),
     }
     tickets.append(entry)
     forwarded = await _forward_post(SERVICENOW_API_URL, entry)
@@ -244,7 +244,7 @@ async def create_github_issue(ticket: TicketCreate) -> dict:
         "title": ticket.summary,
         "body": ticket.description,
         "labels": ticket.labels or [],
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": datetime.now(UTC).isoformat(),
     }
     tickets.append(entry)
     forwarded = await _forward_post(GITHUB_ISSUES_API_URL, entry)
@@ -263,7 +263,7 @@ async def create_ticket_webhook(payload: WebhookRequest) -> dict:
         "event_type": payload.event_type,
         "target_url": payload.target_url,
         "payload": payload.payload,
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": datetime.now(UTC).isoformat(),
     }
     webhook_events.append(entry)
     forwarded = await _forward_post(payload.target_url, entry)
@@ -336,7 +336,7 @@ async def threat_intel_ip(ip: str) -> dict:
         "ip": ip,
         "malicious": False,
         "risk_score": 12,
-        "last_seen": datetime.now(timezone.utc).isoformat(),
+        "last_seen": datetime.now(UTC).isoformat(),
         "tags": ["scanner"],
         "notes": "Simulated threat intel response.",
     }
@@ -348,7 +348,7 @@ async def threat_intel_domain(domain: str) -> dict:
         "domain": domain,
         "malicious": False,
         "risk_score": 18,
-        "last_seen": datetime.now(timezone.utc).isoformat(),
+        "last_seen": datetime.now(UTC).isoformat(),
         "tags": ["phishing"],
         "notes": "Simulated threat intelligence lookup.",
     }
@@ -361,7 +361,7 @@ async def ci_build(trigger: dict[str, Any]) -> dict:
         "status": "queued",
         "build_id": build_id,
         "trigger": trigger,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
     }
 
 

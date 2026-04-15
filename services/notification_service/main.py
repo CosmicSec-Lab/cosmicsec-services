@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import smtplib
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from email.mime.text import MIMEText
 from typing import Any
 
@@ -45,7 +45,7 @@ class NotificationConfig(BaseModel):
     channel: str  # "email" | "slack" | "webhook"
     name: str
     config: dict[str, Any] = Field(default_factory=dict)
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 class NotificationEvent(BaseModel):

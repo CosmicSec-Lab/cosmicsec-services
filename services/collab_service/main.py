@@ -11,7 +11,7 @@ Provides:
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect
@@ -45,7 +45,7 @@ class _Room:
 
     def __init__(self, room_id: str):
         self.room_id = room_id
-        self.created_at = datetime.now(timezone.utc).isoformat()
+        self.created_at = datetime.now(UTC).isoformat()
         self.connections: dict[str, WebSocket] = {}
         self.scan_state: dict[str, Any] | None = None
 
@@ -147,7 +147,7 @@ async def room_websocket(websocket: WebSocket, room_id: str):
             "username": username,
             "event": "joined",
             "present_users": room.present_users,
-            "ts": datetime.now(timezone.utc).isoformat(),
+            "ts": datetime.now(UTC).isoformat(),
         }
     )
 
@@ -167,7 +167,7 @@ async def room_websocket(websocket: WebSocket, room_id: str):
                     "text": text,
                     "mentions": mentions,
                     "thread_id": data.get("thread_id"),
-                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "ts": datetime.now(UTC).isoformat(),
                 }
                 await room.broadcast(msg)
 
@@ -184,13 +184,13 @@ async def room_websocket(websocket: WebSocket, room_id: str):
                         "room": room_id,
                         "state": state,
                         "updated_by": username,
-                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "ts": datetime.now(UTC).isoformat(),
                     }
                 )
 
             elif ev_type == "ping":
                 await websocket.send_json(
-                    {"type": "pong", "ts": datetime.now(timezone.utc).isoformat()}
+                    {"type": "pong", "ts": datetime.now(UTC).isoformat()}
                 )
 
     except WebSocketDisconnect:
@@ -201,7 +201,7 @@ async def room_websocket(websocket: WebSocket, room_id: str):
                 "room": room_id,
                 "username": username,
                 "present_users": room.present_users,
-                "ts": datetime.now(timezone.utc).isoformat(),
+                "ts": datetime.now(UTC).isoformat(),
             }
         )
 
@@ -217,7 +217,7 @@ async def health_check() -> dict:
         "status": "healthy",
         "service": "collab",
         "active_rooms": len(_rooms),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
     }
 
 
@@ -291,7 +291,7 @@ async def post_message(
         "thread_id": payload.thread_id,
         "ts": msg_row.created_at.isoformat()
         if msg_row.created_at
-        else datetime.now(timezone.utc).isoformat(),
+        else datetime.now(UTC).isoformat(),
     }
     room = _get_or_create_room(room_id)
     await room.broadcast(msg)
@@ -313,7 +313,7 @@ async def update_scan_state(room_id: str, payload: ScanStateUpdate) -> dict:
             "room": room_id,
             "state": state,
             "updated_by": payload.updated_by,
-            "ts": datetime.now(timezone.utc).isoformat(),
+            "ts": datetime.now(UTC).isoformat(),
         }
     )
     return {"room_id": room_id, "state": state}
@@ -361,7 +361,7 @@ async def create_report_section(
     now = (
         section_row.created_at.isoformat()
         if section_row.created_at
-        else datetime.now(timezone.utc).isoformat()
+        else datetime.now(UTC).isoformat()
     )
     room = _get_or_create_room(room_id)
     await room.broadcast(
@@ -427,7 +427,7 @@ async def update_report_section(
     if section is None:
         raise HTTPException(status_code=404, detail="Section not found")
 
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     history = list(section.edit_history or [])
     history.append(
         {
@@ -490,7 +490,7 @@ async def delete_report_section(
             "room": room_id,
             "section_id": section_id,
             "editor": editor,
-            "ts": datetime.now(timezone.utc).isoformat(),
+            "ts": datetime.now(UTC).isoformat(),
         }
     )
     return {"status": "deleted", "section_id": section_id}
