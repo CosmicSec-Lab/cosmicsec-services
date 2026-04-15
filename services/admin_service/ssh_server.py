@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import os
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 
 import asyncssh  # type: ignore[import-not-found]
 import pyotp  # type: ignore[import-not-found]
 
 from .state import load_state, save_state
-
 
 HOST_KEY_PATH = Path(__file__).resolve().parent / "ssh_host_key"
 
@@ -39,7 +38,9 @@ class CosmicSecSSHServer(asyncssh.SSHServer):
         return True
 
     def validate_public_key(self, username, key):
-        auth_keys_path = Path(os.getenv("COSMICSEC_AUTHORIZED_KEYS", str(Path.home() / ".ssh" / "authorized_keys")))
+        auth_keys_path = Path(
+            os.getenv("COSMICSEC_AUTHORIZED_KEYS", str(Path.home() / ".ssh" / "authorized_keys"))
+        )
         if not auth_keys_path.exists() or username != "admin":
             return False
         authorized = auth_keys_path.read_text(encoding="utf-8", errors="ignore")
@@ -51,7 +52,9 @@ class CosmicSecSSHServer(asyncssh.SSHServer):
 
 class CosmicSecProcess(asyncssh.SSHServerProcess):
     def session_started(self):
-        self._chan.write("CosmicSec admin shell ready. Enter `2fa <code>` before privileged commands.\n")
+        self._chan.write(
+            "CosmicSec admin shell ready. Enter `2fa <code>` before privileged commands.\n"
+        )
         self._mfa_verified = False
         state = load_state()
         state.log("ssh.session.start", datetime.utcnow().isoformat())

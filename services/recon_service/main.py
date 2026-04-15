@@ -130,8 +130,14 @@ async def run_recon(payload: ReconRequest) -> dict:
         "crtsh": crtsh,
         "rdap": rdap,
         "findings": [
-            {"source": "dns", "summary": f"Resolved addresses for {target}: {', '.join(dns['ips']) if dns['ips'] else 'none'}"},
+            {
+                "source": "dns",
+                "summary": f"Resolved addresses for {target}: {', '.join(dns['ips']) if dns['ips'] else 'none'}",
+            },
             {"source": "osint", "summary": f"External intelligence checks completed for {target}"},
-            {"source": "legacy-merge", "summary": "Merged legacy CT-log and WHOIS-style domain intelligence into hybrid recon flow."},
+            {
+                "source": "legacy-merge",
+                "summary": "Merged legacy CT-log and WHOIS-style domain intelligence into hybrid recon flow.",
+            },
         ],
     }

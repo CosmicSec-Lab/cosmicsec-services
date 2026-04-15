@@ -1,10 +1,11 @@
 """Phase 5 Advanced Security Platform Service."""
+
 from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
 from statistics import mean
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from fastapi import Depends, FastAPI
 from pydantic import BaseModel, Field
@@ -13,28 +14,28 @@ from sqlalchemy.orm import Session
 from services.common.db import get_db
 from services.common.models import (
     Phase5AlertModel,
-    Phase5IOCModel,
     Phase5IncidentModel,
+    Phase5IOCModel,
     Phase5PolicyModel,
 )
 
 app = FastAPI(title="CosmicSec Phase 5 Service", version="1.0.0")
 
 # In-memory only for ephemeral/non-critical state
-vendors: Dict[str, Dict[str, Any]] = {}
+vendors: dict[str, dict[str, Any]] = {}
 
 
 class AlertIngest(BaseModel):
     source: str
     severity: str
     title: str
-    payload: Dict[str, Any] = Field(default_factory=dict)
+    payload: dict[str, Any] = Field(default_factory=dict)
 
 
 class IncidentCreate(BaseModel):
     title: str
     severity: str = "medium"
-    evidence: List[str] = Field(default_factory=list)
+    evidence: list[str] = Field(default_factory=list)
 
 
 class HuntQuery(BaseModel):
@@ -46,29 +47,29 @@ class HuntQuery(BaseModel):
 class PlaybookRun(BaseModel):
     playbook: str
     target: str
-    actions: List[str] = Field(default_factory=list)
+    actions: list[str] = Field(default_factory=list)
 
 
 class ShiftHandoff(BaseModel):
     analyst: str
     next_analyst: str
     notes: str
-    escalations: List[str] = Field(default_factory=list)
+    escalations: list[str] = Field(default_factory=list)
 
 
 class SastRequest(BaseModel):
     repository: str
-    pull_request: Optional[int] = None
-    changed_files: List[str] = Field(default_factory=list)
+    pull_request: int | None = None
+    changed_files: list[str] = Field(default_factory=list)
 
 
 class DependencyScanRequest(BaseModel):
-    dependencies: List[Dict[str, str]] = Field(default_factory=list)
+    dependencies: list[dict[str, str]] = Field(default_factory=list)
 
 
 class CIGateRequest(BaseModel):
     build_id: str
-    findings: List[Dict[str, Any]] = Field(default_factory=list)
+    findings: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class IDEHighlightRequest(BaseModel):
@@ -115,8 +116,8 @@ class IOCRequest(BaseModel):
 
 class ActorTrackRequest(BaseModel):
     actor_name: str
-    ttps: List[str] = Field(default_factory=list)
-    campaign: Optional[str] = None
+    ttps: list[str] = Field(default_factory=list)
+    campaign: str | None = None
 
 
 class ShareIntelRequest(BaseModel):
@@ -127,11 +128,11 @@ class ShareIntelRequest(BaseModel):
 
 class GenericAnalysisRequest(BaseModel):
     target: str
-    metadata: Dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class CloudAssessRequest(BaseModel):
-    providers: List[str] = Field(default_factory=lambda: ["aws", "azure", "gcp"])
+    providers: list[str] = Field(default_factory=lambda: ["aws", "azure", "gcp"])
 
 
 class ContractAnalysisRequest(BaseModel):
@@ -141,13 +142,17 @@ class ContractAnalysisRequest(BaseModel):
 
 class FuzzRequest(BaseModel):
     target: str
-    protocol: Optional[str] = None
-    engine: Optional[str] = None
+    protocol: str | None = None
+    engine: str | None = None
 
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "healthy", "service": "phase5", "timestamp": datetime.now(timezone.utc).isoformat()}
+    return {
+        "status": "healthy",
+        "service": "phase5",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 @app.post("/soc/alerts/ingest")
@@ -178,9 +183,15 @@ def soc_alert_dashboard(db: Session = Depends(get_db)) -> dict:
     all_alerts = db.query(Phase5AlertModel).all()
     total = len(all_alerts)
     open_critical = sum(1 for a in all_alerts if a.severity.lower() == "critical")
-    scores = [a.payload.get("priority_score", 50) for a in all_alerts if isinstance(a.payload, dict)]
+    scores = [
+        a.payload.get("priority_score", 50) for a in all_alerts if isinstance(a.payload, dict)
+    ]
     avg_priority = round(mean(scores), 2) if scores else 0.0
-    return {"total_alerts": total, "critical_alerts": open_critical, "average_priority": avg_priority}
+    return {
+        "total_alerts": total,
+        "critical_alerts": open_critical,
+        "average_priority": avg_priority,
+    }
 
 
 @app.post("/soc/incidents")
@@ -234,7 +245,11 @@ def soc_run_playbook(payload: PlaybookRun) -> dict:
 
 @app.post("/soc/shifts/handoff")
 def soc_shift_handoff(payload: ShiftHandoff) -> dict:
-    return {"status": "recorded", "handoff": payload.model_dump(), "at": datetime.now(timezone.utc).isoformat()}
+    return {
+        "status": "recorded",
+        "handoff": payload.model_dump(),
+        "at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 @app.get("/soc/metrics")
@@ -245,8 +260,16 @@ def soc_metrics() -> dict:
 @app.post("/devsecops/sast/analyze")
 def devsecops_sast(payload: SastRequest) -> dict:
     findings = [
-        {"type": "sql_injection_pattern", "severity": "high", "file": payload.changed_files[0] if payload.changed_files else "src/app.py"},
-        {"type": "hardcoded_secret", "severity": "critical", "file": payload.changed_files[-1] if payload.changed_files else "config.py"},
+        {
+            "type": "sql_injection_pattern",
+            "severity": "high",
+            "file": payload.changed_files[0] if payload.changed_files else "src/app.py",
+        },
+        {
+            "type": "hardcoded_secret",
+            "severity": "critical",
+            "file": payload.changed_files[-1] if payload.changed_files else "config.py",
+        },
     ]
     return {
         "repository": payload.repository,
@@ -258,13 +281,23 @@ def devsecops_sast(payload: SastRequest) -> dict:
 
 @app.post("/devsecops/dependencies/scan")
 def devsecops_dependency_scan(payload: DependencyScanRequest) -> dict:
-    vulnerable = [d for d in payload.dependencies if d.get("name", "").lower() in {"log4j", "pyyaml", "lodash"}]
-    return {"vulnerable_dependencies": vulnerable, "license_compliance": "pass", "auto_update_prs": len(vulnerable)}
+    vulnerable = [
+        d
+        for d in payload.dependencies
+        if d.get("name", "").lower() in {"log4j", "pyyaml", "lodash"}
+    ]
+    return {
+        "vulnerable_dependencies": vulnerable,
+        "license_compliance": "pass",
+        "auto_update_prs": len(vulnerable),
+    }
 
 
 @app.post("/devsecops/cicd/gate")
 def devsecops_cicd_gate(payload: CIGateRequest) -> dict:
-    blocked = any(str(f.get("severity", "")).lower() in {"critical", "high"} for f in payload.findings)
+    blocked = any(
+        str(f.get("severity", "")).lower() in {"critical", "high"} for f in payload.findings
+    )
     return {"build_id": payload.build_id, "gate_status": "blocked" if blocked else "passed"}
 
 
@@ -292,19 +325,39 @@ def devsecops_api_test(payload: APISecurityTestRequest) -> dict:
     return {
         "spec_url": payload.spec_url,
         "target": payload.target,
-        "checks": {"openapi_valid": True, "authz_tested": True, "rate_limit_validated": True, "graphql_tested": True},
+        "checks": {
+            "openapi_valid": True,
+            "authz_tested": True,
+            "rate_limit_validated": True,
+            "graphql_tested": True,
+        },
     }
 
 
 @app.get("/grc/frameworks")
 def grc_frameworks() -> dict:
-    return {"frameworks": ["SOC2", "ISO27001", "PCI-DSS", "HIPAA", "GDPR", "NIST-CSF", "CIS-v8", "FedRAMP"]}
+    return {
+        "frameworks": [
+            "SOC2",
+            "ISO27001",
+            "PCI-DSS",
+            "HIPAA",
+            "GDPR",
+            "NIST-CSF",
+            "CIS-v8",
+            "FedRAMP",
+        ]
+    }
 
 
 @app.post("/grc/risk/assess")
 def grc_risk_assess(payload: RiskAssessmentRequest) -> dict:
     score = round((payload.likelihood * payload.impact * (1 - payload.controls_score)) * 100, 2)
-    return {"asset": payload.asset, "risk_score": score, "heat_level": "high" if score >= 60 else "moderate"}
+    return {
+        "asset": payload.asset,
+        "risk_score": score,
+        "heat_level": "high" if score >= 60 else "moderate",
+    }
 
 
 @app.post("/grc/policies")
@@ -360,7 +413,11 @@ def grc_audit_evidence(db: Session = Depends(get_db)) -> dict:
 @app.post("/grc/third-party/assess")
 def grc_vendor_assess(payload: VendorAssessment) -> dict:
     vendor_id = f"vnd-{uuid.uuid4().hex[:8]}"
-    record = {**payload.model_dump(), "vendor_id": vendor_id, "risk": "high" if payload.questionnaire_score < 60 else "medium"}
+    record = {
+        **payload.model_dump(),
+        "vendor_id": vendor_id,
+        "risk": "high" if payload.questionnaire_score < 60 else "medium",
+    }
     vendors[vendor_id] = record
     return record
 
@@ -408,7 +465,12 @@ def threat_intel_ioc_search(value: str, db: Session = Depends(get_db)) -> dict:
 
 @app.post("/threat-intel/actors/track")
 def threat_intel_actor_track(payload: ActorTrackRequest) -> dict:
-    return {"actor_name": payload.actor_name, "ttps": payload.ttps, "mitre_mapped": True, "campaign": payload.campaign}
+    return {
+        "actor_name": payload.actor_name,
+        "ttps": payload.ttps,
+        "mitre_mapped": True,
+        "campaign": payload.campaign,
+    }
 
 
 @app.post("/threat-intel/sharing/publish")
@@ -418,17 +480,29 @@ def threat_intel_sharing(payload: ShareIntelRequest) -> dict:
 
 @app.post("/mobile/ios/analyze")
 def mobile_ios_analyze(payload: GenericAnalysisRequest) -> dict:
-    return {"target": payload.target, "checks": ["ipa_static_analysis", "runtime_checks", "ssl_pinning_assessment"], "risk": "medium"}
+    return {
+        "target": payload.target,
+        "checks": ["ipa_static_analysis", "runtime_checks", "ssl_pinning_assessment"],
+        "risk": "medium",
+    }
 
 
 @app.post("/mobile/android/analyze")
 def mobile_android_analyze(payload: GenericAnalysisRequest) -> dict:
-    return {"target": payload.target, "checks": ["apk_static_analysis", "frida_hooks", "root_detection_review"], "risk": "medium"}
+    return {
+        "target": payload.target,
+        "checks": ["apk_static_analysis", "frida_hooks", "root_detection_review"],
+        "risk": "medium",
+    }
 
 
 @app.post("/mobile/api-traffic/analyze")
 def mobile_api_traffic_analyze(payload: GenericAnalysisRequest) -> dict:
-    return {"target": payload.target, "checks": ["proxy_capture", "token_extraction", "auth_flow_validation"], "risk": "low"}
+    return {
+        "target": payload.target,
+        "checks": ["proxy_capture", "token_extraction", "auth_flow_validation"],
+        "risk": "low",
+    }
 
 
 @app.post("/cspm/multicloud/assess")
@@ -439,12 +513,20 @@ def cspm_multicloud_assess(payload: CloudAssessRequest) -> dict:
 
 @app.post("/cspm/config/audit")
 def cspm_config_audit(payload: GenericAnalysisRequest) -> dict:
-    return {"target": payload.target, "checks": ["cis_benchmarks", "iam_review", "bucket_permissions", "network_config"], "findings": 4}
+    return {
+        "target": payload.target,
+        "checks": ["cis_benchmarks", "iam_review", "bucket_permissions", "network_config"],
+        "findings": 4,
+    }
 
 
 @app.post("/cspm/workload/protect")
 def cspm_workload_protect(payload: GenericAnalysisRequest) -> dict:
-    return {"target": payload.target, "controls": ["serverless_guardrails", "container_runtime_security", "api_gateway_security"], "status": "enforced"}
+    return {
+        "target": payload.target,
+        "controls": ["serverless_guardrails", "container_runtime_security", "api_gateway_security"],
+        "status": "enforced",
+    }
 
 
 @app.post("/cspm/cost/optimize")
@@ -454,18 +536,30 @@ def cspm_cost_optimize(payload: GenericAnalysisRequest) -> dict:
 
 @app.post("/web3/contracts/analyze")
 def web3_contract_analyze(payload: ContractAnalysisRequest) -> dict:
-    vuln = ["reentrancy", "integer_overflow"] if "call.value" in payload.code or "unchecked" in payload.code else []
+    vuln = (
+        ["reentrancy", "integer_overflow"]
+        if "call.value" in payload.code or "unchecked" in payload.code
+        else []
+    )
     return {"language": payload.language, "vulnerabilities": vuln, "tools": ["mythril", "slither"]}
 
 
 @app.post("/web3/defi/test")
 def web3_defi_test(payload: GenericAnalysisRequest) -> dict:
-    return {"target": payload.target, "tests": ["flash_loan_simulation", "oracle_manipulation", "liquidity_pool_analysis"], "status": "completed"}
+    return {
+        "target": payload.target,
+        "tests": ["flash_loan_simulation", "oracle_manipulation", "liquidity_pool_analysis"],
+        "status": "completed",
+    }
 
 
 @app.post("/web3/nft/analyze")
 def web3_nft_analyze(payload: GenericAnalysisRequest) -> dict:
-    return {"target": payload.target, "checks": ["metadata_verification", "ownership_analysis"], "risk": "low"}
+    return {
+        "target": payload.target,
+        "checks": ["metadata_verification", "ownership_analysis"],
+        "risk": "low",
+    }
 
 
 @app.post("/web3/forensics/trace")
@@ -475,42 +569,76 @@ def web3_forensics_trace(payload: GenericAnalysisRequest) -> dict:
 
 @app.post("/iot/firmware/analyze")
 def iot_firmware_analyze(payload: GenericAnalysisRequest) -> dict:
-    return {"target": payload.target, "steps": ["extract", "binary_scan", "backdoor_detection"], "vulnerabilities": 2}
+    return {
+        "target": payload.target,
+        "steps": ["extract", "binary_scan", "backdoor_detection"],
+        "vulnerabilities": 2,
+    }
 
 
 @app.post("/iot/protocol/fuzz")
 def iot_protocol_fuzz(payload: FuzzRequest) -> dict:
-    return {"target": payload.target, "protocol": payload.protocol or "mqtt", "engine": payload.engine or "custom", "crashes": 1}
+    return {
+        "target": payload.target,
+        "protocol": payload.protocol or "mqtt",
+        "engine": payload.engine or "custom",
+        "crashes": 1,
+    }
 
 
 @app.post("/iot/ics/assess")
 def iot_ics_assess(payload: GenericAnalysisRequest) -> dict:
-    return {"target": payload.target, "checks": ["scada_assessment", "modbus_dnp3_tests", "plc_scan"], "status": "completed"}
+    return {
+        "target": payload.target,
+        "checks": ["scada_assessment", "modbus_dnp3_tests", "plc_scan"],
+        "status": "completed",
+    }
 
 
 @app.post("/reverse/binary/analyze")
 def reverse_binary_analyze(payload: GenericAnalysisRequest) -> dict:
-    return {"target": payload.target, "tools": ["ghidra", "ida", "binary_ninja"], "decompilation": True}
+    return {
+        "target": payload.target,
+        "tools": ["ghidra", "ida", "binary_ninja"],
+        "decompilation": True,
+    }
 
 
 @app.post("/reverse/fuzz/run")
 def reverse_fuzz_run(payload: FuzzRequest) -> dict:
-    return {"target": payload.target, "engine": payload.engine or "afl++", "corpus_size": 42, "crashes": 2}
+    return {
+        "target": payload.target,
+        "engine": payload.engine or "afl++",
+        "corpus_size": 42,
+        "crashes": 2,
+    }
 
 
 @app.post("/reverse/malware/analyze")
 def reverse_malware_analyze(payload: GenericAnalysisRequest) -> dict:
-    return {"target": payload.target, "checks": ["static", "dynamic", "yara"], "behavioral_profile": "suspicious_network_beaconing"}
+    return {
+        "target": payload.target,
+        "checks": ["static", "dynamic", "yara"],
+        "behavioral_profile": "suspicious_network_beaconing",
+    }
 
 
 @app.post("/reverse/exploit/template")
 def reverse_exploit_template(payload: GenericAnalysisRequest) -> dict:
-    return {"target": payload.target, "template": "ROP_CHAIN_TEMPLATE_V1", "shellcode_library": True}
+    return {
+        "target": payload.target,
+        "template": "ROP_CHAIN_TEMPLATE_V1",
+        "shellcode_library": True,
+    }
 
 
 @app.get("/training/labs")
 def training_labs() -> dict:
-    return {"labs": ["xss_lab", "sqli_lab", "cloud_misconfig_lab"], "ctf_enabled": True, "difficulty_levels": ["beginner", "intermediate", "advanced"]}
+    return {
+        "labs": ["xss_lab", "sqli_lab", "cloud_misconfig_lab"],
+        "ctf_enabled": True,
+        "difficulty_levels": ["beginner", "intermediate", "advanced"],
+    }
 
 
 @app.get("/training/cert-paths")
@@ -519,8 +647,12 @@ def training_cert_paths() -> dict:
 
 
 @app.get("/training/learning-paths")
-def training_learning_paths(role: Optional[str] = None) -> dict:
-    base: List[Dict[str, Any]] = [{"track": "pentester"}, {"track": "soc_analyst"}, {"track": "security_engineer"}]
+def training_learning_paths(role: str | None = None) -> dict:
+    base: list[dict[str, Any]] = [
+        {"track": "pentester"},
+        {"track": "soc_analyst"},
+        {"track": "security_engineer"},
+    ]
     if role:
         base = [b for b in base if b["track"] == role]
     return {"paths": base, "video_tutorials": True, "docs_available": True}
@@ -528,26 +660,43 @@ def training_learning_paths(role: Optional[str] = None) -> dict:
 
 @app.get("/training/gamification/leaderboard")
 def training_leaderboard() -> dict:
-    return {"leaders": [{"user": "alice", "points": 1200}, {"user": "bob", "points": 980}], "team_competitions": True}
+    return {
+        "leaders": [{"user": "alice", "points": 1200}, {"user": "bob", "points": 980}],
+        "team_competitions": True,
+    }
 
 
 @app.get("/executive/risk-posture")
 def executive_risk_posture() -> dict:
-    return {"overall_security_score": 83, "trend": "improving", "heatmap_ready": True, "industry_benchmark_percentile": 72}
+    return {
+        "overall_security_score": 83,
+        "trend": "improving",
+        "heatmap_ready": True,
+        "industry_benchmark_percentile": 72,
+    }
 
 
 @app.get("/executive/compliance-status")
 def executive_compliance_status() -> dict:
-    return {"framework_compliance": {"soc2": 88, "iso27001": 81, "pci_dss": 77}, "gap_analysis": True, "remediation_timelines": True}
+    return {
+        "framework_compliance": {"soc2": 88, "iso27001": 81, "pci_dss": 77},
+        "gap_analysis": True,
+        "remediation_timelines": True,
+    }
 
 
 @app.get("/executive/resource-optimization")
 def executive_resource_optimization() -> dict:
-    return {"team_productivity": 0.84, "tool_utilization": 0.79, "budget_allocation": {"people": 60, "tools": 30, "training": 10}}
+    return {
+        "team_productivity": 0.84,
+        "tool_utilization": 0.79,
+        "budget_allocation": {"people": 60, "tools": 30, "training": 10},
+    }
 
 
 @app.get("/executive/reports")
 def executive_reports() -> dict:
-    return {"reports": ["board_kpi_deck", "quarterly_roi", "risk_reduction_trend"], "generated_at": datetime.now(timezone.utc).isoformat()}
-
-
+    return {
+        "reports": ["board_kpi_deck", "quarterly_roi", "risk_reduction_trend"],
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }

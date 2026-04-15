@@ -8,13 +8,14 @@ Performs automated security testing of HTTP API endpoints:
 - Response analysis for vulnerability indicators
 - Graceful simulation mode when httpx is not installed
 """
+
 from __future__ import annotations
 
 import logging
 import re
 import secrets
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any
 from urllib.parse import urljoin, urlparse
 
 logger = logging.getLogger(__name__)
@@ -22,6 +23,7 @@ logger = logging.getLogger(__name__)
 _HTTPX_AVAILABLE = False
 try:
     import httpx  # type: ignore[import-not-found]
+
     _HTTPX_AVAILABLE = True
 except Exception:
     pass
@@ -30,7 +32,7 @@ except Exception:
 # Payload corpus — concise but representative
 # ---------------------------------------------------------------------------
 
-_PAYLOADS: Dict[str, List[str]] = {
+_PAYLOADS: dict[str, list[str]] = {
     "sqli": [
         "' OR '1'='1' --",
         "1; SELECT * FROM users --",
@@ -75,7 +77,7 @@ _PAYLOADS: Dict[str, List[str]] = {
 }
 
 # Response patterns that indicate confirmed vulnerability
-_VULN_INDICATORS: Dict[str, List[str]] = {
+_VULN_INDICATORS: dict[str, list[str]] = {
     "sqli": [
         r"sql syntax.*mysql",
         r"mysql_fetch",
@@ -117,7 +119,7 @@ _VULN_INDICATORS: Dict[str, List[str]] = {
     ],
 }
 
-_ATTACK_SEVERITY: Dict[str, str] = {
+_ATTACK_SEVERITY: dict[str, str] = {
     "sqli": "critical",
     "rce": "critical",
     "cmd_injection": "critical",
@@ -128,7 +130,7 @@ _ATTACK_SEVERITY: Dict[str, str] = {
     "auth_bypass": "critical",
 }
 
-_REMEDIATION: Dict[str, str] = {
+_REMEDIATION: dict[str, str] = {
     "sqli": "Use parameterised queries/prepared statements. Apply WAF. Restrict DB user privileges.",
     "xss": "Encode output by context. Implement strict Content-Security-Policy. Use DOMPurify for HTML.",
     "path_traversal": "Canonicalise file paths. Restrict access inside a safe directory root.",
@@ -140,10 +142,7 @@ _REMEDIATION: Dict[str, str] = {
 
 
 def _check_vuln(body: str, attack_type: str) -> bool:
-    for pat in _VULN_INDICATORS.get(attack_type, []):
-        if re.search(pat, body, re.IGNORECASE):
-            return True
-    return False
+    return any(re.search(pat, body, re.IGNORECASE) for pat in _VULN_INDICATORS.get(attack_type, []))
 
 
 def _make_finding(
@@ -153,7 +152,7 @@ def _make_finding(
     attack_type: str,
     payload: str,
     evidence: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     return {
         "id": secrets.token_urlsafe(8),
         "title": f"{attack_type.upper().replace('_', ' ')} injection in {param} @ {endpoint}",
@@ -165,7 +164,9 @@ def _make_finding(
         "evidence": evidence[:300],
         "severity": _ATTACK_SEVERITY.get(attack_type, "high"),
         "category": "api_fuzzing",
-        "recommendation": _REMEDIATION.get(attack_type, "Sanitise and validate all user input at this endpoint."),
+        "recommendation": _REMEDIATION.get(
+            attack_type, "Sanitise and validate all user input at this endpoint."
+        ),
         "detected_at": datetime.utcnow().isoformat(),
     }
 
@@ -174,34 +175,39 @@ def _make_finding(
 # OpenAPI spec parser
 # ---------------------------------------------------------------------------
 
-def _parse_openapi_endpoints(spec: Dict[str, Any], base_url: str) -> List[Dict[str, Any]]:
+
+def _parse_openapi_endpoints(spec: dict[str, Any], base_url: str) -> list[dict[str, Any]]:
     """Extract endpoint list from an OpenAPI 3.x spec dict."""
     server_url = spec.get("servers", [{}])[0].get("url", base_url)
-    endpoints: List[Dict[str, Any]] = []
+    endpoints: list[dict[str, Any]] = []
 
     for path, methods in spec.get("paths", {}).items():
         for method, details in methods.items():
             if method.lower() not in {"get", "post", "put", "delete", "patch"}:
                 continue
-            params: List[Dict[str, str]] = []
+            params: list[dict[str, str]] = []
             for p in details.get("parameters", []):
                 params.append({"name": p.get("name", "param"), "in": p.get("in", "query")})
             # requestBody properties → body params
-            for content_type, schema_obj in details.get("requestBody", {}).get("content", {}).items():
+            for _content_type, schema_obj in (
+                details.get("requestBody", {}).get("content", {}).items()
+            ):
                 for prop_name in schema_obj.get("schema", {}).get("properties", {}):
                     params.append({"name": prop_name, "in": "body"})
             if not params:
                 params = [{"name": "q", "in": "query"}]
             full_url = urljoin(server_url.rstrip("/") + "/", path.lstrip("/"))
-            endpoints.append({
-                "url": full_url,
-                "method": method.upper(),
-                "params": params,
-            })
+            endpoints.append(
+                {
+                    "url": full_url,
+                    "method": method.upper(),
+                    "params": params,
+                }
+            )
     return endpoints
 
 
-def _default_endpoints(base_url: str) -> List[Dict[str, Any]]:
+def _default_endpoints(base_url: str) -> list[dict[str, Any]]:
     """Minimal default endpoint set when no spec is available."""
     common_params = [
         {"name": "q", "in": "query"},
@@ -216,6 +222,7 @@ def _default_endpoints(base_url: str) -> List[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # Fuzzer core
 # ---------------------------------------------------------------------------
+
 
 class APIFuzzer:
     """
@@ -239,9 +246,9 @@ class APIFuzzer:
     async def fuzz(
         self,
         base_url: str,
-        openapi_spec: Optional[Dict[str, Any]] = None,
-        attack_types: Optional[List[str]] = None,
-    ) -> Dict[str, Any]:
+        openapi_spec: dict[str, Any] | None = None,
+        attack_types: list[str] | None = None,
+    ) -> dict[str, Any]:
         """
         Run a fuzzing campaign against a target API.
 
@@ -255,10 +262,11 @@ class APIFuzzer:
         """
         selected = attack_types or list(_PAYLOADS.keys())
         self._request_count = 0
-        findings: List[Dict[str, Any]] = []
+        findings: list[dict[str, Any]] = []
 
         endpoints = (
-            _parse_openapi_endpoints(openapi_spec, base_url) if openapi_spec
+            _parse_openapi_endpoints(openapi_spec, base_url)
+            if openapi_spec
             else _default_endpoints(base_url)
         )
 
@@ -277,7 +285,7 @@ class APIFuzzer:
                         ep_hits = await self._fuzz_endpoint(client, ep, attack)
                         findings.extend(ep_hits)
 
-        severity_counts: Dict[str, int] = {}
+        severity_counts: dict[str, int] = {}
         for f in findings:
             s = f.get("severity", "info")
             severity_counts[s] = severity_counts.get(s, 0) + 1
@@ -296,10 +304,10 @@ class APIFuzzer:
     async def _fuzz_endpoint(
         self,
         client: Any,
-        endpoint: Dict[str, Any],
+        endpoint: dict[str, Any],
         attack_type: str,
-    ) -> List[Dict[str, Any]]:
-        found: List[Dict[str, Any]] = []
+    ) -> list[dict[str, Any]]:
+        found: list[dict[str, Any]] = []
         payloads = _PAYLOADS.get(attack_type, [])
         url = endpoint["url"]
         method = endpoint["method"]
@@ -311,7 +319,9 @@ class APIFuzzer:
                 self._request_count += 1
                 body = await self._request(client, method, url, param, payload)
                 if body and _check_vuln(body, attack_type):
-                    found.append(_make_finding(url, method, param["name"], attack_type, payload, body[:200]))
+                    found.append(
+                        _make_finding(url, method, param["name"], attack_type, payload, body[:200])
+                    )
                     break  # one confirmed finding per param+attack is sufficient
         return found
 
@@ -320,9 +330,9 @@ class APIFuzzer:
         client: Any,
         method: str,
         url: str,
-        param: Dict[str, str],
+        param: dict[str, str],
         payload: str,
-    ) -> Optional[str]:
+    ) -> str | None:
         loc = param.get("in", "query")
         name = param.get("name", "q")
         try:
@@ -338,14 +348,13 @@ class APIFuzzer:
     # Simulation mode (no httpx / offline use)
     # ------------------------------------------------------------------
 
-    def _simulate(self, base_url: str, attack_types: List[str]) -> List[Dict[str, Any]]:
+    def _simulate(self, base_url: str, attack_types: list[str]) -> list[dict[str, Any]]:
         """
         Analytical simulation: return representative findings without live HTTP.
         Used when httpx is unavailable or in CI environments.
         """
-        findings: List[Dict[str, Any]] = []
-        parsed = urlparse(base_url)
-        domain = parsed.netloc or base_url
+        findings: list[dict[str, Any]] = []
+        urlparse(base_url)
 
         simulated_targets = [
             (f"{base_url}/api/search", "GET", "q"),
@@ -357,14 +366,16 @@ class APIFuzzer:
         for attack_type in attack_types:
             for ep_url, method, param in simulated_targets[:2]:
                 payload = _PAYLOADS[attack_type][0] if _PAYLOADS.get(attack_type) else "FUZZ"
-                findings.append(_make_finding(
-                    endpoint=ep_url,
-                    method=method,
-                    param=param,
-                    attack_type=attack_type,
-                    payload=payload,
-                    evidence=f"[simulation] {attack_type.upper()} pattern detected analytically",
-                ))
+                findings.append(
+                    _make_finding(
+                        endpoint=ep_url,
+                        method=method,
+                        param=param,
+                        attack_type=attack_type,
+                        payload=payload,
+                        evidence=f"[simulation] {attack_type.upper()} pattern detected analytically",
+                    )
+                )
                 break  # one per attack type in simulation
 
         self._request_count = len(findings) * 3

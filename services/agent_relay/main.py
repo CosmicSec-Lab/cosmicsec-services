@@ -3,6 +3,7 @@ CosmicSec Agent Relay Service
 Lightweight FastAPI service (port 8011) that manages agent WebSocket connections
 and dispatches tasks to connected agents.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -63,6 +64,7 @@ _RELAY_SECRET = os.environ.get("RELAY_INTERNAL_SECRET", "")
 # Schemas
 # ---------------------------------------------------------------------------
 
+
 class DispatchTaskRequest(BaseModel):
     """Payload for dispatching a task to a specific agent."""
 
@@ -73,6 +75,7 @@ class DispatchTaskRequest(BaseModel):
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+
 
 @app.get("/health")
 async def health() -> dict:

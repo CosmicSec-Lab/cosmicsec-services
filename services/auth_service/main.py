@@ -2,22 +2,24 @@
 CosmicSec Authentication Service
 Handles user authentication, JWT tokens, OAuth2, and session management
 """
-from fastapi import FastAPI, Depends, HTTPException, Request, status
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from pydantic import BaseModel, EmailStr, Field
-from passlib.context import CryptContext
-import bcrypt as bcrypt_lib
-from jose import JWTError, jwt
-from datetime import datetime, timedelta
-from typing import Optional, Dict, List, Any
-import os
-import secrets
+
+import base64
+import hashlib
 import hmac
 import logging
-import hashlib
-import base64
+import os
+import secrets
+from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any, Optional
 from urllib.parse import urlencode
+
+import bcrypt as bcrypt_lib
+from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi.security import OAuth2PasswordBearer
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from pydantic import BaseModel, EmailStr, Field
 
 try:
     import redis
@@ -37,7 +39,7 @@ except Exception:  # pragma: no cover - optional dependency at runtime
 app = FastAPI(
     title="CosmicSec Auth Service",
     description="Authentication and authorization service for GuardAxisSphere",
-    version="1.0.0"
+    version="1.0.0",
 )
 
 # Configure logging
@@ -147,12 +149,13 @@ class MFAChallengeVerifyRequest(BaseModel):
 # Phase 3.1 — Multi-tenancy models
 # ---------------------------------------------------------------------------
 
+
 class OrganizationCreate(BaseModel):
     name: str
     slug: str = Field(..., min_length=3)
     owner_email: EmailStr
     plan: str = "team"  # free | team | enterprise
-    branding: Dict[str, str] = Field(default_factory=dict)
+    branding: dict[str, str] = Field(default_factory=dict)
 
 
 class WorkspaceCreate(BaseModel):
@@ -200,7 +203,9 @@ class FieldEncryptionRequest(BaseModel):
 
 class SecurityScanRequest(BaseModel):
     target: str
-    controls: List[str] = Field(default_factory=lambda: ["mfa", "rbac", "audit_logs", "token_rotation"])
+    controls: list[str] = Field(
+        default_factory=lambda: ["mfa", "rbac", "audit_logs", "token_rotation"]
+    )
 
 
 class DataResidencyRequest(BaseModel):
@@ -223,22 +228,23 @@ hardware_keys_db = {}
 sms_challenges_db = {}
 
 # Multi-tenant billing and retention (Phase 3)
-tenant_billing: Dict[str, Dict[str, Any]] = {}
-tenant_retention: Dict[str, int] = {}  # days
-tenant_data_residency: Dict[str, Dict[str, str]] = {}
-vault_store: Dict[str, Dict[str, str]] = {}
+tenant_billing: dict[str, dict[str, Any]] = {}
+tenant_retention: dict[str, int] = {}  # days
+tenant_data_residency: dict[str, dict[str, str]] = {}
+vault_store: dict[str, dict[str, str]] = {}
 
 
-def _hash_audit_entry(entry: Dict[str, Any], previous_hash: Optional[str]) -> str:
+def _hash_audit_entry(entry: dict[str, Any], previous_hash: Optional[str]) -> str:
     """Generate a tamper-evident hash chain for audit logs."""
-    import hashlib, json
+    import hashlib
+    import json
 
     payload = {
         **entry,
         "previous_hash": previous_hash or "",
     }
-    raw = json.dumps(payload, sort_keys=True, separators=(',', ':'))
-    return hashlib.sha256(raw.encode('utf-8')).hexdigest()
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _audit_entry(action: str, actor: str, detail: str, org_id: Optional[str] = None) -> None:
@@ -258,7 +264,7 @@ def _audit_entry(action: str, actor: str, detail: str, org_id: Optional[str] = N
 def _cleanup_retention() -> None:
     """Delete old entries based on tenant retention policies."""
     now = datetime.utcnow()
-    kept: List[Dict[str, Any]] = []
+    kept: list[dict[str, Any]] = []
     for entry in audit_logs:
         org = entry.get("org_id")
         days = tenant_retention.get(org, 30)
@@ -285,11 +291,12 @@ async def startup_retention_task():
 
     asyncio.create_task(_loop())
 
+
 # Multi-tenant state (in-memory; DB in production)
-organizations_db: Dict[str, Dict] = {}
-org_memberships: Dict[str, Dict[str, str]] = {}  # org_id -> {email: role}
-workspaces_db: Dict[str, List[Dict]] = {}  # org_id -> workspace list
-tenant_quotas: Dict[str, Dict[str, int]] = {}  # org_id -> quotas
+organizations_db: dict[str, dict] = {}
+org_memberships: dict[str, dict[str, str]] = {}  # org_id -> {email: role}
+workspaces_db: dict[str, list[dict]] = {}  # org_id -> workspace list
+tenant_quotas: dict[str, dict[str, int]] = {}  # org_id -> quotas
 
 redis_client = None
 if redis is not None:
@@ -327,7 +334,7 @@ def _require_org_admin(org_id: str, email: str) -> None:
         raise HTTPException(status_code=403, detail="Organization admin permission required")
 
 
-def _ensure_org_exists(org_id: str) -> Dict:
+def _ensure_org_exists(org_id: str) -> dict:
     org = organizations_db.get(org_id)
     if org is None:
         raise HTTPException(status_code=404, detail="Organization not found")
@@ -384,17 +391,17 @@ def _map_action_to_resource(action: str) -> tuple[str, str]:
 # Password utilities
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Verify password against hash using bcrypt directly"""
-    password_bytes = plain_password.encode('utf-8')[:72]  # Truncate to 72 bytes
-    hash_bytes = hashed_password.encode('utf-8')
+    password_bytes = plain_password.encode("utf-8")[:72]  # Truncate to 72 bytes
+    hash_bytes = hashed_password.encode("utf-8")
     return bcrypt_lib.checkpw(password_bytes, hash_bytes)
 
 
 def get_password_hash(password: str) -> str:
     """Hash password using bcrypt directly"""
-    password_bytes = password.encode('utf-8')[:72]  # Truncate to 72 bytes
+    password_bytes = password.encode("utf-8")[:72]  # Truncate to 72 bytes
     salt = bcrypt_lib.gensalt()
     hashed = bcrypt_lib.hashpw(password_bytes, salt)
-    return hashed.decode('utf-8')
+    return hashed.decode("utf-8")
 
 
 # JWT utilities
@@ -406,11 +413,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     else:
         expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
 
-    to_encode.update({
-        "exp": expire,
-        "iat": datetime.utcnow(),
-        "type": "access"
-    })
+    to_encode.update({"exp": expire, "iat": datetime.utcnow(), "type": "access"})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
@@ -420,11 +423,7 @@ def create_refresh_token(data: dict) -> str:
     to_encode = data.copy()
     expire = datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
 
-    to_encode.update({
-        "exp": expire,
-        "iat": datetime.utcnow(),
-        "type": "refresh"
-    })
+    to_encode.update({"exp": expire, "iat": datetime.utcnow(), "type": "refresh"})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
@@ -439,15 +438,13 @@ def verify_token(token: str) -> TokenData:
 
         if email is None:
             raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Could not validate credentials"
+                status_code=status.HTTP_401_UNAUTHORIZED, detail="Could not validate credentials"
             )
 
         return TokenData(email=email, user_id=user_id, role=role)
     except JWTError:
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not validate credentials"
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Could not validate credentials"
         )
 
 
@@ -458,10 +455,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
 
     user = fake_users_db.get(token_data.email)
     if user is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User not found"
-        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
 
     return User(**user)
 
@@ -475,7 +469,9 @@ def require_permission(action: str):
             )
 
         resource, verb = _map_action_to_resource(action)
-        if casbin_enforcer is not None and not casbin_enforcer.enforce(current_user.role, resource, verb):
+        if casbin_enforcer is not None and not casbin_enforcer.enforce(
+            current_user.role, resource, verb
+        ):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"Casbin denied '{action}' for role '{current_user.role}'",
@@ -489,11 +485,7 @@ def require_permission(action: str):
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "service": "auth",
-        "timestamp": datetime.utcnow().isoformat()
-    }
+    return {"status": "healthy", "service": "auth", "timestamp": datetime.utcnow().isoformat()}
 
 
 @app.post("/register", response_model=dict)
@@ -502,8 +494,7 @@ async def register(user_data: UserCreate):
     # Check if user already exists
     if user_data.email in fake_users_db:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Email already registered"
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Email already registered"
         )
 
     # Create new user
@@ -517,7 +508,7 @@ async def register(user_data: UserCreate):
         "hashed_password": hashed_password,
         "role": user_data.role,
         "is_active": True,
-        "created_at": datetime.utcnow()
+        "created_at": datetime.utcnow(),
     }
 
     fake_users_db[user_data.email] = new_user
@@ -525,11 +516,7 @@ async def register(user_data: UserCreate):
 
     logger.info(f"New user registered: {user_data.email}")
 
-    return {
-        "message": "User registered successfully",
-        "user_id": user_id,
-        "email": user_data.email
-    }
+    return {"message": "User registered successfully", "user_id": user_id, "email": user_data.email}
 
 
 @app.post("/login", response_model=Token)
@@ -539,30 +526,23 @@ async def login(user_data: UserLogin):
     user = fake_users_db.get(user_data.email)
     if not user:
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect email or password"
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Incorrect email or password"
         )
 
     # Verify password
     if not verify_password(user_data.password, user["hashed_password"]):
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect email or password"
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Incorrect email or password"
         )
 
     # Check if user is active
     if not user["is_active"]:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="User account is inactive"
+            status_code=status.HTTP_403_FORBIDDEN, detail="User account is inactive"
         )
 
     # Create tokens
-    access_token_data = {
-        "sub": user["email"],
-        "user_id": user["id"],
-        "role": user["role"]
-    }
+    access_token_data = {"sub": user["email"], "user_id": user["id"], "role": user["role"]}
 
     access_token = create_access_token(access_token_data)
     refresh_token = create_refresh_token(access_token_data)
@@ -589,14 +569,13 @@ async def refresh(payload: RefreshRequest):
 
         if token_payload.get("type") != "refresh":
             raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid token type"
+                status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token type"
             )
 
         access_token_data = {
             "sub": token_payload.get("sub"),
             "user_id": token_payload.get("user_id"),
-            "role": token_payload.get("role")
+            "role": token_payload.get("role"),
         }
 
         new_access_token = create_access_token(access_token_data)
@@ -606,13 +585,12 @@ async def refresh(payload: RefreshRequest):
             "access_token": new_access_token,
             "refresh_token": new_refresh_token,
             "token_type": "bearer",
-            "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60
+            "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         }
 
     except JWTError:
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid refresh token"
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token"
         )
 
 
@@ -640,7 +618,7 @@ async def verify_token_endpoint(token: str):
             "valid": True,
             "email": token_data.email,
             "user_id": token_data.user_id,
-            "role": token_data.role
+            "role": token_data.role,
         }
     except HTTPException:
         return {"valid": False}
@@ -655,9 +633,7 @@ async def gdpr_export(email: EmailStr):
 
     # Collect all user-related data from this service
     sessions = [s for s in fake_sessions_db.values() if s.startswith(f"{email}:")]
-    api_keys = [
-        {"key_id": k, **v} for k, v in fake_api_keys_db.items() if v.get("owner") == email
-    ]
+    api_keys = [{"key_id": k, **v} for k, v in fake_api_keys_db.items() if v.get("owner") == email]
     memberships = [
         {"org_id": org_id, "role": role}
         for org_id, members in org_memberships.items()
@@ -875,7 +851,9 @@ async def list_users(current_user: User = Depends(require_permission("manage")))
 
 
 @app.post("/users")
-async def create_user(user_data: UserCreate, current_user: User = Depends(require_permission("manage"))):
+async def create_user(
+    user_data: UserCreate, current_user: User = Depends(require_permission("manage"))
+):
     if user_data.email in fake_users_db:
         raise HTTPException(status_code=400, detail="Email already registered")
 
@@ -895,7 +873,9 @@ async def create_user(user_data: UserCreate, current_user: User = Depends(requir
 
 
 @app.put("/users/{email}")
-async def update_user(email: str, payload: UserUpdate, current_user: User = Depends(require_permission("manage"))):
+async def update_user(
+    email: str, payload: UserUpdate, current_user: User = Depends(require_permission("manage"))
+):
     user = fake_users_db.get(email)
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
@@ -920,7 +900,9 @@ async def delete_user(email: str, current_user: User = Depends(require_permissio
 
 
 @app.post("/roles/assign")
-async def assign_role(payload: RoleAssignRequest, current_user: User = Depends(require_permission("manage"))):
+async def assign_role(
+    payload: RoleAssignRequest, current_user: User = Depends(require_permission("manage"))
+):
     user = fake_users_db.get(payload.email)
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
@@ -936,7 +918,9 @@ async def get_config(current_user: User = Depends(require_permission("manage")))
 
 
 @app.post("/config")
-async def update_config(payload: ConfigUpdateRequest, current_user: User = Depends(require_permission("manage"))):
+async def update_config(
+    payload: ConfigUpdateRequest, current_user: User = Depends(require_permission("manage"))
+):
     platform_config[payload.key] = payload.value
     _audit("config.set", current_user.email, f"{payload.key}={payload.value}")
     return {"message": "Config updated", "config": platform_config}
@@ -1016,8 +1000,11 @@ async def mfa_verify(payload: MFAChallengeVerifyRequest):
 # Phase 3.1 — Multi-tenancy endpoints
 # ---------------------------------------------------------------------------
 
+
 @app.post("/orgs", status_code=201)
-async def create_organization(payload: OrganizationCreate, current_user: User = Depends(require_permission("manage"))):
+async def create_organization(
+    payload: OrganizationCreate, current_user: User = Depends(require_permission("manage"))
+):
     org_id = secrets.token_urlsafe(10)
     if any(org.get("slug") == payload.slug for org in organizations_db.values()):
         raise HTTPException(status_code=409, detail="Organization slug already exists")
@@ -1049,17 +1036,23 @@ async def list_organizations(current_user: User = Depends(require_permission("ma
     for org_id, org in organizations_db.items():
         role = org_memberships.get(org_id, {}).get(current_user.email)
         if current_user.role in {"admin", "superadmin"} or role:
-            visible.append({
-                **org,
-                "member_role": role,
-                "member_count": len(org_memberships.get(org_id, {})),
-                "workspace_count": len(workspaces_db.get(org_id, [])),
-            })
+            visible.append(
+                {
+                    **org,
+                    "member_role": role,
+                    "member_count": len(org_memberships.get(org_id, {})),
+                    "workspace_count": len(workspaces_db.get(org_id, [])),
+                }
+            )
     return {"items": visible, "total": len(visible)}
 
 
 @app.post("/orgs/{org_id}/members")
-async def add_org_member(org_id: str, payload: OrganizationMemberAssign, current_user: User = Depends(require_permission("manage"))):
+async def add_org_member(
+    org_id: str,
+    payload: OrganizationMemberAssign,
+    current_user: User = Depends(require_permission("manage")),
+):
     _ensure_org_exists(org_id)
     _require_org_admin(org_id, current_user.email)
     if payload.email not in fake_users_db:
@@ -1067,7 +1060,9 @@ async def add_org_member(org_id: str, payload: OrganizationMemberAssign, current
 
     quotas = tenant_quotas.get(org_id, {})
     current_members = org_memberships.setdefault(org_id, {})
-    if payload.email not in current_members and len(current_members) >= quotas.get("max_users", 1000):
+    if payload.email not in current_members and len(current_members) >= quotas.get(
+        "max_users", 1000
+    ):
         raise HTTPException(status_code=400, detail="Tenant user quota exceeded")
 
     current_members[payload.email] = payload.role
@@ -1088,7 +1083,11 @@ async def list_org_members(org_id: str, current_user: User = Depends(require_per
 
 
 @app.post("/orgs/{org_id}/workspaces", status_code=201)
-async def create_workspace(org_id: str, payload: WorkspaceCreate, current_user: User = Depends(require_permission("manage"))):
+async def create_workspace(
+    org_id: str,
+    payload: WorkspaceCreate,
+    current_user: User = Depends(require_permission("manage")),
+):
     _ensure_org_exists(org_id)
     _require_org_admin(org_id, current_user.email)
     quota = tenant_quotas.get(org_id, {})
@@ -1111,7 +1110,10 @@ async def create_workspace(org_id: str, payload: WorkspaceCreate, current_user: 
 @app.get("/orgs/{org_id}/workspaces")
 async def list_workspaces(org_id: str, current_user: User = Depends(require_permission("read"))):
     _ensure_org_exists(org_id)
-    if current_user.role not in {"admin", "superadmin"} and current_user.email not in org_memberships.get(org_id, {}):
+    if current_user.role not in {
+        "admin",
+        "superadmin",
+    } and current_user.email not in org_memberships.get(org_id, {}):
         raise HTTPException(status_code=403, detail="Not a member of this organization")
     items = workspaces_db.get(org_id, [])
     return {"org_id": org_id, "items": items, "total": len(items)}
@@ -1125,10 +1127,16 @@ async def get_org_quotas(org_id: str, current_user: User = Depends(require_permi
 
 
 @app.post("/orgs/{org_id}/quotas")
-async def set_org_quotas(org_id: str, payload: TenantQuotaUpdate, current_user: User = Depends(require_permission("manage"))):
+async def set_org_quotas(
+    org_id: str,
+    payload: TenantQuotaUpdate,
+    current_user: User = Depends(require_permission("manage")),
+):
     _ensure_org_exists(org_id)
     _require_org_admin(org_id, current_user.email)
-    quotas = tenant_quotas.setdefault(org_id, {"max_users": 1000, "max_workspaces": 1000, "max_scans_per_day": 100000})
+    quotas = tenant_quotas.setdefault(
+        org_id, {"max_users": 1000, "max_workspaces": 1000, "max_scans_per_day": 100000}
+    )
     if payload.max_users is not None:
         quotas["max_users"] = payload.max_users
     if payload.max_workspaces is not None:
@@ -1155,7 +1163,9 @@ async def create_billing_customer(
         "provider": payload.provider,
         "created_at": datetime.utcnow().isoformat(),
     }
-    _audit_org("org.billing.customer.create", current_user.email, org_id, f"provider={payload.provider}")
+    _audit_org(
+        "org.billing.customer.create", current_user.email, org_id, f"provider={payload.provider}"
+    )
     return {"org_id": org_id, "customer": state["customer"]}
 
 
@@ -1173,7 +1183,9 @@ async def set_billing_subscription(
         "status": payload.status,
         "updated_at": datetime.utcnow().isoformat(),
     }
-    _audit_org("org.billing.subscription.update", current_user.email, org_id, f"plan={payload.plan}")
+    _audit_org(
+        "org.billing.subscription.update", current_user.email, org_id, f"plan={payload.plan}"
+    )
     return {"org_id": org_id, "subscription": state["subscription"]}
 
 
@@ -1195,12 +1207,16 @@ async def create_billing_invoice(
         "issued_at": datetime.utcnow().isoformat(),
     }
     state.setdefault("invoices", []).append(invoice)
-    _audit_org("org.billing.invoice.create", current_user.email, org_id, f"amount={payload.amount_cents}")
+    _audit_org(
+        "org.billing.invoice.create", current_user.email, org_id, f"amount={payload.amount_cents}"
+    )
     return {"org_id": org_id, "invoice": invoice}
 
 
 @app.get("/orgs/{org_id}/billing")
-async def get_billing_state(org_id: str, current_user: User = Depends(require_permission("manage"))):
+async def get_billing_state(
+    org_id: str, current_user: User = Depends(require_permission("manage"))
+):
     _ensure_org_exists(org_id)
     _require_org_admin(org_id, current_user.email)
     return {"org_id": org_id, "billing": tenant_billing.get(org_id, {"invoices": []})}
@@ -1216,7 +1232,12 @@ async def store_secret(
     _require_org_admin(org_id, current_user.email)
     org_secrets = vault_store.setdefault(org_id, {})
     org_secrets[payload.name] = payload.value
-    _audit_org("org.security.secret.store", current_user.email, org_id, f"name={payload.name} engine={payload.engine}")
+    _audit_org(
+        "org.security.secret.store",
+        current_user.email,
+        org_id,
+        f"name={payload.name} engine={payload.engine}",
+    )
     return {"org_id": org_id, "stored": True, "name": payload.name, "engine": payload.engine}
 
 
@@ -1261,9 +1282,14 @@ async def decrypt_field_value(
 
 
 @app.get("/orgs/{org_id}/security/policies")
-async def get_security_policies(org_id: str, current_user: User = Depends(require_permission("read"))):
+async def get_security_policies(
+    org_id: str, current_user: User = Depends(require_permission("read"))
+):
     _ensure_org_exists(org_id)
-    if current_user.role not in {"admin", "superadmin"} and current_user.email not in org_memberships.get(org_id, {}):
+    if current_user.role not in {
+        "admin",
+        "superadmin",
+    } and current_user.email not in org_memberships.get(org_id, {}):
         raise HTTPException(status_code=403, detail="Not a member of this organization")
     return {
         "org_id": org_id,
@@ -1302,24 +1328,36 @@ async def set_data_residency(
 ):
     _ensure_org_exists(org_id)
     _require_org_admin(org_id, current_user.email)
-    tenant_data_residency[org_id] = {"region": payload.region, "storage_class": payload.storage_class}
-    _audit_org("org.compliance.data_residency.set", current_user.email, org_id, f"region={payload.region}")
+    tenant_data_residency[org_id] = {
+        "region": payload.region,
+        "storage_class": payload.storage_class,
+    }
+    _audit_org(
+        "org.compliance.data_residency.set", current_user.email, org_id, f"region={payload.region}"
+    )
     return {"org_id": org_id, "data_residency": tenant_data_residency[org_id]}
 
 
 @app.get("/orgs/{org_id}/compliance/data-residency")
 async def get_data_residency(org_id: str, current_user: User = Depends(require_permission("read"))):
     _ensure_org_exists(org_id)
-    if current_user.role not in {"admin", "superadmin"} and current_user.email not in org_memberships.get(org_id, {}):
+    if current_user.role not in {
+        "admin",
+        "superadmin",
+    } and current_user.email not in org_memberships.get(org_id, {}):
         raise HTTPException(status_code=403, detail="Not a member of this organization")
     return {
         "org_id": org_id,
-        "data_residency": tenant_data_residency.get(org_id, {"region": "us-east-1", "storage_class": "standard"}),
+        "data_residency": tenant_data_residency.get(
+            org_id, {"region": "us-east-1", "storage_class": "standard"}
+        ),
     }
 
 
 @app.get("/orgs/{org_id}/retention")
-async def get_org_retention(org_id: str, current_user: User = Depends(require_permission("manage"))):
+async def get_org_retention(
+    org_id: str, current_user: User = Depends(require_permission("manage"))
+):
     """Get data retention policy settings for an organization."""
     _ensure_org_exists(org_id)
     if current_user.email not in org_memberships.get(org_id, {}):
@@ -1352,4 +1390,5 @@ async def set_org_retention(
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8001)

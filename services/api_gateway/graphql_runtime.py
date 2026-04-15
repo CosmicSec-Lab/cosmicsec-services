@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import httpx
 from fastapi import FastAPI
@@ -82,7 +82,7 @@ def _extract_data(payload: Any) -> Any:
     return payload
 
 
-async def _request_json(url: str, method: str = "GET", json_body: Optional[dict] = None) -> Any:
+async def _request_json(url: str, method: str = "GET", json_body: dict | None = None) -> Any:
     async with httpx.AsyncClient() as client:
         if method == "GET":
             resp = await client.get(url, timeout=8.0)
@@ -92,10 +92,10 @@ async def _request_json(url: str, method: str = "GET", json_body: Optional[dict]
     return _extract_data(resp.json())
 
 
-def mount_graphql(app: FastAPI, service_urls: Dict[str, str], logger) -> bool:
+def mount_graphql(app: FastAPI, service_urls: dict[str, str], logger) -> bool:
     """Mount /graphql if Ariadne is available."""
     try:
-        from ariadne import QueryType, MutationType, make_executable_schema
+        from ariadne import MutationType, QueryType, make_executable_schema
         from ariadne.asgi import GraphQL
     except Exception as exc:  # pragma: no cover
         logger.warning("GraphQL runtime unavailable (Ariadne import failed): %s", exc)
@@ -114,22 +114,22 @@ def mount_graphql(app: FastAPI, service_urls: Dict[str, str], logger) -> bool:
         return data
 
     @query.field("scans")
-    async def resolve_scans(*_, limit: int = 10, offset: int = 0) -> List[dict]:
+    async def resolve_scans(*_, limit: int = 10, offset: int = 0) -> list[dict]:
         url = f"{service_urls['scan']}/scans?limit={limit}&offset={offset}"
         data = await _request_json(url)
         return data if isinstance(data, list) else []
 
     @query.field("scan")
-    async def resolve_scan(*_, id: str) -> Optional[dict]:
+    async def resolve_scan(*_, id: str) -> dict | None:
         return await _request_json(f"{service_urls['scan']}/scans/{id}")
 
     @query.field("scanFindings")
-    async def resolve_scan_findings(*_, scanId: str) -> List[dict]:
+    async def resolve_scan_findings(*_, scanId: str) -> list[dict]:
         data = await _request_json(f"{service_urls['scan']}/scans/{scanId}/findings")
         return data if isinstance(data, list) else []
 
     @query.field("agents")
-    async def resolve_agents(*_) -> List[dict]:
+    async def resolve_agents(*_) -> list[dict]:
         try:
             payload = await _request_json(f"{service_urls['agent_relay']}/relay/agents")
             if isinstance(payload, dict):
@@ -139,7 +139,7 @@ def mount_graphql(app: FastAPI, service_urls: Dict[str, str], logger) -> bool:
         return []
 
     @mutation.field("createScan")
-    async def resolve_create_scan(*_, target: str, scanTypes: List[str]) -> dict:
+    async def resolve_create_scan(*_, target: str, scanTypes: list[str]) -> dict:
         return await _request_json(
             f"{service_urls['scan']}/scans",
             method="POST",

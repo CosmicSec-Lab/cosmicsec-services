@@ -1,6 +1,6 @@
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -24,7 +24,7 @@ app = FastAPI(title="CosmicSec Report Service", version="1.0.0")
 class ReportRequest(BaseModel):
     scan_id: str
     format: str = "pdf"
-    findings: List[dict] = Field(default_factory=list)
+    findings: list[dict] = Field(default_factory=list)
 
 
 class ScheduleRequest(BaseModel):
@@ -34,18 +34,18 @@ class ScheduleRequest(BaseModel):
 
 
 class TopologyRequest(BaseModel):
-    nodes: List[dict] = Field(default_factory=list)
-    edges: List[dict] = Field(default_factory=list)
+    nodes: list[dict] = Field(default_factory=list)
+    edges: list[dict] = Field(default_factory=list)
     node_filter: str = Field(default="all")
 
 
 class AttackPathRequest(BaseModel):
-    attack_steps: List[dict] = Field(default_factory=list)
+    attack_steps: list[dict] = Field(default_factory=list)
     highlight_threshold: int = Field(default=70)
 
 
 class ThreatHeatmapRequest(BaseModel):
-    observations: List[dict] = Field(default_factory=list)
+    observations: list[dict] = Field(default_factory=list)
     group_by: str = Field(default="region")
 
 
@@ -56,7 +56,7 @@ class ImmersiveViewRequest(BaseModel):
 
 REPORT_DIR = Path("/tmp/reports")
 REPORT_DIR.mkdir(parents=True, exist_ok=True)
-scheduled_jobs: List[dict] = []
+scheduled_jobs: list[dict] = []
 
 
 def _write_json(file_path: Path, payload: ReportRequest) -> None:
@@ -90,7 +90,7 @@ def _write_csv(file_path: Path, payload: ReportRequest) -> None:
 
 def _write_html(file_path: Path, payload: ReportRequest) -> None:
     rows = "".join(
-        f"<tr><td>{f.get('title','')}</td><td>{f.get('severity','')}</td><td>{f.get('category','')}</td><td>{f.get('description','')}</td></tr>"
+        f"<tr><td>{f.get('title', '')}</td><td>{f.get('severity', '')}</td><td>{f.get('category', '')}</td><td>{f.get('description', '')}</td></tr>"
         for f in payload.findings
     )
     html = f"""
@@ -114,14 +114,16 @@ def _write_pdf(file_path: Path, payload: ReportRequest) -> None:
     pdf = canvas.Canvas(str(file_path))
     pdf.setTitle(f"CosmicSec Report {payload.scan_id}")
     y = 800
-    pdf.drawString(50, y, f"CosmicSec Report")
+    pdf.drawString(50, y, "CosmicSec Report")
     y -= 20
     pdf.drawString(50, y, f"Scan ID: {payload.scan_id}")
     y -= 20
     pdf.drawString(50, y, f"Generated: {datetime.utcnow().isoformat()}")
     y -= 30
     for finding in payload.findings[:25]:
-        pdf.drawString(50, y, f"- {finding.get('title', 'untitled')} ({finding.get('severity', 'n/a')})")
+        pdf.drawString(
+            50, y, f"- {finding.get('title', 'untitled')} ({finding.get('severity', 'n/a')})"
+        )
         y -= 18
         if y < 80:
             pdf.showPage()
@@ -138,7 +140,9 @@ def _write_docx(file_path: Path, payload: ReportRequest) -> None:
     doc.add_paragraph(f"Scan ID: {payload.scan_id}")
     doc.add_paragraph(f"Generated: {datetime.utcnow().isoformat()}")
     for finding in payload.findings:
-        doc.add_paragraph(f"• {finding.get('title', 'untitled')} ({finding.get('severity', 'n/a')})")
+        doc.add_paragraph(
+            f"• {finding.get('title', 'untitled')} ({finding.get('severity', 'n/a')})"
+        )
     doc.save(str(file_path))
 
 
@@ -177,30 +181,66 @@ def generate_report(payload: ReportRequest) -> dict:
 class ComplianceReportRequest(BaseModel):
     scan_id: str
     standard: str = Field(..., description="Compliance standard: nist | pci | hipaa")
-    findings: List[dict] = Field(default_factory=list)
+    findings: list[dict] = Field(default_factory=list)
     include_summary: bool = Field(default=True)
 
 
-def _compliance_template(standard: str, findings: List[dict]) -> Dict[str, Any]:
+def _compliance_template(standard: str, findings: list[dict]) -> dict[str, Any]:
     """Return a basic compliance report structure for a given standard."""
     standard = standard.lower()
     if standard == "nist":
         sections = [
-            {"title": "Access Control", "status": "pending", "notes": "Validate RBAC and session management."},
-            {"title": "Incident Response", "status": "in_progress", "notes": "Document response playbooks."},
-            {"title": "Audit & Accountability", "status": "complete", "notes": "Audit logs are captured with hash chaining."},
+            {
+                "title": "Access Control",
+                "status": "pending",
+                "notes": "Validate RBAC and session management.",
+            },
+            {
+                "title": "Incident Response",
+                "status": "in_progress",
+                "notes": "Document response playbooks.",
+            },
+            {
+                "title": "Audit & Accountability",
+                "status": "complete",
+                "notes": "Audit logs are captured with hash chaining.",
+            },
         ]
     elif standard == "pci":
         sections = [
-            {"title": "Cardholder Data Protection", "status": "in_progress", "notes": "Encryption in transit and at rest."},
-            {"title": "Vulnerability Management", "status": "in_progress", "notes": "Automated scan schedule enabled."},
-            {"title": "Access Control", "status": "pending", "notes": "MFA required for admin access."},
+            {
+                "title": "Cardholder Data Protection",
+                "status": "in_progress",
+                "notes": "Encryption in transit and at rest.",
+            },
+            {
+                "title": "Vulnerability Management",
+                "status": "in_progress",
+                "notes": "Automated scan schedule enabled.",
+            },
+            {
+                "title": "Access Control",
+                "status": "pending",
+                "notes": "MFA required for admin access.",
+            },
         ]
     else:
         sections = [
-            {"title": "Risk Assessment", "status": "in_progress", "notes": "Regular assessments scheduled."},
-            {"title": "Media Protection", "status": "pending", "notes": "Data at rest encryption review."},
-            {"title": "Audit Controls", "status": "complete", "notes": "Audit logs are immutable and retained."},
+            {
+                "title": "Risk Assessment",
+                "status": "in_progress",
+                "notes": "Regular assessments scheduled.",
+            },
+            {
+                "title": "Media Protection",
+                "status": "pending",
+                "notes": "Data at rest encryption review.",
+            },
+            {
+                "title": "Audit Controls",
+                "status": "complete",
+                "notes": "Audit logs are immutable and retained.",
+            },
         ]
 
     return {
@@ -239,7 +279,11 @@ def generate_topology(payload: TopologyRequest) -> dict:
     if payload.node_filter != "all":
         filtered_nodes = [n for n in payload.nodes if n.get("type") == payload.node_filter]
     allowed_ids = {n.get("id") for n in filtered_nodes}
-    filtered_edges = [e for e in payload.edges if e.get("source") in allowed_ids and e.get("target") in allowed_ids]
+    filtered_edges = [
+        e
+        for e in payload.edges
+        if e.get("source") in allowed_ids and e.get("target") in allowed_ids
+    ]
     return {
         "mode": "threejs-ready",
         "node_count": len(filtered_nodes),
@@ -252,7 +296,9 @@ def generate_topology(payload: TopologyRequest) -> dict:
 @app.post("/visualization/attack-path")
 def build_attack_path(payload: AttackPathRequest) -> dict:
     ranked = sorted(payload.attack_steps, key=lambda s: int(s.get("risk", 0)), reverse=True)
-    highlighted = [step for step in ranked if int(step.get("risk", 0)) >= payload.highlight_threshold]
+    highlighted = [
+        step for step in ranked if int(step.get("risk", 0)) >= payload.highlight_threshold
+    ]
     return {
         "total_steps": len(payload.attack_steps),
         "highlighted_steps": len(highlighted),
@@ -264,7 +310,7 @@ def build_attack_path(payload: AttackPathRequest) -> dict:
 
 @app.post("/visualization/heatmap")
 def create_threat_heatmap(payload: ThreatHeatmapRequest) -> dict:
-    buckets: Dict[str, Dict[str, Any]] = {}
+    buckets: dict[str, dict[str, Any]] = {}
     for obs in payload.observations:
         bucket = str(obs.get(payload.group_by, "unknown"))
         severity = str(obs.get("severity", "low")).lower()

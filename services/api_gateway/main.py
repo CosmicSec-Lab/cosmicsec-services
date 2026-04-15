@@ -2,22 +2,24 @@
 CosmicSec API Gateway
 Main entry point for all API requests with routing, authentication, and rate limiting
 """
-from fastapi import FastAPI, Request, Depends, HTTPException, status, WebSocket, WebSocketDisconnect
+
+import asyncio
+import json
+import logging
+import re
+import time
+import uuid
+from datetime import timedelta
+from typing import Optional
+
+import httpx
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
-import re
-import httpx
-import json
-import time
-import asyncio
-import uuid
-from typing import Optional
-import logging
-from datetime import timedelta
+from slowapi.util import get_remote_address
 
 from cosmicsec_platform.contracts.runtime_metadata import HYBRID_SCHEMA, HYBRID_VERSION
 from cosmicsec_platform.middleware.hybrid_router import HybridRouter
@@ -26,9 +28,59 @@ from cosmicsec_platform.middleware.static_profiles import STATIC_PROFILES
 from services.api_gateway.graphql_runtime import mount_graphql
 from services.common.caching import CacheManager, get_redis
 from services.common.exceptions import CosmicSecException
-from services.common.logging import clear_context, set_request_id, set_trace_id, setup_structured_logging
+from services.common.logging import (
+    clear_context,
+    set_request_id,
+    set_trace_id,
+    setup_structured_logging,
+)
 from services.common.observability import setup_observability
 from services.common.versioning import APIVersionMiddleware
+
+# ---------------------------------------------------------------------------
+# Security helpers — path-parameter validation & log sanitization
+# ---------------------------------------------------------------------------
+
+# Compiled patterns for path parameter validation
+_RE_ALPHANUMERIC_ID = re.compile(r"^[A-Za-z0-9_\-]{1,128}$")
+_RE_EMAIL = re.compile(r"^[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9.\-]{1,253}\.[A-Za-z]{2,}$")
+_RE_PLUGIN_NAME = re.compile(r"^[A-Za-z0-9_\-]{1,128}$")
+_RE_UUID = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
+)
+
+
+def _validate_path_id(value: str, label: str = "id") -> str:
+    """Validate an alphanumeric path parameter to prevent SSRF path injection.
+
+    Accepts letters, digits, hyphens and underscores (max 128 chars).
+    Raises HTTP 400 if the value is invalid.
+    """
+    if not _RE_ALPHANUMERIC_ID.match(value):
+        raise HTTPException(
+            status_code=400, detail=f"Invalid {label}: must be alphanumeric (max 128 chars)"
+        )
+    return value
+
+
+def _validate_email_param(value: str) -> str:
+    """Validate an email path parameter to prevent SSRF path injection."""
+    if not _RE_EMAIL.match(value):
+        raise HTTPException(status_code=400, detail="Invalid email format in path")
+    return value
+
+
+def _sanitize_log(value: object, max_len: int = 200) -> str:
+    """Sanitize a user-provided value before including it in a log message.
+
+    Removes newline and carriage-return characters to prevent log injection,
+    and truncates to ``max_len`` characters.
+    """
+    text = str(value) if value is not None else ""
+    # Strip log-injection control characters
+    text = text.replace("\n", "\\n").replace("\r", "\\r").replace("\x00", "")
+    return text[:max_len]
+
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -37,12 +89,13 @@ app = FastAPI(
     version="1.0.0",
     docs_url="/api/docs",
     redoc_url="/api/redoc",
-    openapi_url="/api/openapi.json"
+    openapi_url="/api/openapi.json",
 )
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = setup_structured_logging("api_gateway")
+
 
 # Rate limiting
 def get_user_identifier(request: Request) -> str:
@@ -51,12 +104,14 @@ def get_user_identifier(request: Request) -> str:
     if auth_header.startswith("Bearer "):
         try:
             import base64 as _b64
+
             token = auth_header.split(" ", 1)[1]
             parts = token.split(".")
             if len(parts) == 3:
                 payload_bytes = parts[1] + "=="  # add padding
                 decoded = _b64.urlsafe_b64decode(payload_bytes)
                 import json as _json
+
                 claims = _json.loads(decoded)
                 sub = claims.get("sub") or claims.get("user_id")
                 if sub:
@@ -125,7 +180,9 @@ async def add_process_time_header(request: Request, call_next):
     response = await call_next(request)
     process_time = time.time() - start_time
     response.headers["X-Process-Time"] = str(process_time)
-    logger.info(f"{request.method} {request.url.path} - {response.status_code} - {process_time:.3f}s")
+    logger.info(
+        f"{request.method} {request.url.path} - {response.status_code} - {process_time:.3f}s"
+    )
     return response
 
 
@@ -159,15 +216,21 @@ async def waf_middleware(request: Request, call_next):
             if _SQL_INJECTION_RE.search(body_str) or _XSS_RE.search(body_str):
                 return JSONResponse(
                     status_code=400,
-                    content={"detail": "Request blocked by security policy", "error_code": "WAF_BLOCKED"},
+                    content={
+                        "detail": "Request blocked by security policy",
+                        "error_code": "WAF_BLOCKED",
+                    },
                 )
+
             # Re-attach body so downstream can read it
             async def receive():
                 return {"type": "http.request", "body": body_bytes}
+
             request._receive = receive  # type: ignore[attr-defined]
         except Exception:
             pass
     return await call_next(request)
+
 
 # Service URLs (configure via environment variables in production)
 SERVICE_URLS = {
@@ -233,7 +296,7 @@ async def root():
         "ai_engine": "Helix AI",
         "version": "1.0.0",
         "status": "operational",
-        "documentation": "/api/docs"
+        "documentation": "/api/docs",
     }
 
 
@@ -243,11 +306,7 @@ async def health_check():
     return {
         "status": "healthy",
         "timestamp": time.time(),
-        "services": {
-            "api_gateway": "operational",
-            "database": "connected",
-            "cache": "connected"
-        },
+        "services": {"api_gateway": "operational", "database": "connected", "cache": "connected"},
         "runtime_mode_default": hybrid_router.default_mode.value,
     }
 
@@ -274,13 +333,10 @@ async def api_status(request: Request):
                 response = await client.get(f"{service_url}/health", timeout=2.0)
                 service_status[service_name] = {
                     "status": "healthy" if response.status_code == 200 else "unhealthy",
-                    "response_time": response.elapsed.total_seconds()
+                    "response_time": response.elapsed.total_seconds(),
                 }
             except Exception as e:
-                service_status[service_name] = {
-                    "status": "unreachable",
-                    "error": str(e)
-                }
+                service_status[service_name] = {"status": "unreachable", "error": str(e)}
 
     response_body = {
         "gateway": "operational",
@@ -290,7 +346,9 @@ async def api_status(request: Request):
     }
     try:
         cache_manager = CacheManager(await get_redis())
-        await cache_manager.set(cache_key, response_body, ttl=timedelta(seconds=15), tags=["status"])
+        await cache_manager.set(
+            cache_key, response_body, ttl=timedelta(seconds=15), tags=["status"]
+        )
     except Exception as exc:
         logger.warning("API status cache write skipped: %s", exc)
     return response_body
@@ -347,10 +405,13 @@ async def dashboard_summary(request: Request):
     }
     try:
         cache_manager = CacheManager(await get_redis())
-        await cache_manager.set(cache_key, response_body, ttl=timedelta(seconds=30), tags=["dashboard"])
+        await cache_manager.set(
+            cache_key, response_body, ttl=timedelta(seconds=30), tags=["dashboard"]
+        )
     except Exception as exc:
         logger.warning("Dashboard summary cache write skipped: %s", exc)
     return response_body
+
 
 @app.get("/api/dashboard/overview")
 @limiter.limit("60/minute")
@@ -392,13 +453,17 @@ async def dashboard_overview(request: Request):
             resp = await client.get(f"{SERVICE_URLS['scan']}/agents", timeout=3.0)
             if resp.status_code == 200:
                 data = resp.json()
-                active_agents = len([a for a in data.get("agents", []) if a.get("status") == "online"])
+                active_agents = len(
+                    [a for a in data.get("agents", []) if a.get("status") == "online"]
+                )
         except Exception:
             pass
 
         # Bug bounty open count
         try:
-            resp = await client.get(f"{SERVICE_URLS['bugbounty']}/submissions?status=open&limit=100", timeout=3.0)
+            resp = await client.get(
+                f"{SERVICE_URLS['bugbounty']}/submissions?status=open&limit=100", timeout=3.0
+            )
             if resp.status_code == 200:
                 data = resp.json()
                 open_bugs = len(data.get("items", []))
@@ -428,12 +493,13 @@ async def dashboard_overview(request: Request):
 
     try:
         cache_manager = CacheManager(await get_redis())
-        await cache_manager.set(cache_key, response_body, ttl=timedelta(seconds=30), tags=["dashboard", "overview"])
+        await cache_manager.set(
+            cache_key, response_body, ttl=timedelta(seconds=30), tags=["dashboard", "overview"]
+        )
     except Exception as exc:
         logger.warning("Dashboard overview cache write skipped: %s", exc)
 
     return response_body
-
 
 
 async def register(request: Request):
@@ -442,19 +508,14 @@ async def register(request: Request):
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(
-                f"{SERVICE_URLS['auth']}/register",
-                json=data,
-                timeout=10.0
+                f"{SERVICE_URLS['auth']}/register", json=data, timeout=10.0
             )
-            return JSONResponse(
-                status_code=response.status_code,
-                content=response.json()
-            )
+            return JSONResponse(status_code=response.status_code, content=response.json())
         except Exception as e:
             logger.error(f"Auth service error: {e}")
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Authentication service unavailable"
+                detail="Authentication service unavailable",
             )
 
 
@@ -500,7 +561,9 @@ async def create_api_key(request: Request):
         headers["Authorization"] = request.headers.get("Authorization")
     async with httpx.AsyncClient() as client:
         try:
-            response = await client.post(f"{SERVICE_URLS['auth']}/apikeys", json=data, headers=headers, timeout=10.0)
+            response = await client.post(
+                f"{SERVICE_URLS['auth']}/apikeys", json=data, headers=headers, timeout=10.0
+            )
             return JSONResponse(status_code=response.status_code, content=response.json())
         except Exception as e:
             logger.error("Auth service error: %s", e)
@@ -516,7 +579,9 @@ async def list_api_keys(request: Request):
         headers["Authorization"] = request.headers.get("Authorization")
     async with httpx.AsyncClient() as client:
         try:
-            response = await client.get(f"{SERVICE_URLS['auth']}/apikeys", headers=headers, timeout=10.0)
+            response = await client.get(
+                f"{SERVICE_URLS['auth']}/apikeys", headers=headers, timeout=10.0
+            )
             return JSONResponse(status_code=response.status_code, content=response.json())
         except Exception as e:
             logger.error("Auth service error: %s", e)
@@ -527,12 +592,17 @@ async def list_api_keys(request: Request):
 @limiter.limit("30/minute")
 async def delete_api_key(request: Request, key_id: str):
     """Revoke an API key — proxied to auth service."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", key_id):
+        raise HTTPException(status_code=400, detail="Invalid key_id format")
+
     headers = {}
     if request.headers.get("Authorization"):
         headers["Authorization"] = request.headers.get("Authorization")
     async with httpx.AsyncClient() as client:
         try:
-            response = await client.delete(f"{SERVICE_URLS['auth']}/apikeys/{key_id}", headers=headers, timeout=10.0)
+            response = await client.delete(
+                f"{SERVICE_URLS['auth']}/apikeys/{key_id}", headers=headers, timeout=10.0
+            )
             return JSONResponse(status_code=response.status_code, content=response.json())
         except Exception as e:
             logger.error("Auth service error: %s", e)
@@ -545,7 +615,9 @@ async def gdpr_export(request: Request):
     params = dict(request.query_params)
     async with httpx.AsyncClient() as client:
         try:
-            response = await client.get(f"{SERVICE_URLS['auth']}/gdpr/export", params=params, timeout=10.0)
+            response = await client.get(
+                f"{SERVICE_URLS['auth']}/gdpr/export", params=params, timeout=10.0
+            )
             return JSONResponse(status_code=response.status_code, content=response.json())
         except Exception as e:
             logger.error(f"Auth service error: {e}")
@@ -558,7 +630,9 @@ async def gdpr_delete(request: Request):
     params = dict(request.query_params)
     async with httpx.AsyncClient() as client:
         try:
-            response = await client.delete(f"{SERVICE_URLS['auth']}/gdpr/delete", params=params, timeout=10.0)
+            response = await client.delete(
+                f"{SERVICE_URLS['auth']}/gdpr/delete", params=params, timeout=10.0
+            )
             return JSONResponse(status_code=response.status_code, content=response.json())
         except Exception as e:
             logger.error(f"Auth service error: {e}")
@@ -611,12 +685,12 @@ async def platform_info():
         "project": {
             "name": "CosmicSec",
             "version": "1.0.0",
-            "description": "Universal Cybersecurity Intelligence Platform"
+            "description": "Universal Cybersecurity Intelligence Platform",
         },
         "platform": {
             "name": "GuardAxisSphere",
             "tagline": "Enterprise Security Command Center",
-            "description": "Multi-dimensional security platform for modern enterprises"
+            "description": "Multi-dimensional security platform for modern enterprises",
         },
         "ai_engine": {
             "name": "Helix AI",
@@ -626,16 +700,16 @@ async def platform_info():
                 "Vulnerability assessment",
                 "Intelligent automation",
                 "Exploit generation",
-                "Code analysis"
-            ]
+                "Code analysis",
+            ],
         },
         "features": [
             "Multi-tenant architecture",
             "Distributed scanning",
             "AI-powered analysis",
             "Real-time collaboration",
-            "Enterprise compliance"
-        ]
+            "Enterprise compliance",
+        ],
     }
 
 
@@ -737,7 +811,7 @@ async def ai_kb_ingest(request: Request):
                 timeout=10.0,
             )
             return JSONResponse(status_code=response.status_code, content=response.json())
-        except Exception as e:
+        except Exception:
             raise HTTPException(status_code=503, detail="AI service unavailable")
 
 
@@ -749,7 +823,7 @@ async def ai_kb_stats(request: Request):
         try:
             response = await client.get(f"{SERVICE_URLS['ai']}/kb/stats", timeout=5.0)
             return JSONResponse(status_code=response.status_code, content=response.json())
-        except Exception as e:
+        except Exception:
             raise HTTPException(status_code=503, detail="AI service unavailable")
 
 
@@ -862,7 +936,9 @@ async def runtime_slo(request: Request):
     metrics = hybrid_router.get_metrics()
     total_degradation_events = metrics["fallback_total"] + metrics["policy_denied_total"]
     total_observed_events = metrics["dynamic_total"] + metrics["static_total"]
-    degraded_ratio = (total_degradation_events / total_observed_events) if total_observed_events else 0.0
+    degraded_ratio = (
+        (total_degradation_events / total_observed_events) if total_observed_events else 0.0
+    )
 
     return {
         "window": "rolling-process-lifetime",
@@ -877,7 +953,9 @@ async def runtime_slo(request: Request):
             "total_degradation_events": total_degradation_events,
         },
         "error_budget": {
-            "availability_remaining": round(max(0.0, 0.995 - (1.0 - metrics["dynamic_success_rate"])), 4),
+            "availability_remaining": round(
+                max(0.0, 0.995 - (1.0 - metrics["dynamic_success_rate"])), 4
+            ),
             "degradation_remaining": round(max(0.0, 0.10 - degraded_ratio), 4),
         },
     }
@@ -938,7 +1016,8 @@ async def runtime_compliance(request: Request):
     sections = {
         "8_static_module_requirements": {
             "deterministic_schema_contract": True,
-            "avoid_privileged_fallback": ROUTE_POLICIES["auth.refresh"].fallback_policy == "disabled",
+            "avoid_privileged_fallback": ROUTE_POLICIES["auth.refresh"].fallback_policy
+            == "disabled",
             "advisory_fields_present": True,
             "fallback_audit_logging": True,
             "testable_without_external_dependencies": True,
@@ -951,7 +1030,8 @@ async def runtime_compliance(request: Request):
         },
         "10_success_criteria": {
             "gateway_responsive_with_fallback": True,
-            "security_critical_no_silent_bypass": ROUTE_POLICIES["auth.refresh"].fallback_policy == "disabled",
+            "security_critical_no_silent_bypass": ROUTE_POLICIES["auth.refresh"].fallback_policy
+            == "disabled",
             "observable_mode_and_fallback": tracing["buffer_size"] > 0,
             "tests_passing_baseline": True,
             "docs_aligned_with_implementation": True,
@@ -1019,7 +1099,9 @@ async def threat_intel_ip(request: Request):
     params = dict(request.query_params)
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.get(f"{SERVICE_URLS['report']}/threat-intel/ip", params=params, timeout=5.0)
+            resp = await client.get(
+                f"{SERVICE_URLS['report']}/threat-intel/ip", params=params, timeout=5.0
+            )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
             raise HTTPException(status_code=503, detail="Integration service unavailable")
@@ -1031,7 +1113,9 @@ async def threat_intel_domain(request: Request):
     params = dict(request.query_params)
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.get(f"{SERVICE_URLS['report']}/threat-intel/domain", params=params, timeout=5.0)
+            resp = await client.get(
+                f"{SERVICE_URLS['report']}/threat-intel/domain", params=params, timeout=5.0
+            )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
             raise HTTPException(status_code=503, detail="Integration service unavailable")
@@ -1069,15 +1153,19 @@ async def admin_create_user(request: Request):
 @app.put("/api/admin/users/{email}")
 @limiter.limit("30/minute")
 async def admin_update_user(request: Request, email: str):
+    email = _validate_email_param(email)
     payload = await request.json()
     async with httpx.AsyncClient() as client:
-        response = await client.put(f"{SERVICE_URLS['auth']}/users/{email}", json=payload, timeout=10.0)
+        response = await client.put(
+            f"{SERVICE_URLS['auth']}/users/{email}", json=payload, timeout=10.0
+        )
         return JSONResponse(status_code=response.status_code, content=response.json())
 
 
 @app.delete("/api/admin/users/{email}")
 @limiter.limit("30/minute")
 async def admin_delete_user(request: Request, email: str):
+    email = _validate_email_param(email)
     async with httpx.AsyncClient() as client:
         response = await client.delete(f"{SERVICE_URLS['auth']}/users/{email}", timeout=10.0)
         return JSONResponse(status_code=response.status_code, content=response.json())
@@ -1088,7 +1176,9 @@ async def admin_delete_user(request: Request, email: str):
 async def admin_assign_role(request: Request):
     payload = await request.json()
     async with httpx.AsyncClient() as client:
-        response = await client.post(f"{SERVICE_URLS['auth']}/roles/assign", json=payload, timeout=10.0)
+        response = await client.post(
+            f"{SERVICE_URLS['auth']}/roles/assign", json=payload, timeout=10.0
+        )
         return JSONResponse(status_code=response.status_code, content=response.json())
 
 
@@ -1114,13 +1204,16 @@ async def admin_set_config(request: Request):
 async def admin_get_audit_logs(request: Request):
     query = dict(request.query_params)
     async with httpx.AsyncClient() as client:
-        response = await client.get(f"{SERVICE_URLS['auth']}/audit-logs", params=query, timeout=10.0)
+        response = await client.get(
+            f"{SERVICE_URLS['auth']}/audit-logs", params=query, timeout=10.0
+        )
         return JSONResponse(status_code=response.status_code, content=response.json())
 
 
 # ---------------------------------------------------------------------------
 # Phase 3.1 — Multi-tenant org/workspace routes
 # ---------------------------------------------------------------------------
+
 
 @app.post("/api/orgs")
 @limiter.limit("20/minute")
@@ -1142,15 +1235,19 @@ async def list_orgs(request: Request):
 @app.post("/api/orgs/{org_id}/members")
 @limiter.limit("30/minute")
 async def add_org_member(request: Request, org_id: str):
+    org_id = _validate_path_id(org_id, "org_id")
     payload = await request.json()
     async with httpx.AsyncClient() as client:
-        response = await client.post(f"{SERVICE_URLS['auth']}/orgs/{org_id}/members", json=payload, timeout=10.0)
+        response = await client.post(
+            f"{SERVICE_URLS['auth']}/orgs/{org_id}/members", json=payload, timeout=10.0
+        )
         return JSONResponse(status_code=response.status_code, content=response.json())
 
 
 @app.get("/api/orgs/{org_id}/members")
 @limiter.limit("60/minute")
 async def list_org_members(request: Request, org_id: str):
+    org_id = _validate_path_id(org_id, "org_id")
     async with httpx.AsyncClient() as client:
         response = await client.get(f"{SERVICE_URLS['auth']}/orgs/{org_id}/members", timeout=10.0)
         return JSONResponse(status_code=response.status_code, content=response.json())
@@ -1159,23 +1256,30 @@ async def list_org_members(request: Request, org_id: str):
 @app.post("/api/orgs/{org_id}/workspaces")
 @limiter.limit("30/minute")
 async def create_workspace(request: Request, org_id: str):
+    org_id = _validate_path_id(org_id, "org_id")
     payload = await request.json()
     async with httpx.AsyncClient() as client:
-        response = await client.post(f"{SERVICE_URLS['auth']}/orgs/{org_id}/workspaces", json=payload, timeout=10.0)
+        response = await client.post(
+            f"{SERVICE_URLS['auth']}/orgs/{org_id}/workspaces", json=payload, timeout=10.0
+        )
         return JSONResponse(status_code=response.status_code, content=response.json())
 
 
 @app.get("/api/orgs/{org_id}/workspaces")
 @limiter.limit("60/minute")
 async def list_workspaces(request: Request, org_id: str):
+    org_id = _validate_path_id(org_id, "org_id")
     async with httpx.AsyncClient() as client:
-        response = await client.get(f"{SERVICE_URLS['auth']}/orgs/{org_id}/workspaces", timeout=10.0)
+        response = await client.get(
+            f"{SERVICE_URLS['auth']}/orgs/{org_id}/workspaces", timeout=10.0
+        )
         return JSONResponse(status_code=response.status_code, content=response.json())
 
 
 @app.get("/api/orgs/{org_id}/quotas")
 @limiter.limit("60/minute")
 async def get_org_quotas(request: Request, org_id: str):
+    org_id = _validate_path_id(org_id, "org_id")
     async with httpx.AsyncClient() as client:
         response = await client.get(f"{SERVICE_URLS['auth']}/orgs/{org_id}/quotas", timeout=10.0)
         return JSONResponse(status_code=response.status_code, content=response.json())
@@ -1184,9 +1288,12 @@ async def get_org_quotas(request: Request, org_id: str):
 @app.post("/api/orgs/{org_id}/quotas")
 @limiter.limit("20/minute")
 async def set_org_quotas(request: Request, org_id: str):
+    org_id = _validate_path_id(org_id, "org_id")
     payload = await request.json()
     async with httpx.AsyncClient() as client:
-        response = await client.post(f"{SERVICE_URLS['auth']}/orgs/{org_id}/quotas", json=payload, timeout=10.0)
+        response = await client.post(
+            f"{SERVICE_URLS['auth']}/orgs/{org_id}/quotas", json=payload, timeout=10.0
+        )
         return JSONResponse(status_code=response.status_code, content=response.json())
 
 
@@ -1216,6 +1323,7 @@ async def dashboard_stream(websocket: WebSocket):
 # Phase 2 — Collab service proxy routes
 # ---------------------------------------------------------------------------
 
+
 @app.get("/api/collab/rooms")
 @limiter.limit("60/minute")
 async def collab_list_rooms(request: Request):
@@ -1223,7 +1331,7 @@ async def collab_list_rooms(request: Request):
         try:
             response = await client.get(f"{SERVICE_URLS['collab']}/rooms", timeout=5.0)
             return JSONResponse(status_code=response.status_code, content=response.json())
-        except Exception as e:
+        except Exception:
             raise HTTPException(status_code=503, detail="Collab service unavailable")
 
 
@@ -1239,7 +1347,7 @@ async def collab_get_messages(request: Request, room_id: str):
                 timeout=5.0,
             )
             return JSONResponse(status_code=response.status_code, content=response.json())
-        except Exception as e:
+        except Exception:
             raise HTTPException(status_code=503, detail="Collab service unavailable")
 
 
@@ -1255,7 +1363,7 @@ async def collab_post_message(request: Request, room_id: str):
                 timeout=5.0,
             )
             return JSONResponse(status_code=response.status_code, content=response.json())
-        except Exception as e:
+        except Exception:
             raise HTTPException(status_code=503, detail="Collab service unavailable")
 
 
@@ -1268,7 +1376,7 @@ async def collab_presence(request: Request, room_id: str):
                 f"{SERVICE_URLS['collab']}/rooms/{room_id}/presence", timeout=5.0
             )
             return JSONResponse(status_code=response.status_code, content=response.json())
-        except Exception as e:
+        except Exception:
             raise HTTPException(status_code=503, detail="Collab service unavailable")
 
 
@@ -1282,13 +1390,14 @@ async def collab_activity_feed(request: Request):
                 f"{SERVICE_URLS['collab']}/activity-feed", params=params, timeout=5.0
             )
             return JSONResponse(status_code=response.status_code, content=response.json())
-        except Exception as e:
+        except Exception:
             raise HTTPException(status_code=503, detail="Collab service unavailable")
 
 
 # ---------------------------------------------------------------------------
 # Phase 2 — Plugin registry proxy routes
 # ---------------------------------------------------------------------------
+
 
 @app.get("/api/plugins")
 @limiter.limit("60/minute")
@@ -1297,7 +1406,7 @@ async def plugins_list(request: Request):
         try:
             response = await client.get(f"{SERVICE_URLS['plugins']}/plugins", timeout=5.0)
             return JSONResponse(status_code=response.status_code, content=response.json())
-        except Exception as e:
+        except Exception:
             raise HTTPException(status_code=503, detail="Plugin registry unavailable")
 
 
@@ -1308,7 +1417,7 @@ async def plugin_detail(request: Request, name: str):
         try:
             response = await client.get(f"{SERVICE_URLS['plugins']}/plugins/{name}", timeout=5.0)
             return JSONResponse(status_code=response.status_code, content=response.json())
-        except Exception as e:
+        except Exception:
             raise HTTPException(status_code=503, detail="Plugin registry unavailable")
 
 
@@ -1324,7 +1433,7 @@ async def plugin_run(request: Request, name: str):
                 timeout=30.0,
             )
             return JSONResponse(status_code=response.status_code, content=response.json())
-        except Exception as e:
+        except Exception:
             raise HTTPException(status_code=503, detail="Plugin registry unavailable")
 
 
@@ -1337,7 +1446,7 @@ async def plugin_enable(request: Request, name: str):
                 f"{SERVICE_URLS['plugins']}/plugins/{name}/enable", timeout=5.0
             )
             return JSONResponse(status_code=response.status_code, content=response.json())
-        except Exception as e:
+        except Exception:
             raise HTTPException(status_code=503, detail="Plugin registry unavailable")
 
 
@@ -1350,7 +1459,7 @@ async def plugin_disable(request: Request, name: str):
                 f"{SERVICE_URLS['plugins']}/plugins/{name}/disable", timeout=5.0
             )
             return JSONResponse(status_code=response.status_code, content=response.json())
-        except Exception as e:
+        except Exception:
             raise HTTPException(status_code=503, detail="Plugin registry unavailable")
 
 
@@ -1360,13 +1469,16 @@ async def plugin_disable(request: Request, name: str):
 
 # Continuous monitoring -------------------------------------------------------
 
+
 @app.post("/api/scan/monitor/schedule")
 @limiter.limit("20/minute")
 async def scan_monitor_schedule(request: Request):
     data = await request.json()
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.post(f"{SERVICE_URLS['scan']}/monitor/schedule", json=data, timeout=10.0)
+            resp = await client.post(
+                f"{SERVICE_URLS['scan']}/monitor/schedule", json=data, timeout=10.0
+            )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
             raise HTTPException(status_code=503, detail="Scan service unavailable")
@@ -1397,9 +1509,12 @@ async def scan_monitor_job_detail(request: Request, job_id: str):
 @app.post("/api/scan/monitor/jobs/{job_id}/pause")
 @limiter.limit("20/minute")
 async def scan_monitor_pause(request: Request, job_id: str):
+    job_id = _validate_path_id(job_id, "job_id")
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.post(f"{SERVICE_URLS['scan']}/monitor/jobs/{job_id}/pause", timeout=5.0)
+            resp = await client.post(
+                f"{SERVICE_URLS['scan']}/monitor/jobs/{job_id}/pause", timeout=5.0
+            )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
             raise HTTPException(status_code=503, detail="Scan service unavailable")
@@ -1408,9 +1523,12 @@ async def scan_monitor_pause(request: Request, job_id: str):
 @app.post("/api/scan/monitor/jobs/{job_id}/resume")
 @limiter.limit("20/minute")
 async def scan_monitor_resume(request: Request, job_id: str):
+    job_id = _validate_path_id(job_id, "job_id")
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.post(f"{SERVICE_URLS['scan']}/monitor/jobs/{job_id}/resume", timeout=5.0)
+            resp = await client.post(
+                f"{SERVICE_URLS['scan']}/monitor/jobs/{job_id}/resume", timeout=5.0
+            )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
             raise HTTPException(status_code=503, detail="Scan service unavailable")
@@ -1429,6 +1547,7 @@ async def scan_monitor_cancel(request: Request, job_id: str):
 
 # API fuzzing -----------------------------------------------------------------
 
+
 @app.post("/api/scans/fuzz")
 @limiter.limit("10/minute")
 async def scans_fuzz(request: Request):
@@ -1444,6 +1563,7 @@ async def scans_fuzz(request: Request):
 
 # Container / K8s scanning ----------------------------------------------------
 
+
 @app.post("/api/scans/container")
 @limiter.limit("20/minute")
 async def scans_container(request: Request):
@@ -1451,13 +1571,16 @@ async def scans_container(request: Request):
     data = await request.json()
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.post(f"{SERVICE_URLS['scan']}/scans/container", json=data, timeout=30.0)
+            resp = await client.post(
+                f"{SERVICE_URLS['scan']}/scans/container", json=data, timeout=30.0
+            )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
             raise HTTPException(status_code=503, detail="Scan service unavailable")
 
 
 # Smart scan plan -------------------------------------------------------------
+
 
 @app.post("/api/scans/smart-plan")
 @limiter.limit("20/minute")
@@ -1466,13 +1589,16 @@ async def scans_smart_plan(request: Request):
     data = await request.json()
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.post(f"{SERVICE_URLS['scan']}/scans/smart-plan", json=data, timeout=30.0)
+            resp = await client.post(
+                f"{SERVICE_URLS['scan']}/scans/smart-plan", json=data, timeout=30.0
+            )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
             raise HTTPException(status_code=503, detail="Scan service unavailable")
 
 
 # Cloud configuration scan ----------------------------------------------------
+
 
 @app.post("/api/scans/cloud")
 @limiter.limit("10/minute")
@@ -1489,13 +1615,16 @@ async def scans_cloud(request: Request):
 
 # Distributed scanning --------------------------------------------------------
 
+
 @app.post("/api/scan/distributed/nodes/register")
 @limiter.limit("20/minute")
 async def scan_register_node(request: Request):
     data = await request.json()
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.post(f"{SERVICE_URLS['scan']}/distributed/nodes/register", json=data, timeout=10.0)
+            resp = await client.post(
+                f"{SERVICE_URLS['scan']}/distributed/nodes/register", json=data, timeout=10.0
+            )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
             raise HTTPException(status_code=503, detail="Scan service unavailable")
@@ -1534,7 +1663,9 @@ async def scan_distributed_assign(request: Request):
     data = await request.json()
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.post(f"{SERVICE_URLS['scan']}/distributed/assign", json=data, timeout=10.0)
+            resp = await client.post(
+                f"{SERVICE_URLS['scan']}/distributed/assign", json=data, timeout=10.0
+            )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
             raise HTTPException(status_code=503, detail="Scan service unavailable")
@@ -1558,6 +1689,7 @@ async def scan_distributed_complete(request: Request, node_id: str):
 # Phase 2 — AI service new routes
 # ==========================================================================
 
+
 @app.post("/api/ai/agent/autonomous")
 @limiter.limit("10/minute")
 async def ai_agent_autonomous(request: Request):
@@ -1565,7 +1697,9 @@ async def ai_agent_autonomous(request: Request):
     data = await request.json()
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.post(f"{SERVICE_URLS['ai']}/agent/autonomous", json=data, timeout=60.0)
+            resp = await client.post(
+                f"{SERVICE_URLS['ai']}/agent/autonomous", json=data, timeout=60.0
+            )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
             raise HTTPException(status_code=503, detail="AI service unavailable")
@@ -1578,7 +1712,9 @@ async def ai_exploit_suggest(request: Request):
     data = await request.json()
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.post(f"{SERVICE_URLS['ai']}/exploit/suggest", json=data, timeout=30.0)
+            resp = await client.post(
+                f"{SERVICE_URLS['ai']}/exploit/suggest", json=data, timeout=30.0
+            )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
             raise HTTPException(status_code=503, detail="AI service unavailable")
@@ -1604,7 +1740,9 @@ async def ai_anomaly_detect(request: Request):
     data = await request.json()
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.post(f"{SERVICE_URLS['ai']}/anomaly/detect", json=data, timeout=15.0)
+            resp = await client.post(
+                f"{SERVICE_URLS['ai']}/anomaly/detect", json=data, timeout=15.0
+            )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
             raise HTTPException(status_code=503, detail="AI service unavailable")
@@ -1627,13 +1765,17 @@ async def ai_anomaly_batch(request: Request):
 # Phase 2 — Collaborative report editing routes
 # ==========================================================================
 
+
 @app.post("/api/collab/rooms/{room_id}/reports")
 @limiter.limit("30/minute")
 async def collab_create_report_section(request: Request, room_id: str):
+    room_id = _validate_path_id(room_id, "room_id")
     data = await request.json()
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.post(f"{SERVICE_URLS['collab']}/rooms/{room_id}/reports", json=data, timeout=10.0)
+            resp = await client.post(
+                f"{SERVICE_URLS['collab']}/rooms/{room_id}/reports", json=data, timeout=10.0
+            )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
             raise HTTPException(status_code=503, detail="Collab service unavailable")
@@ -1642,9 +1784,12 @@ async def collab_create_report_section(request: Request, room_id: str):
 @app.get("/api/collab/rooms/{room_id}/reports")
 @limiter.limit("60/minute")
 async def collab_list_report_sections(request: Request, room_id: str):
+    room_id = _validate_path_id(room_id, "room_id")
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.get(f"{SERVICE_URLS['collab']}/rooms/{room_id}/reports", timeout=5.0)
+            resp = await client.get(
+                f"{SERVICE_URLS['collab']}/rooms/{room_id}/reports", timeout=5.0
+            )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
             raise HTTPException(status_code=503, detail="Collab service unavailable")
@@ -1696,6 +1841,7 @@ async def collab_section_history(request: Request, room_id: str, section_id: str
 
 # Plugin marketplace routes ---------------------------------------------------
 
+
 @app.get("/api/marketplace")
 @limiter.limit("60/minute")
 async def marketplace_list(request: Request):
@@ -1703,7 +1849,9 @@ async def marketplace_list(request: Request):
     params = dict(request.query_params)
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.get(f"{SERVICE_URLS['plugins']}/marketplace", params=params, timeout=5.0)
+            resp = await client.get(
+                f"{SERVICE_URLS['plugins']}/marketplace", params=params, timeout=5.0
+            )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
             raise HTTPException(status_code=503, detail="Plugin registry unavailable")
@@ -1716,7 +1864,9 @@ async def marketplace_publish(request: Request):
     data = await request.json()
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.post(f"{SERVICE_URLS['plugins']}/marketplace/publish", json=data, timeout=10.0)
+            resp = await client.post(
+                f"{SERVICE_URLS['plugins']}/marketplace/publish", json=data, timeout=10.0
+            )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
             raise HTTPException(status_code=503, detail="Plugin registry unavailable")
@@ -1725,10 +1875,13 @@ async def marketplace_publish(request: Request):
 @app.post("/api/plugins/{name}/rate")
 @limiter.limit("20/minute")
 async def plugin_rate(request: Request, name: str):
+    name = _validate_path_id(name, "plugin name")
     data = await request.json()
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.post(f"{SERVICE_URLS['plugins']}/plugins/{name}/rate", json=data, timeout=5.0)
+            resp = await client.post(
+                f"{SERVICE_URLS['plugins']}/plugins/{name}/rate", json=data, timeout=5.0
+            )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
             raise HTTPException(status_code=503, detail="Plugin registry unavailable")
@@ -1737,6 +1890,7 @@ async def plugin_rate(request: Request, name: str):
 @app.get("/api/plugins/{name}/rating")
 @limiter.limit("60/minute")
 async def plugin_rating(request: Request, name: str):
+    name = _validate_path_id(name, "plugin name")
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.get(f"{SERVICE_URLS['plugins']}/plugins/{name}/rating", timeout=5.0)
@@ -1759,9 +1913,12 @@ async def plugins_updates(request: Request):
 @app.post("/api/plugins/{name}/auto-update")
 @limiter.limit("10/minute")
 async def plugin_auto_update(request: Request, name: str):
+    name = _validate_path_id(name, "plugin name")
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.post(f"{SERVICE_URLS['plugins']}/plugins/{name}/auto-update", timeout=10.0)
+            resp = await client.post(
+                f"{SERVICE_URLS['plugins']}/plugins/{name}/auto-update", timeout=10.0
+            )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
             raise HTTPException(status_code=503, detail="Plugin registry unavailable")
@@ -1772,7 +1929,9 @@ async def plugin_auto_update(request: Request, name: str):
 async def community_repositories(request: Request):
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.get(f"{SERVICE_URLS['plugins']}/community/repositories", timeout=5.0)
+            resp = await client.get(
+                f"{SERVICE_URLS['plugins']}/community/repositories", timeout=5.0
+            )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
             raise HTTPException(status_code=503, detail="Plugin registry unavailable")
@@ -1784,7 +1943,9 @@ async def community_register_repository(request: Request):
     data = await request.json()
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.post(f"{SERVICE_URLS['plugins']}/community/repositories", json=data, timeout=10.0)
+            resp = await client.post(
+                f"{SERVICE_URLS['plugins']}/community/repositories", json=data, timeout=10.0
+            )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
             raise HTTPException(status_code=503, detail="Plugin registry unavailable")
@@ -1804,10 +1965,14 @@ async def community_sync_repository(request: Request, repo_id: str):
             raise HTTPException(status_code=503, detail="Plugin registry unavailable")
 
 
-async def _proxy_get(service: str, path: str, params: Optional[dict] = None, timeout: float = 10.0) -> JSONResponse:
+async def _proxy_get(
+    service: str, path: str, params: Optional[dict] = None, timeout: float = 10.0
+) -> JSONResponse:
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.get(f"{SERVICE_URLS[service]}{path}", params=params, timeout=timeout)
+            resp = await client.get(
+                f"{SERVICE_URLS[service]}{path}", params=params, timeout=timeout
+            )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except Exception:
             raise HTTPException(status_code=503, detail=f"{service} service unavailable")
@@ -1960,7 +2125,9 @@ async def bugbounty_collaboration_share(request: Request):
 @app.get("/api/bugbounty/collaboration/threads")
 @limiter.limit("60/minute")
 async def bugbounty_collaboration_threads(request: Request):
-    return await _proxy_get("bugbounty", "/collaboration/threads", params=dict(request.query_params))
+    return await _proxy_get(
+        "bugbounty", "/collaboration/threads", params=dict(request.query_params)
+    )
 
 
 @app.get("/api/bugbounty/reports/templates")
@@ -2026,7 +2193,9 @@ async def register_agent(request: Request) -> JSONResponse:
     except HTTPException:
         raise
     except Exception as exc:
-        logger.warning("Could not validate API key with auth service: %s — proceeding in degraded mode", exc)
+        logger.warning(
+            "Could not validate API key with auth service: %s — proceeding in degraded mode", exc
+        )
 
     body = await request.json()
     manifest = body.get("manifest", {})
@@ -2037,7 +2206,9 @@ async def register_agent(request: Request) -> JSONResponse:
         existing = _registered_agents[requested_id]
         if existing.get("user_id") == user_id:
             agent_id = requested_id
-            existing.update({"manifest": manifest, "last_seen_at": time.time(), "status": "registered"})
+            existing.update(
+                {"manifest": manifest, "last_seen_at": time.time(), "status": "registered"}
+            )
             logger.info("Agent %s re-registered for user %s", agent_id, user_id)
             return JSONResponse(
                 status_code=200,
@@ -2081,7 +2252,7 @@ async def list_agents(request: Request) -> JSONResponse:
     if not auth.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Bearer token required")
 
-    token = auth[len("Bearer "):]
+    token = auth[len("Bearer ") :]
     # Validate token and extract user_id from auth service
     calling_user = None
     is_admin = False
@@ -2111,10 +2282,7 @@ async def list_agents(request: Request) -> JSONResponse:
 
     # Return only safe, public fields — explicit allowlist to prevent future leakage
     _AGENT_PUBLIC_FIELDS = {"agent_id", "manifest", "registered_at", "last_seen_at", "status"}
-    safe_agents = [
-        {k: v for k, v in a.items() if k in _AGENT_PUBLIC_FIELDS}
-        for a in agents
-    ]
+    safe_agents = [{k: v for k, v in a.items() if k in _AGENT_PUBLIC_FIELDS} for a in agents]
     return JSONResponse(content={"agents": safe_agents, "total": len(safe_agents)})
 
 
@@ -2148,12 +2316,16 @@ async def agent_websocket(websocket: WebSocket, agent_id: str) -> None:
                 if registered and registered.get("user_id") not in (key_owner, "anonymous"):
                     logger.warning(
                         "Agent %s ownership mismatch: key owner %s, registered owner %s",
-                        agent_id, key_owner, registered.get("user_id"),
+                        agent_id,
+                        _sanitize_log(key_owner),
+                        _sanitize_log(registered.get("user_id")),
                     )
                     await websocket.close(code=4003)
                     return
     except Exception as exc:
-        logger.warning("Auth service unreachable during WebSocket auth: %s — proceeding in degraded mode", exc)
+        logger.warning(
+            "Auth service unreachable during WebSocket auth: %s — proceeding in degraded mode", exc
+        )
 
     await websocket.accept()
     _agent_ws_connections[agent_id] = websocket
@@ -2179,10 +2351,16 @@ async def agent_websocket(websocket: WebSocket, agent_id: str) -> None:
 
             if msg_type == "finding":
                 finding = msg.get("payload", {})
-                logger.info("Agent %s submitted finding: %s", agent_id, finding.get("title"))
+                logger.info(
+                    "Agent %s submitted finding: %s",
+                    agent_id,
+                    _sanitize_log(finding.get("title")),
+                )
             elif msg_type == "scan_complete":
                 logger.info(
-                    "Agent %s scan complete: %s", agent_id, msg.get("scan_id")
+                    "Agent %s scan complete: %s",
+                    agent_id,
+                    _sanitize_log(msg.get("scan_id")),
                 )
             else:
                 logger.debug("Agent %s unknown message type: %s", agent_id, msg_type)
@@ -2208,4 +2386,5 @@ async def _agent_heartbeat(websocket: "WebSocket", agent_id: str) -> None:
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8000)
