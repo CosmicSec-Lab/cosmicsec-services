@@ -8,12 +8,12 @@ from pydantic import BaseModel, Field
 
 try:
     from docx import Document
-except Exception:  # pragma: no cover
+except ImportError:  # pragma: no cover
     Document = None
 
 try:
     from reportlab.pdfgen import canvas
-except Exception:  # pragma: no cover
+except ImportError:  # pragma: no cover
     canvas = None
 
 import csv

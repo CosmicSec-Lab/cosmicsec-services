@@ -45,7 +45,7 @@ async def send_to_splunk(events: list[dict[str, Any]], hec_url: str, hec_token: 
             resp = await client.post(hec_url, content=payload, headers=headers)
             resp.raise_for_status()
         return True
-    except Exception as exc:
+    except httpx.HTTPError as exc:
         logger.error("Splunk HEC send failed: %s", exc)
         return False
 
@@ -64,7 +64,7 @@ async def send_to_elastic_siem(
             resp = await client.post(f"{elastic_url}/_bulk", content=bulk_body, headers=headers)
             resp.raise_for_status()
         return True
-    except Exception as exc:
+    except httpx.HTTPError as exc:
         logger.error("Elastic SIEM send failed: %s", exc)
         return False
 

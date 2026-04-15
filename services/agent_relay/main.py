@@ -120,7 +120,7 @@ async def dispatch_task(payload: DispatchTaskRequest, request: Request) -> JSONR
     ws: WebSocket = _connections[agent_id]["websocket"]
     try:
         await ws.send_json({"type": "task", "payload": payload.task})
-    except Exception:
+    except (WebSocketDisconnect, RuntimeError, OSError):
         logger.exception("Failed to dispatch task to agent %s", agent_id)
         raise HTTPException(status_code=503, detail="Failed to deliver task to agent")
 

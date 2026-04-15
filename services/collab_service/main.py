@@ -70,7 +70,7 @@ class _Room:
                 continue
             try:
                 await ws.send_json(event)
-            except Exception:
+            except (WebSocketDisconnect, RuntimeError, OSError):
                 dead.append(user)
         for u in dead:
             self.connections.pop(u, None)

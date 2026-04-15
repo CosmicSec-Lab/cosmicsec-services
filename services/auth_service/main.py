@@ -23,17 +23,17 @@ from pydantic import BaseModel, EmailStr, Field
 
 try:
     import redis
-except Exception:  # pragma: no cover - optional dependency at runtime
+except ImportError:  # pragma: no cover - optional dependency at runtime
     redis = None
 
 try:
     import pyotp
-except Exception:  # pragma: no cover - optional dependency at runtime
+except ImportError:  # pragma: no cover - optional dependency at runtime
     pyotp = None
 
 try:
     import casbin
-except Exception:  # pragma: no cover - optional dependency at runtime
+except ImportError:  # pragma: no cover - optional dependency at runtime
     casbin = None
 
 try:
@@ -43,7 +43,7 @@ try:
     from services.common.models import APIKeyModel, UserModel
 
     _HAS_DB = True
-except Exception:  # pragma: no cover - optional dependency at runtime
+except ImportError:  # pragma: no cover - optional dependency at runtime
     _HAS_DB = False
 
 from fastapi.responses import JSONResponse
@@ -451,7 +451,7 @@ def _cleanup_retention() -> None:
         days = tenant_retention.get(org, 30)
         try:
             ts = datetime.fromisoformat(entry["timestamp"])
-        except Exception:
+        except (ValueError, TypeError):
             kept.append(entry)
             continue
         if (now - ts).days <= days:
