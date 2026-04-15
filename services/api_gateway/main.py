@@ -166,6 +166,11 @@ async def _resolve_authenticated_user(request: Request) -> tuple[str, bool]:
     return str(principal), me.get("role") == "admin"
 
 
+# Search tuning constants
+_SEARCH_SCAN_FETCH_MULTIPLIER = 10
+_SEARCH_FINDING_SCAN_CANDIDATES = 10
+
+
 # Initialize FastAPI app
 app = FastAPI(
     title="CosmicSec API Gateway",
@@ -668,7 +673,7 @@ async def global_search(request: Request, q: str, limit: int = 10):
         async with httpx.AsyncClient() as client:
             scans_resp = await client.get(
                 _build_service_url("scan", "/scans"),
-                params={"limit": max(20, per_category * 10), "offset": 0},
+                params={"limit": max(20, per_category * _SEARCH_SCAN_FETCH_MULTIPLIER), "offset": 0},
                 headers=headers,
                 timeout=8.0,
             )
@@ -680,7 +685,7 @@ async def global_search(request: Request, q: str, limit: int = 10):
                     if query in str(scan.get("target", "")).lower()
                     or query in str(scan.get("id", "")).lower()
                 ][:per_category]
-                candidates = all_scans[: min(len(all_scans), 10)]
+                candidates = all_scans[: min(len(all_scans), _SEARCH_FINDING_SCAN_CANDIDATES)]
     except httpx.HTTPError as exc:
         logger.warning("Search scan lookup unavailable: %s", exc)
 
