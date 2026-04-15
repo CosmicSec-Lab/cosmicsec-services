@@ -38,27 +38,25 @@ impl Parser for NmapParser {
                         "address" => {
                             let addrtype = attr_value(e, b"addrtype").unwrap_or_default();
                             if addrtype == "ipv4" || addrtype == "ipv6" {
-                                current_host =
-                                    attr_value(e, b"addr").unwrap_or_default().to_owned();
+                                current_host = attr_value(e, b"addr").unwrap_or_default();
                             }
                         }
                         "port" => {
-                            current_proto = attr_value(e, b"protocol")
-                                .unwrap_or("tcp")
-                                .to_owned();
-                            let port_str = attr_value(e, b"portid").unwrap_or("0");
+                            current_proto =
+                                attr_value(e, b"protocol").unwrap_or_else(|| "tcp".to_owned());
+                            let port_str = attr_value(e, b"portid").unwrap_or_default();
                             current_port = port_str.parse().unwrap_or(0);
                         }
                         "state" => {
-                            current_state = attr_value(e, b"state").unwrap_or("").to_owned();
+                            current_state = attr_value(e, b"state").unwrap_or_default();
                         }
                         "service" => {
-                            current_service = attr_value(e, b"name").unwrap_or("").to_owned();
+                            current_service = attr_value(e, b"name").unwrap_or_default();
                         }
                         "script" => {
                             // Script output carries vulnerability information
-                            let script_id = attr_value(e, b"id").unwrap_or("").to_owned();
-                            let output = attr_value(e, b"output").unwrap_or("").to_owned();
+                            let script_id = attr_value(e, b"id").unwrap_or_default();
+                            let output = attr_value(e, b"output").unwrap_or_default();
 
                             if !output.is_empty() && !current_host.is_empty() {
                                 let mut f =
@@ -113,16 +111,14 @@ impl Parser for NmapParser {
     }
 }
 
-fn attr_value<'a>(
-    e: &'a quick_xml::events::BytesStart<'a>,
+fn attr_value(
+    e: &quick_xml::events::BytesStart<'_>,
     key: &[u8],
-) -> Option<&'a str> {
+) -> Option<String> {
     e.attributes()
         .flatten()
         .find(|a| a.key.as_ref() == key)
-        .and_then(|a| std::str::from_utf8(a.value.as_ref()).ok())
-        // SAFETY: lifetime tied to the BytesStart, which lives long enough in our loop
-        .map(|s| unsafe { std::mem::transmute::<&str, &'a str>(s) })
+        .and_then(|a| std::str::from_utf8(a.value.as_ref()).ok().map(|s| s.to_owned()))
 }
 
 fn severity_from_script_id(id: &str) -> Severity {

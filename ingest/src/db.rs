@@ -47,23 +47,21 @@ impl DbWriter {
               raw_evidence, detected_at, extra) VALUES ",
         );
 
-        let mut params: Vec<Box<dyn sqlx::Encode<'_, sqlx::Postgres> + Send>> = Vec::new();
-        let mut idx = 1usize;
+        const COLS_PER_ROW: usize = 15;
 
-        for (i, f) in batch.iter().enumerate() {
+        for i in 0..batch.len() {
             if i > 0 {
                 sql.push_str(", ");
             }
+            let base = i * COLS_PER_ROW;
             write!(
                 sql,
-                "(${idx}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
-                idx + 1, idx + 2, idx + 3, idx + 4, idx + 5,
-                idx + 6, idx + 7, idx + 8, idx + 9, idx + 10,
-                idx + 11, idx + 12, idx + 13, idx + 14,
+                "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+                base + 1, base + 2, base + 3, base + 4, base + 5,
+                base + 6, base + 7, base + 8, base + 9, base + 10,
+                base + 11, base + 12, base + 13, base + 14, base + 15,
             )
             .unwrap();
-            let _ = f; // suppress unused warning; actual bind happens below
-            idx += 15;
         }
 
         sql.push_str(" ON CONFLICT (id) DO NOTHING");

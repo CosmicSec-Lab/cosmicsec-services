@@ -78,7 +78,7 @@ impl Metrics {
         );
         registry.register(
             "active_workers",
-            "Currently active ingest worker goroutines",
+            "Currently active ingest worker tasks",
             active_workers.clone(),
         );
 
