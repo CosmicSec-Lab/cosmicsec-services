@@ -2261,6 +2261,8 @@ async def register_agent(request: Request) -> JSONResponse:
 
     # Reuse existing agent_id if provided and already registered by this user
     requested_id = body.get("agent_id")
+    if requested_id:
+        requested_id = _validate_uuid_param(requested_id, "agent_id")
     if requested_id and requested_id in _registered_agents:
         existing = _registered_agents[requested_id]
         if existing.get("user_id") == user_id:
