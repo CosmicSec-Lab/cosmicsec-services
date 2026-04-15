@@ -10,6 +10,7 @@ Provides:
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from datetime import UTC, datetime
@@ -173,7 +174,20 @@ async def room_websocket(websocket: WebSocket, room_id: str):
 
     try:
         while True:
-            data = await websocket.receive_json()
+            try:
+                data = await websocket.receive_json()
+            except (json.JSONDecodeError, ValueError):
+                await websocket.send_json(
+                    {"type": "error", "detail": "Invalid JSON payload"}
+                )
+                continue
+
+            if not isinstance(data, dict) or "type" not in data:
+                await websocket.send_json(
+                    {"type": "error", "detail": "Message must be a JSON object with a 'type' field"}
+                )
+                continue
+
             ev_type = data.get("type", "message")
 
             if ev_type == "message":

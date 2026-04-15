@@ -196,6 +196,16 @@ async def agent_ws(websocket: WebSocket, agent_id: str) -> None:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
                 logger.warning("Agent %s sent non-JSON data", agent_id)
+                await websocket.send_json(
+                    {"type": "error", "detail": "Invalid JSON payload"}
+                )
+                continue
+
+            if not isinstance(msg, dict) or "type" not in msg:
+                logger.warning("Agent %s sent message without 'type' field", agent_id)
+                await websocket.send_json(
+                    {"type": "error", "detail": "Message must be a JSON object with a 'type' field"}
+                )
                 continue
 
             msg_type = msg.get("type", "")

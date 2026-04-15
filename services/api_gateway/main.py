@@ -205,6 +205,55 @@ app.add_middleware(
 # GZip compression
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
+# ---------------------------------------------------------------------------
+# Maximum request body size (1 MB default, 10 MB for upload endpoints)
+# ---------------------------------------------------------------------------
+_MAX_BODY_DEFAULT = 1 * 1024 * 1024  # 1 MB
+_MAX_BODY_UPLOAD = 10 * 1024 * 1024  # 10 MB
+_UPLOAD_PATH_PREFIXES = ("/api/upload", "/api/reports/upload", "/api/plugins/upload")
+
+
+@app.middleware("http")
+async def request_body_size_limit_middleware(request: Request, call_next):
+    """Reject requests whose Content-Length exceeds the allowed maximum."""
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            length = int(content_length)
+        except ValueError:
+            return JSONResponse(status_code=400, content={"detail": "Invalid Content-Length"})
+        limit = (
+            _MAX_BODY_UPLOAD
+            if request.url.path.startswith(_UPLOAD_PATH_PREFIXES)
+            else _MAX_BODY_DEFAULT
+        )
+        if length > limit:
+            return JSONResponse(
+                status_code=413,
+                content={"detail": f"Request body too large (max {limit} bytes)"},
+            )
+    return await call_next(request)
+
+
+# ---------------------------------------------------------------------------
+# HTTP Security Headers
+# ---------------------------------------------------------------------------
+
+
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    """Add standard HTTP security headers to every response."""
+    response = await call_next(request)
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-XSS-Protection"] = "0"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    host = request.headers.get("host", "")
+    if not host.startswith("localhost") and not host.startswith("127.0.0.1"):
+        response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
+    return response
+
 
 @app.middleware("http")
 async def api_version_middleware(request: Request, call_next):
