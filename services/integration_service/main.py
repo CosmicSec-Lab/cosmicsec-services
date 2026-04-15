@@ -5,9 +5,11 @@ Provides connector endpoints for SIEM, ticketing, notifications, and external sy
 
 from __future__ import annotations
 
+import logging
 import os
 import secrets
 import uuid
+from collections import deque
 from datetime import UTC, datetime
 from typing import Any
 
@@ -16,16 +18,20 @@ from fastapi import Depends, FastAPI
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from services.common.db import get_db
-from services.common.models import IntegrationConfigModel
+from services.common.db import SessionLocal, get_db
+from services.common.models import IntegrationConfigModel, IntegrationEventModel
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="CosmicSec Integration Service", version="1.0.0")
 
-# In-memory event logs (transient — forwarding audit trail)
-siem_events: list[dict[str, Any]] = []
-tickets: list[dict[str, Any]] = []
-notifications: list[dict[str, Any]] = []
-webhook_events: list[dict[str, Any]] = []
+# In-memory circular buffers for recent events (fast /events/recent endpoint)
+# Full history is persisted to the integration_events DB table
+_RECENT_BUFFER_SIZE = 100
+siem_events: deque[dict[str, Any]] = deque(maxlen=_RECENT_BUFFER_SIZE)
+tickets: deque[dict[str, Any]] = deque(maxlen=_RECENT_BUFFER_SIZE)
+notifications: deque[dict[str, Any]] = deque(maxlen=_RECENT_BUFFER_SIZE)
+webhook_events: deque[dict[str, Any]] = deque(maxlen=_RECENT_BUFFER_SIZE)
 
 # Default forwarding endpoints (override via env)
 SIEM_FORWARD_URL = os.getenv("SIEM_FORWARD_URL")
@@ -82,6 +88,32 @@ async def _forward_post(url: str | None, payload: dict[str, Any]) -> bool:
             return True
         except httpx.HTTPError:
             return False
+
+
+def _persist_event(
+    provider: str,
+    event_type: str,
+    payload: dict[str, Any],
+    *,
+    status: str = "stored",
+    response_code: int | None = None,
+) -> None:
+    """Persist an integration event to the database (fire-and-forget)."""
+    try:
+        db = SessionLocal()
+        event = IntegrationEventModel(
+            id=f"evt-{uuid.uuid4().hex[:12]}",
+            provider=provider,
+            event_type=event_type,
+            payload=payload,
+            status=status,
+            response_code=response_code,
+        )
+        db.add(event)
+        db.commit()
+        db.close()
+    except Exception:
+        logger.warning("Failed to persist integration event (provider=%s)", provider, exc_info=True)
 
 
 def _notification_entry(notification_type: str, payload: NotificationRequest) -> dict[str, Any]:
@@ -162,6 +194,7 @@ async def ingest_siem(event: SIEMEvent) -> dict:
         "received_at": datetime.now(UTC).isoformat(),
     }
     siem_events.append(entry)
+    _persist_event(event.source, "siem_ingest", entry)
     forwarded = await _forward_post(SIEM_FORWARD_URL, entry)
     return {"status": "stored", "event_id": entry["id"], "forwarded": forwarded}
 
@@ -191,7 +224,31 @@ async def ingest_sentinel(event: SIEMEvent) -> dict:
 
 @app.get("/siem/events")
 async def list_siem_events(limit: int = 50) -> dict:
-    return {"events": siem_events[-limit:], "total": len(siem_events)}
+    """List SIEM events — DB with in-memory recent buffer fallback."""
+    try:
+        db = SessionLocal()
+        rows = (
+            db.query(IntegrationEventModel)
+            .filter(IntegrationEventModel.event_type == "siem_ingest")
+            .order_by(IntegrationEventModel.created_at.desc())
+            .limit(limit)
+            .all()
+        )
+        db.close()
+        events = [
+            {
+                "id": r.id,
+                "provider": r.provider,
+                "event_type": r.event_type,
+                **r.payload,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in rows
+        ]
+        return {"events": events, "total": len(events)}
+    except Exception:
+        logger.warning("DB read failed for SIEM events — using in-memory buffer", exc_info=True)
+    return {"events": list(siem_events)[-limit:], "total": len(siem_events)}
 
 
 @app.post("/ticket/jira")
@@ -207,6 +264,7 @@ async def create_jira_ticket(ticket: TicketCreate) -> dict:
         "created_at": datetime.now(UTC).isoformat(),
     }
     tickets.append(entry)
+    _persist_event("jira", "ticket_create", entry)
     forwarded = await _forward_post(JIRA_API_URL, entry)
     return {"status": "created", "issue_key": issue_key, "ticket": entry, "forwarded": forwarded}
 
@@ -225,6 +283,7 @@ async def create_servicenow_ticket(ticket: TicketCreate) -> dict:
         "created_at": datetime.now(UTC).isoformat(),
     }
     tickets.append(entry)
+    _persist_event("servicenow", "ticket_create", entry)
     forwarded = await _forward_post(SERVICENOW_API_URL, entry)
     return {
         "status": "created",
@@ -247,6 +306,7 @@ async def create_github_issue(ticket: TicketCreate) -> dict:
         "created_at": datetime.now(UTC).isoformat(),
     }
     tickets.append(entry)
+    _persist_event("github", "ticket_create", entry)
     forwarded = await _forward_post(GITHUB_ISSUES_API_URL, entry)
     return {
         "status": "created",
@@ -266,6 +326,7 @@ async def create_ticket_webhook(payload: WebhookRequest) -> dict:
         "created_at": datetime.now(UTC).isoformat(),
     }
     webhook_events.append(entry)
+    _persist_event("webhook", payload.event_type, entry)
     forwarded = await _forward_post(payload.target_url, entry)
     return {"status": "queued", "webhook_id": entry["id"], "forwarded": forwarded}
 
@@ -274,6 +335,7 @@ async def create_ticket_webhook(payload: WebhookRequest) -> dict:
 async def notify_slack(payload: NotificationRequest) -> dict:
     entry = _notification_entry("slack", payload)
     notifications.append(entry)
+    _persist_event("slack", "notification", entry)
     forwarded = await _forward_post(SLACK_WEBHOOK_URL, {"text": payload.message})
     return {"status": "queued", "notification_id": entry["id"], "forwarded": forwarded}
 
@@ -282,6 +344,7 @@ async def notify_slack(payload: NotificationRequest) -> dict:
 async def notify_teams(payload: NotificationRequest) -> dict:
     entry = _notification_entry("teams", payload)
     notifications.append(entry)
+    _persist_event("teams", "notification", entry)
     forwarded = await _forward_post(TEAMS_WEBHOOK_URL, {"text": payload.message})
     return {"status": "queued", "notification_id": entry["id"], "forwarded": forwarded}
 
@@ -290,6 +353,7 @@ async def notify_teams(payload: NotificationRequest) -> dict:
 async def notify_discord(payload: NotificationRequest) -> dict:
     entry = _notification_entry("discord", payload)
     notifications.append(entry)
+    _persist_event("discord", "notification", entry)
     forwarded = await _forward_post(DISCORD_WEBHOOK_URL, {"content": payload.message})
     return {"status": "queued", "notification_id": entry["id"], "forwarded": forwarded}
 
@@ -298,6 +362,7 @@ async def notify_discord(payload: NotificationRequest) -> dict:
 async def notify_pagerduty(payload: NotificationRequest) -> dict:
     entry = _notification_entry("pagerduty", payload)
     notifications.append(entry)
+    _persist_event("pagerduty", "notification", entry)
     forwarded = await _forward_post(
         PAGERDUTY_EVENTS_URL,
         {
@@ -313,6 +378,7 @@ async def notify_pagerduty(payload: NotificationRequest) -> dict:
 async def notify_email(payload: NotificationRequest) -> dict:
     entry = _notification_entry("email", payload)
     notifications.append(entry)
+    _persist_event("email", "notification", entry)
     forwarded = await _forward_post(
         EMAIL_API_URL,
         {"to": payload.channel, "subject": payload.message[:64], "body": payload.message},
@@ -324,6 +390,7 @@ async def notify_email(payload: NotificationRequest) -> dict:
 async def notify_sms(payload: NotificationRequest) -> dict:
     entry = _notification_entry("sms", payload)
     notifications.append(entry)
+    _persist_event("sms", "notification", entry)
     forwarded = await _forward_post(
         TWILIO_API_URL, {"to": payload.channel, "body": payload.message}
     )
