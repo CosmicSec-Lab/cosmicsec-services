@@ -718,6 +718,95 @@ async def delete_api_key(request: Request, key_id: str):
             raise HTTPException(status_code=503, detail="Authentication service unavailable")
 
 
+@app.post("/api/auth/sessions/revoke-all")
+@limiter.limit("10/minute")
+async def revoke_all_auth_sessions(request: Request):
+    headers = {}
+    if request.headers.get("Authorization"):
+        headers["Authorization"] = request.headers.get("Authorization")
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                _build_service_url("auth", "/sessions/revoke-all"), headers=headers, timeout=10.0
+            )
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except httpx.HTTPError as e:
+            logger.error("Auth service error: %s", e)
+            raise HTTPException(status_code=503, detail="Authentication service unavailable")
+
+
+@app.delete("/api/auth/account")
+@limiter.limit("5/minute")
+async def delete_auth_account(request: Request):
+    headers = {}
+    if request.headers.get("Authorization"):
+        headers["Authorization"] = request.headers.get("Authorization")
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.delete(
+                _build_service_url("auth", "/account"), headers=headers, timeout=10.0
+            )
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except httpx.HTTPError as e:
+            logger.error("Auth service error: %s", e)
+            raise HTTPException(status_code=503, detail="Authentication service unavailable")
+
+
+@app.post("/api/auth/2fa/enable")
+@limiter.limit("20/minute")
+async def enable_auth_2fa(request: Request):
+    headers = {}
+    if request.headers.get("Authorization"):
+        headers["Authorization"] = request.headers.get("Authorization")
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                _build_service_url("auth", "/2fa/enable"), headers=headers, timeout=10.0
+            )
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except httpx.HTTPError as e:
+            logger.error("Auth service error: %s", e)
+            raise HTTPException(status_code=503, detail="Authentication service unavailable")
+
+
+@app.delete("/api/auth/2fa/disable")
+@limiter.limit("20/minute")
+async def disable_auth_2fa(request: Request):
+    headers = {}
+    if request.headers.get("Authorization"):
+        headers["Authorization"] = request.headers.get("Authorization")
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.delete(
+                _build_service_url("auth", "/2fa/disable"), headers=headers, timeout=10.0
+            )
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except httpx.HTTPError as e:
+            logger.error("Auth service error: %s", e)
+            raise HTTPException(status_code=503, detail="Authentication service unavailable")
+
+
+@app.post("/api/settings/scan-defaults")
+@limiter.limit("20/minute")
+async def save_scan_defaults(request: Request):
+    data = await request.json()
+    headers = {}
+    if request.headers.get("Authorization"):
+        headers["Authorization"] = request.headers.get("Authorization")
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                _build_service_url("auth", "/settings/scan-defaults"),
+                json=data,
+                headers=headers,
+                timeout=10.0,
+            )
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except httpx.HTTPError as e:
+            logger.error("Auth service error: %s", e)
+            raise HTTPException(status_code=503, detail="Authentication service unavailable")
+
+
 @app.get("/api/gdpr/export")
 @limiter.limit("20/minute")
 async def gdpr_export(request: Request):
