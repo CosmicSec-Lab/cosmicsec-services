@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import re
 import secrets
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
@@ -167,7 +167,7 @@ def _make_finding(
         "recommendation": _REMEDIATION.get(
             attack_type, "Sanitise and validate all user input at this endpoint."
         ),
-        "detected_at": datetime.utcnow().isoformat(),
+        "detected_at": datetime.now(tz=UTC).isoformat(),
     }
 
 
@@ -298,7 +298,7 @@ class APIFuzzer:
             "findings": findings,
             "findings_count": len(findings),
             "severity_breakdown": severity_counts,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(tz=UTC).isoformat(),
         }
 
     async def _fuzz_endpoint(

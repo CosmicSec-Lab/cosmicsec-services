@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -64,7 +64,7 @@ def _write_json(file_path: Path, payload: ReportRequest) -> None:
         json.dumps(
             {
                 "scan_id": payload.scan_id,
-                "generated_at": datetime.utcnow().isoformat(),
+                "generated_at": datetime.now(tz=UTC).isoformat(),
                 "findings": payload.findings,
             },
             indent=2,
@@ -97,7 +97,7 @@ def _write_html(file_path: Path, payload: ReportRequest) -> None:
     <html><body>
     <h1>CosmicSec Report</h1>
     <p>Scan ID: {payload.scan_id}</p>
-    <p>Generated: {datetime.utcnow().isoformat()}</p>
+    <p>Generated: {datetime.now(tz=UTC).isoformat()}</p>
     <table border='1' cellspacing='0' cellpadding='5'>
       <tr><th>Title</th><th>Severity</th><th>Category</th><th>Description</th></tr>
       {rows}
@@ -118,7 +118,7 @@ def _write_pdf(file_path: Path, payload: ReportRequest) -> None:
     y -= 20
     pdf.drawString(50, y, f"Scan ID: {payload.scan_id}")
     y -= 20
-    pdf.drawString(50, y, f"Generated: {datetime.utcnow().isoformat()}")
+    pdf.drawString(50, y, f"Generated: {datetime.now(tz=UTC).isoformat()}")
     y -= 30
     for finding in payload.findings[:25]:
         pdf.drawString(
@@ -138,7 +138,7 @@ def _write_docx(file_path: Path, payload: ReportRequest) -> None:
     doc = Document()
     doc.add_heading("CosmicSec Report", level=1)
     doc.add_paragraph(f"Scan ID: {payload.scan_id}")
-    doc.add_paragraph(f"Generated: {datetime.utcnow().isoformat()}")
+    doc.add_paragraph(f"Generated: {datetime.now(tz=UTC).isoformat()}")
     for finding in payload.findings:
         doc.add_paragraph(
             f"• {finding.get('title', 'untitled')} ({finding.get('severity', 'n/a')})"
@@ -174,7 +174,7 @@ def generate_report(payload: ReportRequest) -> dict:
         "format": safe_format,
         "artifact": str(out),
         "status": "generated",
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": datetime.now(tz=UTC).isoformat(),
     }
 
 
@@ -247,7 +247,7 @@ def _compliance_template(standard: str, findings: list[dict]) -> dict[str, Any]:
         "standard": standard,
         "sections": sections,
         "findings": findings,
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": datetime.now(tz=UTC).isoformat(),
     }
 
 
@@ -257,7 +257,7 @@ def generate_compliance_report(payload: ComplianceReportRequest) -> dict:
     return {
         "scan_id": payload.scan_id,
         "compliance_report": report,
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": datetime.now(tz=UTC).isoformat(),
     }
 
 
@@ -267,7 +267,7 @@ def schedule_report(payload: ScheduleRequest) -> dict:
         "scan_id": payload.scan_id,
         "format": payload.format,
         "cron": payload.cron,
-        "created_at": datetime.utcnow().isoformat(),
+        "created_at": datetime.now(tz=UTC).isoformat(),
     }
     scheduled_jobs.append(job)
     return {"status": "scheduled", "job": job}
@@ -289,7 +289,7 @@ def generate_topology(payload: TopologyRequest) -> dict:
         "node_count": len(filtered_nodes),
         "edge_count": len(filtered_edges),
         "topology": {"nodes": filtered_nodes, "edges": filtered_edges},
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": datetime.now(tz=UTC).isoformat(),
     }
 
 
@@ -304,7 +304,7 @@ def build_attack_path(payload: AttackPathRequest) -> dict:
         "highlighted_steps": len(highlighted),
         "path": ranked,
         "highlighted": highlighted,
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": datetime.now(tz=UTC).isoformat(),
     }
 
 
@@ -325,7 +325,7 @@ def create_threat_heatmap(payload: ThreatHeatmapRequest) -> dict:
     return {
         "group_by": payload.group_by,
         "heatmap": heatmap,
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": datetime.now(tz=UTC).isoformat(),
     }
 
 
@@ -336,5 +336,5 @@ def create_immersive_view(payload: ImmersiveViewRequest) -> dict:
         "scene_name": payload.scene_name,
         "status": "configured",
         "controls": ["orbit", "zoom", "node-select", "timeline-scrub"],
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": datetime.now(tz=UTC).isoformat(),
     }

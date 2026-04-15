@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 import asyncssh  # type: ignore[import-not-found]
@@ -57,7 +57,7 @@ class CosmicSecProcess(asyncssh.SSHServerProcess):
         )
         self._mfa_verified = False
         state = load_state()
-        state.log("ssh.session.start", datetime.utcnow().isoformat())
+        state.log("ssh.session.start", datetime.now(tz=UTC).isoformat())
         save_state(state)
 
     def data_received(self, data, datatype):
@@ -88,7 +88,7 @@ class CosmicSecProcess(asyncssh.SSHServerProcess):
         elif cmd == "logs":
             self._chan.write(f"logs={state.audit_logs[-10:]}\n")
         elif cmd == "exit":
-            state.log("ssh.session.end", datetime.utcnow().isoformat())
+            state.log("ssh.session.end", datetime.now(tz=UTC).isoformat())
             save_state(state)
             self.exit(0)
         else:

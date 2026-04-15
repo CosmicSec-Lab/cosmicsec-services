@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import re
 import secrets
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 _YAML_AVAILABLE = False
@@ -59,7 +59,7 @@ def _finding(
         "severity": severity,
         "recommendation": recommendation,
         "category": category,
-        "detected_at": datetime.utcnow().isoformat(),
+        "detected_at": datetime.now(tz=UTC).isoformat(),
     }
 
 
@@ -73,7 +73,7 @@ def _scan_result(scan_type: str, findings: list[dict[str, Any]]) -> dict[str, An
         "findings": findings,
         "findings_count": len(findings),
         "severity_breakdown": breakdown,
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(tz=UTC).isoformat(),
     }
 
 

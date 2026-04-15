@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 
@@ -21,7 +21,7 @@ class ScanNode:
     healthy: bool = True
     tags: list[str] = field(default_factory=list)
     active_jobs: int = 0
-    last_heartbeat: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    last_heartbeat: str = field(default_factory=lambda: datetime.now(tz=UTC).isoformat())
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -58,7 +58,7 @@ class DistributedScanCoordinator:
         node.healthy = healthy
         if active_jobs is not None:
             node.active_jobs = max(0, active_jobs)
-        node.last_heartbeat = datetime.utcnow().isoformat()
+        node.last_heartbeat = datetime.now(tz=UTC).isoformat()
         return node.to_dict()
 
     def list_nodes(self) -> list[dict[str, Any]]:
@@ -106,7 +106,7 @@ class DistributedScanCoordinator:
             "replicas": replicas,
             "assigned_nodes": [n.to_dict() for n in selected],
             "strategy": "deterministic-hash + utilization-aware",
-            "assigned_at": datetime.utcnow().isoformat(),
+            "assigned_at": datetime.now(tz=UTC).isoformat(),
         }
 
     def complete_assignment(self, node_id: str) -> bool:
@@ -114,5 +114,5 @@ class DistributedScanCoordinator:
         if node is None:
             return False
         node.active_jobs = max(0, node.active_jobs - 1)
-        node.last_heartbeat = datetime.utcnow().isoformat()
+        node.last_heartbeat = datetime.now(tz=UTC).isoformat()
         return True

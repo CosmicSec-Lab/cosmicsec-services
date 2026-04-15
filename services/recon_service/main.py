@@ -1,6 +1,6 @@
 import os
 import socket
-from datetime import datetime
+from datetime import UTC, datetime
 from urllib.parse import quote, urlparse
 
 import httpx
@@ -123,7 +123,7 @@ async def run_recon(payload: ReconRequest) -> dict:
 
     return {
         "target": target,
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(tz=UTC).isoformat(),
         "dns": dns,
         "shodan": shodan,
         "virustotal": virustotal,

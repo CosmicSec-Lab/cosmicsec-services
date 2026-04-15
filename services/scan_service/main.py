@@ -7,7 +7,7 @@ import logging
 import os
 import secrets
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
@@ -143,7 +143,7 @@ async def _fetch_org_quotas(org_id: str) -> dict[str, int]:
 
 
 def _scans_today_for_org(org_id: str) -> int:
-    today = datetime.utcnow().date()
+    today = datetime.now(tz=UTC).date()
     return sum(
         1
         for scan in scans_db.values()
@@ -201,7 +201,7 @@ async def perform_scan(scan_id: str, config: ScanConfig):
     try:
         # Update status
         scan["status"] = ScanStatus.RUNNING
-        scan["started_at"] = datetime.utcnow()
+        scan["started_at"] = datetime.now(tz=UTC)
         await ws_manager.broadcast(
             scan_id, {"scan_id": scan_id, "status": "running", "progress": 0}
         )
@@ -227,7 +227,7 @@ async def perform_scan(scan_id: str, config: ScanConfig):
                     "cvss_score": 5.3,
                     "category": "network",
                     "recommendation": "Implement IP whitelisting for SSH access",
-                    "detected_at": datetime.utcnow(),
+                    "detected_at": datetime.now(tz=UTC),
                 }
             )
 
@@ -248,7 +248,7 @@ async def perform_scan(scan_id: str, config: ScanConfig):
                     "cvss_score": 3.7,
                     "category": "web",
                     "recommendation": "Implement security headers in web server configuration",
-                    "detected_at": datetime.utcnow(),
+                    "detected_at": datetime.now(tz=UTC),
                 }
             )
 
@@ -263,7 +263,7 @@ async def perform_scan(scan_id: str, config: ScanConfig):
         # Complete scan
         scan["progress"] = 100
         scan["status"] = ScanStatus.COMPLETED
-        scan["completed_at"] = datetime.utcnow()
+        scan["completed_at"] = datetime.now(tz=UTC)
         await ws_manager.broadcast(
             scan_id, {"scan_id": scan_id, "status": "completed", "progress": 100}
         )
@@ -289,7 +289,7 @@ async def perform_scan(scan_id: str, config: ScanConfig):
                         "status": scan["status"],
                         "findings": scan_findings,
                         "severity_breakdown": severity_breakdown,
-                        "updated_at": datetime.utcnow(),
+                        "updated_at": datetime.now(tz=UTC),
                     }
                 },
                 upsert=True,
@@ -300,7 +300,7 @@ async def perform_scan(scan_id: str, config: ScanConfig):
     except Exception as e:
         logger.error(f"Scan {scan_id} failed: {str(e)}")
         scan["status"] = ScanStatus.FAILED
-        scan["completed_at"] = datetime.utcnow()
+        scan["completed_at"] = datetime.now(tz=UTC)
         await ws_manager.broadcast(
             scan_id, {"scan_id": scan_id, "status": "failed", "progress": scan.get("progress", 0)}
         )
@@ -309,7 +309,7 @@ async def perform_scan(scan_id: str, config: ScanConfig):
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
-    return {"status": "healthy", "service": "scan", "timestamp": datetime.utcnow().isoformat()}
+    return {"status": "healthy", "service": "scan", "timestamp": datetime.now(tz=UTC).isoformat()}
 
 
 @app.post("/scans", response_model=Scan)
@@ -335,7 +335,7 @@ async def create_scan(config: ScanConfig, background_tasks: BackgroundTasks, req
         "target": config.target,
         "scan_types": config.scan_types,
         "status": ScanStatus.PENDING,
-        "created_at": datetime.utcnow(),
+        "created_at": datetime.now(tz=UTC),
         "org_id": org_id,
         "workspace_id": workspace_id,
         "started_at": None,
@@ -445,7 +445,7 @@ async def get_stats():
         "running_scans": running_scans,
         "total_findings": total_findings,
         "severity_breakdown": severity_breakdown,
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(tz=UTC).isoformat(),
     }
 
 
@@ -688,7 +688,7 @@ async def cloud_scan(payload: CloudScanRequest) -> dict:
     for f in findings:
         item = dict(f)
         item["id"] = secrets.token_urlsafe(8)
-        item["detected_at"] = datetime.utcnow().isoformat()
+        item["detected_at"] = datetime.now(tz=UTC).isoformat()
         stamped.append(item)
 
     severity_breakdown: dict[str, int] = {}
@@ -702,7 +702,7 @@ async def cloud_scan(payload: CloudScanRequest) -> dict:
         "findings": stamped,
         "findings_count": len(stamped),
         "severity_breakdown": severity_breakdown,
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(tz=UTC).isoformat(),
     }
 
 
