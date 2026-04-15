@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
+from jinja2 import Environment, FileSystemLoader, select_autoescape
 from pydantic import BaseModel, Field
 
 try:
@@ -19,6 +20,11 @@ import csv
 import json
 
 app = FastAPI(title="CosmicSec Report Service", version="1.0.0")
+
+_jinja_env = Environment(
+    loader=FileSystemLoader(Path(__file__).resolve().parent / "templates"),
+    autoescape=select_autoescape(default=True),
+)
 
 
 class ReportRequest(BaseModel):
@@ -89,21 +95,12 @@ def _write_csv(file_path: Path, payload: ReportRequest) -> None:
 
 
 def _write_html(file_path: Path, payload: ReportRequest) -> None:
-    rows = "".join(
-        f"<tr><td>{f.get('title', '')}</td><td>{f.get('severity', '')}</td><td>{f.get('category', '')}</td><td>{f.get('description', '')}</td></tr>"
-        for f in payload.findings
+    template = _jinja_env.get_template("report.html.j2")
+    html = template.render(
+        scan_id=payload.scan_id,
+        generated_at=datetime.now(tz=UTC).isoformat(),
+        findings=payload.findings,
     )
-    html = f"""
-    <html><body>
-    <h1>CosmicSec Report</h1>
-    <p>Scan ID: {payload.scan_id}</p>
-    <p>Generated: {datetime.now(tz=UTC).isoformat()}</p>
-    <table border='1' cellspacing='0' cellpadding='5'>
-      <tr><th>Title</th><th>Severity</th><th>Category</th><th>Description</th></tr>
-      {rows}
-    </table>
-    </body></html>
-    """
     file_path.write_text(html, encoding="utf-8")
 
 
