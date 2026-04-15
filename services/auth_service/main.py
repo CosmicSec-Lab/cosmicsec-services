@@ -36,6 +36,18 @@ try:
 except Exception:  # pragma: no cover - optional dependency at runtime
     casbin = None
 
+try:
+    from sqlalchemy.orm import Session as SASession
+
+    from services.common.db import SessionLocal
+    from services.common.models import APIKeyModel, UserModel
+
+    _HAS_DB = True
+except Exception:  # pragma: no cover - optional dependency at runtime
+    _HAS_DB = False
+
+from services.auth_service.encryption import decrypt_2fa_secret, encrypt_2fa_secret
+
 app = FastAPI(
     title="CosmicSec Auth Service",
     description="Authentication and authorization service for GuardAxisSphere",
@@ -234,6 +246,172 @@ tenant_data_residency: dict[str, dict[str, str]] = {}
 vault_store: dict[str, dict[str, str]] = {}
 
 
+# ---------------------------------------------------------------------------
+# DB-backed persistence helpers  (Phase K.2)
+# ---------------------------------------------------------------------------
+
+
+def _get_db_session() -> "SASession | None":
+    """Return a new DB session, or *None* when the DB layer is unavailable."""
+    if not _HAS_DB:
+        return None
+    try:
+        return SessionLocal()
+    except Exception:
+        logger.debug("Could not open DB session — running without persistence")
+        return None
+
+
+def save_api_key_to_db(key_id: str, data: dict[str, Any]) -> None:
+    """Persist a single API-key record to the database."""
+    db = _get_db_session()
+    if db is None:
+        return
+    try:
+        existing = db.query(APIKeyModel).filter(APIKeyModel.id == key_id).first()
+        if existing:
+            existing.key_hash = data.get("key_hash", "")
+            existing.user_id = data.get("owner", "")
+        else:
+            db.add(
+                APIKeyModel(
+                    id=key_id,
+                    user_id=data.get("owner", ""),
+                    key_hash=data.get("key_hash", ""),
+                    name="default",
+                    scopes=[],
+                    is_active=True,
+                )
+            )
+        db.commit()
+    except Exception:
+        logger.exception("Failed to persist API key %s to DB", key_id)
+        db.rollback()
+    finally:
+        db.close()
+
+
+def delete_api_key_from_db(key_id: str) -> None:
+    """Remove an API-key record from the database."""
+    db = _get_db_session()
+    if db is None:
+        return
+    try:
+        db.query(APIKeyModel).filter(APIKeyModel.id == key_id).delete()
+        db.commit()
+    except Exception:
+        logger.exception("Failed to delete API key %s from DB", key_id)
+        db.rollback()
+    finally:
+        db.close()
+
+
+def load_api_key_from_db(key_id: str) -> dict[str, Any] | None:
+    """Load a single API-key from the DB (cache-miss fallback)."""
+    db = _get_db_session()
+    if db is None:
+        return None
+    try:
+        row = db.query(APIKeyModel).filter(APIKeyModel.id == key_id).first()
+        if row is None:
+            return None
+        return {
+            "owner": row.user_id,
+            "key_hash": row.key_hash,
+            "created_at": row.created_at.isoformat() if row.created_at else "",
+        }
+    except Exception:
+        logger.exception("Failed to load API key %s from DB", key_id)
+        return None
+    finally:
+        db.close()
+
+
+def load_all_api_keys_from_db() -> dict[str, dict[str, Any]]:
+    """Bulk-load every active API key from the database."""
+    db = _get_db_session()
+    if db is None:
+        return {}
+    try:
+        rows = db.query(APIKeyModel).filter(APIKeyModel.is_active.is_(True)).all()
+        return {
+            row.id: {
+                "owner": row.user_id,
+                "key_hash": row.key_hash,
+                "created_at": row.created_at.isoformat() if row.created_at else "",
+            }
+            for row in rows
+        }
+    except Exception:
+        logger.exception("Failed to bulk-load API keys from DB")
+        return {}
+    finally:
+        db.close()
+
+
+def save_2fa_to_db(email: str, secret: str) -> None:
+    """Persist an encrypted 2FA secret on the UserModel."""
+    db = _get_db_session()
+    if db is None:
+        return
+    try:
+        encrypted = encrypt_2fa_secret(secret)
+        user = db.query(UserModel).filter(UserModel.email == email).first()
+        if user:
+            user.totp_secret = encrypted
+            user.totp_enabled = True
+            db.commit()
+        else:
+            logger.warning("save_2fa_to_db: no user row for %s", email)
+    except Exception:
+        logger.exception("Failed to persist 2FA secret for %s", email)
+        db.rollback()
+    finally:
+        db.close()
+
+
+def load_2fa_from_db(email: str) -> str | None:
+    """Load and decrypt a 2FA secret from the database (cache-miss fallback)."""
+    db = _get_db_session()
+    if db is None:
+        return None
+    try:
+        user = db.query(UserModel).filter(UserModel.email == email).first()
+        if user and user.totp_secret:
+            return decrypt_2fa_secret(user.totp_secret)
+        return None
+    except Exception:
+        logger.exception("Failed to load 2FA secret for %s", email)
+        return None
+    finally:
+        db.close()
+
+
+def load_all_2fa_from_db() -> dict[str, str]:
+    """Bulk-load all 2FA secrets from the database (decrypted)."""
+    db = _get_db_session()
+    if db is None:
+        return {}
+    result: dict[str, str] = {}
+    try:
+        rows = (
+            db.query(UserModel)
+            .filter(UserModel.totp_enabled.is_(True), UserModel.totp_secret.isnot(None))
+            .all()
+        )
+        for row in rows:
+            try:
+                result[row.email] = decrypt_2fa_secret(row.totp_secret)
+            except Exception:
+                logger.warning("Skipping undecryptable 2FA secret for %s", row.email)
+        return result
+    except Exception:
+        logger.exception("Failed to bulk-load 2FA secrets from DB")
+        return {}
+    finally:
+        db.close()
+
+
 def _hash_audit_entry(entry: dict[str, Any], previous_hash: str | None) -> str:
     """Generate a tamper-evident hash chain for audit logs."""
     import hashlib
@@ -290,6 +468,20 @@ async def startup_retention_task():
             await asyncio.sleep(86400)  # run daily
 
     asyncio.create_task(_loop())
+
+
+@app.on_event("startup")
+async def startup_warm_cache():
+    """Pre-load API keys and 2FA secrets from the database into in-memory caches."""
+    loaded_keys = load_all_api_keys_from_db()
+    if loaded_keys:
+        fake_api_keys_db.update(loaded_keys)
+        logger.info("Warmed API-key cache with %d entries from DB", len(loaded_keys))
+
+    loaded_2fa = load_all_2fa_from_db()
+    if loaded_2fa:
+        fake_2fa_db.update(loaded_2fa)
+        logger.info("Warmed 2FA cache with %d entries from DB", len(loaded_2fa))
 
 
 # Multi-tenant state (in-memory; DB in production)
@@ -658,6 +850,7 @@ async def gdpr_delete(email: EmailStr):
     for key in list(fake_api_keys_db.keys()):
         if fake_api_keys_db[key].get("owner") == email:
             del fake_api_keys_db[key]
+            delete_api_key_from_db(key)
     for sid in list(fake_sessions_db.keys()):
         if fake_sessions_db[sid].startswith(f"{email}:"):
             del fake_sessions_db[sid]
@@ -737,6 +930,7 @@ async def setup_2fa(current_user: User = Depends(get_current_user)):
         uri = f"otpauth://totp/CosmicSec:{current_user.email}?secret={secret}&issuer=CosmicSec"
 
     fake_2fa_db[current_user.email] = secret
+    save_2fa_to_db(current_user.email, secret)
     return {"secret": secret, "provisioning_uri": uri}
 
 
@@ -744,6 +938,10 @@ async def setup_2fa(current_user: User = Depends(get_current_user)):
 async def verify_2fa(payload: TwoFactorVerifyRequest):
     """Verify user-provided TOTP code."""
     secret = fake_2fa_db.get(payload.email)
+    if not secret:
+        secret = load_2fa_from_db(payload.email)
+        if secret:
+            fake_2fa_db[payload.email] = secret
     if not secret:
         raise HTTPException(status_code=404, detail="2FA is not configured for this user")
 
@@ -760,11 +958,13 @@ async def create_api_key(current_user: User = Depends(get_current_user)):
     """Issue API key for the authenticated user."""
     raw_key = f"csk_{secrets.token_urlsafe(24)}"
     key_id = secrets.token_urlsafe(8)
-    fake_api_keys_db[key_id] = {
+    key_data = {
         "owner": current_user.email,
         "key_hash": hashlib.sha256(raw_key.encode("utf-8")).hexdigest(),
         "created_at": datetime.now(tz=UTC).isoformat(),
     }
+    fake_api_keys_db[key_id] = key_data
+    save_api_key_to_db(key_id, key_data)
     _audit("apikey.create", current_user.email, f"key_id={key_id}")
     return {"key_id": key_id, "api_key": raw_key}
 
@@ -803,9 +1003,14 @@ async def validate_api_key(request: Request):
 async def delete_api_key(key_id: str, current_user: User = Depends(get_current_user)):
     """Revoke an API key owned by the current user."""
     entry = fake_api_keys_db.get(key_id)
+    if entry is None:
+        entry = load_api_key_from_db(key_id)
+        if entry:
+            fake_api_keys_db[key_id] = entry
     if entry is None or entry.get("owner") != current_user.email:
         raise HTTPException(status_code=404, detail="Key not found")
     del fake_api_keys_db[key_id]
+    delete_api_key_from_db(key_id)
     _audit("apikey.revoke", current_user.email, f"key_id={key_id}")
     return {"revoked": True, "key_id": key_id}
 
@@ -988,6 +1193,10 @@ async def mfa_verify(payload: MFAChallengeVerifyRequest):
         return {"verified": expected is not None and payload.code == expected}
     if method == "totp":
         secret = fake_2fa_db.get(payload.email)
+        if not secret:
+            secret = load_2fa_from_db(payload.email)
+            if secret:
+                fake_2fa_db[payload.email] = secret
         if not secret:
             return {"verified": False}
         if pyotp is None:
