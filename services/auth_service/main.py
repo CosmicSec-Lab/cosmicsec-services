@@ -46,7 +46,10 @@ try:
 except Exception:  # pragma: no cover - optional dependency at runtime
     _HAS_DB = False
 
+from fastapi.responses import JSONResponse
+
 from services.auth_service.encryption import decrypt_2fa_secret, encrypt_2fa_secret
+from services.auth_service.rate_limiter import IP_WINDOW_SECONDS, LoginRateLimiter
 
 app = FastAPI(
     title="CosmicSec Auth Service",
@@ -569,6 +572,8 @@ def _build_casbin_enforcer():
 
 casbin_enforcer = _build_casbin_enforcer()
 
+login_rate_limiter = LoginRateLimiter()
+
 
 def _map_action_to_resource(action: str) -> tuple[str, str]:
     mapping = {
@@ -712,17 +717,30 @@ async def register(user_data: UserCreate):
 
 
 @app.post("/login", response_model=Token)
-async def login(user_data: UserLogin):
+async def login(user_data: UserLogin, request: Request):
     """Authenticate user and return JWT tokens"""
+    client_ip = request.client.host if request.client else "unknown"
+
+    # Rate-limit check
+    allowed, rate_msg = await login_rate_limiter.check_rate_limit(client_ip, user_data.email)
+    if not allowed:
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content={"detail": rate_msg},
+            headers={"Retry-After": str(IP_WINDOW_SECONDS)},
+        )
+
     # Get user from database
     user = fake_users_db.get(user_data.email)
     if not user:
+        await login_rate_limiter.record_failed_attempt(client_ip, user_data.email)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Incorrect email or password"
         )
 
     # Verify password
     if not verify_password(user_data.password, user["hashed_password"]):
+        await login_rate_limiter.record_failed_attempt(client_ip, user_data.email)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Incorrect email or password"
         )
@@ -732,6 +750,9 @@ async def login(user_data: UserLogin):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="User account is inactive"
         )
+
+    # Successful login – reset rate-limit counters
+    await login_rate_limiter.reset_on_success(client_ip, user_data.email)
 
     # Create tokens
     access_token_data = {"sub": user["email"], "user_id": user["id"], "role": user["role"]}
