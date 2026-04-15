@@ -228,11 +228,17 @@ class DataResidencyRequest(BaseModel):
     storage_class: str = Field(default="standard")
 
 
+class ScanDefaultsRequest(BaseModel):
+    scan_timeout_seconds: int = Field(default=300, ge=30, le=86400)
+    auto_analyze: bool = True
+
+
 # In-memory user storage (replace with database in production)
 fake_users_db = {}
 fake_api_keys_db = {}
 fake_2fa_db = {}
 fake_sessions_db = {}
+scan_defaults_db: dict[str, dict[str, Any]] = {}
 audit_logs = []
 platform_config = {
     "maintenance_mode": "false",
@@ -411,6 +417,24 @@ def load_all_2fa_from_db() -> dict[str, str]:
     except Exception:
         logger.exception("Failed to bulk-load 2FA secrets from DB")
         return {}
+    finally:
+        db.close()
+
+
+def disable_2fa_in_db(email: str) -> None:
+    """Disable 2FA for a user in the database."""
+    db = _get_db_session()
+    if db is None:
+        return
+    try:
+        user = db.query(UserModel).filter(UserModel.email == email).first()
+        if user:
+            user.totp_enabled = False
+            user.totp_secret = None
+            db.commit()
+    except Exception:
+        logger.exception("Failed to disable 2FA for %s", email)
+        db.rollback()
     finally:
         db.close()
 
@@ -955,6 +979,14 @@ async def setup_2fa(current_user: User = Depends(get_current_user)):
     return {"secret": secret, "provisioning_uri": uri}
 
 
+@app.post("/2fa/enable")
+async def enable_2fa(current_user: User = Depends(get_current_user)):
+    """Enable 2FA for the current user and return setup metadata."""
+    setup = await setup_2fa(current_user)
+    _audit("2fa.enable", current_user.email, "2FA enabled")
+    return {"enabled": True, **setup}
+
+
 @app.post("/2fa/verify")
 async def verify_2fa(payload: TwoFactorVerifyRequest):
     """Verify user-provided TOTP code."""
@@ -972,6 +1004,15 @@ async def verify_2fa(payload: TwoFactorVerifyRequest):
         valid = payload.code == "000000"
 
     return {"verified": bool(valid)}
+
+
+@app.delete("/2fa/disable")
+async def disable_2fa(current_user: User = Depends(get_current_user)):
+    """Disable 2FA for the current user."""
+    fake_2fa_db.pop(current_user.email, None)
+    disable_2fa_in_db(current_user.email)
+    _audit("2fa.disable", current_user.email, "2FA disabled")
+    return {"enabled": False, "email": current_user.email}
 
 
 @app.post("/apikeys", response_model=ApiKeyResponse)
@@ -1050,6 +1091,57 @@ async def revoke_session(session_id: str, current_user: User = Depends(get_curre
     _delete_session(session_id)
     _audit("session.revoke", current_user.email, f"session_id={session_id}")
     return {"revoked": True, "session_id": session_id, "user": current_user.email}
+
+
+@app.post("/sessions/revoke-all")
+async def revoke_all_sessions(current_user: User = Depends(get_current_user)):
+    revoked = 0
+    for sid in list(fake_sessions_db.keys()):
+        if fake_sessions_db[sid].startswith(f"{current_user.email}:"):
+            del fake_sessions_db[sid]
+            revoked += 1
+    _audit("session.revoke_all", current_user.email, f"revoked={revoked}")
+    return {"revoked": True, "count": revoked, "user": current_user.email}
+
+
+@app.post("/settings/scan-defaults")
+async def save_scan_defaults(
+    payload: ScanDefaultsRequest, current_user: User = Depends(get_current_user)
+):
+    scan_defaults_db[current_user.email] = {
+        "scan_timeout_seconds": payload.scan_timeout_seconds,
+        "auto_analyze": payload.auto_analyze,
+        "updated_at": datetime.now(tz=UTC).isoformat(),
+    }
+    _audit(
+        "settings.scan_defaults.update",
+        current_user.email,
+        f"timeout={payload.scan_timeout_seconds},auto_analyze={payload.auto_analyze}",
+    )
+    return {"saved": True, "defaults": scan_defaults_db[current_user.email]}
+
+
+@app.delete("/account")
+async def delete_current_account(current_user: User = Depends(get_current_user)):
+    email = current_user.email
+    fake_users_db.pop(email, None)
+    fake_2fa_db.pop(email, None)
+    disable_2fa_in_db(email)
+
+    revoked_sessions = 0
+    for sid in list(fake_sessions_db.keys()):
+        if fake_sessions_db[sid].startswith(f"{email}:"):
+            del fake_sessions_db[sid]
+            revoked_sessions += 1
+
+    removed_keys = [key_id for key_id, data in fake_api_keys_db.items() if data["owner"] == email]
+    for key_id in removed_keys:
+        del fake_api_keys_db[key_id]
+        delete_api_key_from_db(key_id)
+
+    scan_defaults_db.pop(email, None)
+    _audit("account.delete", email, f"sessions_revoked={revoked_sessions},api_keys={len(removed_keys)}")
+    return {"deleted": True, "email": email}
 
 
 @app.get("/admin/ping")
