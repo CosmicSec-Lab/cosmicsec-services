@@ -6,6 +6,7 @@ Main entry point for all API requests with routing, authentication, and rate lim
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 import urllib.parse
@@ -189,10 +190,14 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # CORS middleware
+_cors_origins_raw = os.environ.get(
+    "COSMICSEC_CORS_ORIGINS", "http://localhost:3000,http://localhost:4173"
+)
+_cors_origins = [o.strip() for o in _cors_origins_raw.split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure this properly in production
-    allow_credentials=True,
+    allow_origins=_cors_origins,
+    allow_credentials="*" not in _cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
