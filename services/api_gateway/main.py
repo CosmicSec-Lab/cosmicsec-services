@@ -673,7 +673,7 @@ async def global_search(request: Request, q: str, limit: int = 10):
         async with httpx.AsyncClient() as client:
             scans_resp = await client.get(
                 _build_service_url("scan", "/scans"),
-                params={"limit": max(20, per_category * _SEARCH_SCAN_FETCH_MULTIPLIER), "offset": 0},
+                params={"limit": per_category * _SEARCH_SCAN_FETCH_MULTIPLIER, "offset": 0},
                 headers=headers,
                 timeout=8.0,
             )
