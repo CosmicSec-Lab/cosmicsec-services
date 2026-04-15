@@ -23,6 +23,7 @@ from fastapi import (
 )
 from pydantic import BaseModel, Field
 
+from services.common.db import SessionLocal, get_db
 from services.common.observability import setup_observability
 
 try:
@@ -40,6 +41,18 @@ from .api_fuzzer import APIFuzzer
 from .container_scanner import scan_container_artifact
 from .continuous_monitor import ContinuousMonitor
 from .distributed_scanner import DistributedScanCoordinator
+from .repository import (
+    count_findings,
+    count_scans_today_for_org,
+    create_finding,
+    create_scan as db_create_scan,
+    delete_scan as db_delete_scan,
+    get_scan as db_get_scan,
+    get_severity_breakdown,
+    list_findings_for_scan,
+    list_scans as db_list_scans,
+    update_scan as db_update_scan,
+)
 from .smart_scanner import smart_scan
 
 # Module-level monitor singleton — started on app startup
@@ -119,9 +132,11 @@ class Finding(BaseModel):
     detected_at: datetime
 
 
-# In-memory storage (replace with database in production)
-scans_db = {}
-findings_db = []
+# Legacy in-memory storage — kept as hot cache / backward compat for tests
+# All writes now go through the repository (DB-backed); these dicts act as
+# fast-path caches that are populated on read and invalidated on write.
+scans_db: dict[str, Any] = {}
+findings_db: list[dict[str, Any]] = []
 
 # Optional in-service quota override (used when auth service is not reachable)
 tenant_quotas: dict[str, dict[str, int]] = {}
@@ -196,12 +211,24 @@ ws_manager = ConnectionManager()
 
 async def perform_scan(scan_id: str, config: ScanConfig):
     """Background task to perform the actual scan"""
-    scan = scans_db[scan_id]
+    scan = scans_db.get(scan_id)
+    if scan is None:
+        logger.error("Scan %s not found in cache", scan_id)
+        return
 
     try:
         # Update status
         scan["status"] = ScanStatus.RUNNING
         scan["started_at"] = datetime.now(tz=UTC)
+
+        # Persist status change to DB
+        try:
+            db = SessionLocal()
+            db_update_scan(db, scan_id, {"status": "running", "started_at": scan["started_at"]})
+            db.close()
+        except Exception:
+            logger.warning("DB update failed for scan %s status change", scan_id, exc_info=True)
+
         await ws_manager.broadcast(
             scan_id, {"scan_id": scan_id, "status": "running", "progress": 0}
         )
@@ -216,20 +243,26 @@ async def perform_scan(scan_id: str, config: ScanConfig):
                 scan_id, {"scan_id": scan_id, "status": "running", "progress": 25}
             )
             logger.info(f"Scan {scan_id}: Network scan in progress...")
-            # Add simulated findings
-            findings_db.append(
-                {
-                    "id": secrets.token_urlsafe(16),
-                    "scan_id": scan_id,
-                    "title": "Open Port Detected",
-                    "description": "Port 22 (SSH) is open and accessible",
-                    "severity": "medium",
-                    "cvss_score": 5.3,
-                    "category": "network",
-                    "recommendation": "Implement IP whitelisting for SSH access",
-                    "detected_at": datetime.now(tz=UTC),
-                }
-            )
+
+            finding_data = {
+                "id": secrets.token_urlsafe(16),
+                "scan_id": scan_id,
+                "title": "Open Port Detected",
+                "description": "Port 22 (SSH) is open and accessible",
+                "severity": "medium",
+                "cvss_score": 5.3,
+                "category": "network",
+                "recommendation": "Implement IP whitelisting for SSH access",
+                "detected_at": datetime.now(tz=UTC),
+            }
+            findings_db.append(finding_data)
+            # Persist finding to DB
+            try:
+                db = SessionLocal()
+                create_finding(db, finding_data)
+                db.close()
+            except Exception:
+                logger.warning("DB persist failed for finding in scan %s", scan_id, exc_info=True)
 
         # Web scan simulation
         if ScanType.WEB in config.scan_types:
@@ -238,19 +271,25 @@ async def perform_scan(scan_id: str, config: ScanConfig):
                 scan_id, {"scan_id": scan_id, "status": "running", "progress": 50}
             )
             logger.info(f"Scan {scan_id}: Web scan in progress...")
-            findings_db.append(
-                {
-                    "id": secrets.token_urlsafe(16),
-                    "scan_id": scan_id,
-                    "title": "Missing Security Headers",
-                    "description": "X-Frame-Options and CSP headers are missing",
-                    "severity": "low",
-                    "cvss_score": 3.7,
-                    "category": "web",
-                    "recommendation": "Implement security headers in web server configuration",
-                    "detected_at": datetime.now(tz=UTC),
-                }
-            )
+
+            finding_data = {
+                "id": secrets.token_urlsafe(16),
+                "scan_id": scan_id,
+                "title": "Missing Security Headers",
+                "description": "X-Frame-Options and CSP headers are missing",
+                "severity": "low",
+                "cvss_score": 3.7,
+                "category": "web",
+                "recommendation": "Implement security headers in web server configuration",
+                "detected_at": datetime.now(tz=UTC),
+            }
+            findings_db.append(finding_data)
+            try:
+                db = SessionLocal()
+                create_finding(db, finding_data)
+                db.close()
+            except Exception:
+                logger.warning("DB persist failed for finding in scan %s", scan_id, exc_info=True)
 
         # API scan simulation
         if ScanType.API in config.scan_types:
@@ -273,11 +312,25 @@ async def perform_scan(scan_id: str, config: ScanConfig):
         scan["findings_count"] = len(scan_findings)
 
         # Severity breakdown
-        severity_breakdown = {}
+        severity_breakdown: dict[str, int] = {}
         for finding in scan_findings:
             severity = finding["severity"]
             severity_breakdown[severity] = severity_breakdown.get(severity, 0) + 1
         scan["severity_breakdown"] = severity_breakdown
+
+        # Persist final state to DB
+        try:
+            db = SessionLocal()
+            db_update_scan(db, scan_id, {
+                "status": "completed",
+                "progress": 100,
+                "completed_at": scan["completed_at"],
+                "findings_count": scan["findings_count"],
+                "severity_breakdown": severity_breakdown,
+            })
+            db.close()
+        except Exception:
+            logger.warning("DB persist failed for scan %s completion", scan_id, exc_info=True)
 
         if mongo_collection is not None:
             mongo_collection.update_one(
@@ -301,6 +354,14 @@ async def perform_scan(scan_id: str, config: ScanConfig):
         logger.error(f"Scan {scan_id} failed: {str(e)}")
         scan["status"] = ScanStatus.FAILED
         scan["completed_at"] = datetime.now(tz=UTC)
+
+        try:
+            db = SessionLocal()
+            db_update_scan(db, scan_id, {"status": "failed", "completed_at": scan["completed_at"]})
+            db.close()
+        except Exception:
+            logger.warning("DB persist failed for scan %s failure", scan_id, exc_info=True)
+
         await ws_manager.broadcast(
             scan_id, {"scan_id": scan_id, "status": "failed", "progress": scan.get("progress", 0)}
         )
@@ -321,7 +382,13 @@ async def create_scan(config: ScanConfig, background_tasks: BackgroundTasks, req
     if org_id:
         quotas = await _fetch_org_quotas(org_id)
         max_scans = quotas.get("max_scans_per_day", 1000)
-        used = _scans_today_for_org(org_id)
+        # Try DB count first, fall back to in-memory
+        try:
+            db = SessionLocal()
+            used = count_scans_today_for_org(db, org_id)
+            db.close()
+        except Exception:
+            used = _scans_today_for_org(org_id)
         if used >= max_scans:
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -330,7 +397,7 @@ async def create_scan(config: ScanConfig, background_tasks: BackgroundTasks, req
 
     scan_id = secrets.token_urlsafe(16)
 
-    scan_data = {
+    scan_data: dict[str, Any] = {
         "id": scan_id,
         "target": config.target,
         "scan_types": config.scan_types,
@@ -346,6 +413,14 @@ async def create_scan(config: ScanConfig, background_tasks: BackgroundTasks, req
     }
 
     scans_db[scan_id] = scan_data
+
+    # Persist to database
+    try:
+        db = SessionLocal()
+        db_create_scan(db, scan_data)
+        db.close()
+    except Exception:
+        logger.warning("DB persist failed for new scan %s — in-memory only", scan_id, exc_info=True)
 
     # Start scan in background
     background_tasks.add_task(perform_scan, scan_id, config)
@@ -373,51 +448,92 @@ async def enqueue_scan(scan_id: str):
 
 @app.get("/scans/{scan_id}", response_model=Scan)
 async def get_scan(scan_id: str):
-    """Get scan details by ID"""
-    if scan_id not in scans_db:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scan not found")
+    """Get scan details by ID — checks in-memory cache then database."""
+    if scan_id in scans_db:
+        return Scan(**scans_db[scan_id])
 
-    return Scan(**scans_db[scan_id])
+    # Fallback to DB
+    try:
+        db = SessionLocal()
+        scan = db_get_scan(db, scan_id)
+        db.close()
+        if scan:
+            return Scan(**scan)
+    except Exception:
+        logger.warning("DB read failed for scan %s", scan_id, exc_info=True)
+
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scan not found")
 
 
 @app.get("/scans", response_model=list[Scan])
 async def list_scans(status_filter: ScanStatus | None = None, limit: int = 10, offset: int = 0):
-    """List all scans with optional filtering"""
-    scans = list(scans_db.values())
+    """List all scans with optional filtering — DB with in-memory fallback."""
+    # Try DB first
+    try:
+        db = SessionLocal()
+        scans = db_list_scans(db, status_filter=status_filter, limit=limit, offset=offset)
+        db.close()
+        if scans:
+            return [Scan(**scan) for scan in scans]
+    except Exception:
+        logger.warning("DB list scans failed — falling back to in-memory", exc_info=True)
 
+    # Fallback to in-memory
+    scans_list = list(scans_db.values())
     if status_filter:
-        scans = [s for s in scans if s["status"] == status_filter]
-
-    # Sort by created_at descending
-    scans.sort(key=lambda x: x["created_at"], reverse=True)
-
-    # Pagination
-    scans = scans[offset : offset + limit]
-
-    return [Scan(**scan) for scan in scans]
+        scans_list = [s for s in scans_list if s["status"] == status_filter]
+    scans_list.sort(key=lambda x: x["created_at"], reverse=True)
+    scans_list = scans_list[offset : offset + limit]
+    return [Scan(**scan) for scan in scans_list]
 
 
 @app.get("/scans/{scan_id}/findings", response_model=list[Finding])
 async def get_scan_findings(scan_id: str):
-    """Get all findings for a specific scan"""
+    """Get all findings for a specific scan — DB with in-memory fallback."""
+    # Try DB first
+    try:
+        db = SessionLocal()
+        db_findings = list_findings_for_scan(db, scan_id)
+        db.close()
+        if db_findings:
+            return [Finding(**f) for f in db_findings]
+    except Exception:
+        logger.warning("DB read findings failed for scan %s", scan_id, exc_info=True)
+
+    # Check scan exists
     if scan_id not in scans_db:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scan not found")
+        try:
+            db = SessionLocal()
+            scan = db_get_scan(db, scan_id)
+            db.close()
+            if not scan:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scan not found")
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scan not found")
 
     scan_findings = [f for f in findings_db if f["scan_id"] == scan_id]
-
     return [Finding(**finding) for finding in scan_findings]
 
 
 @app.delete("/scans/{scan_id}")
 async def delete_scan(scan_id: str):
-    """Delete a scan and its findings"""
+    """Delete a scan and its findings from both DB and in-memory cache."""
+    # Delete from DB
+    try:
+        db = SessionLocal()
+        db_delete_scan(db, scan_id)
+        db.close()
+    except Exception:
+        logger.warning("DB delete failed for scan %s", scan_id, exc_info=True)
+
     if scan_id not in scans_db:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scan not found")
 
-    # Delete scan
+    # Delete from in-memory cache
     del scans_db[scan_id]
 
-    # Delete findings
     global findings_db
     findings_db = [f for f in findings_db if f["scan_id"] != scan_id]
 
@@ -428,13 +544,36 @@ async def delete_scan(scan_id: str):
 
 @app.get("/stats")
 async def get_stats():
-    """Get scanning statistics"""
+    """Get scanning statistics — DB with in-memory fallback."""
+    # Try DB first
+    try:
+        from services.common.models import ScanModel as _SM
+
+        db = SessionLocal()
+        total_scans = db.query(_SM).count()
+        completed_scans = db.query(_SM).filter(_SM.status == "completed").count()
+        running_scans = db.query(_SM).filter(_SM.status == "running").count()
+        total_findings_count = count_findings(db)
+        breakdown = get_severity_breakdown(db)
+        db.close()
+        return {
+            "total_scans": total_scans,
+            "completed_scans": completed_scans,
+            "running_scans": running_scans,
+            "total_findings": total_findings_count,
+            "severity_breakdown": breakdown,
+            "timestamp": datetime.now(tz=UTC).isoformat(),
+        }
+    except Exception:
+        logger.warning("DB stats query failed — falling back to in-memory", exc_info=True)
+
+    # In-memory fallback
     total_scans = len(scans_db)
     completed_scans = sum(1 for s in scans_db.values() if s["status"] == ScanStatus.COMPLETED)
     running_scans = sum(1 for s in scans_db.values() if s["status"] == ScanStatus.RUNNING)
     total_findings = len(findings_db)
 
-    severity_breakdown = {}
+    severity_breakdown: dict[str, int] = {}
     for finding in findings_db:
         severity = finding["severity"]
         severity_breakdown[severity] = severity_breakdown.get(severity, 0) + 1

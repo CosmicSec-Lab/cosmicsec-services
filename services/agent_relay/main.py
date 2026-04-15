@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import time
+from datetime import UTC, datetime
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -185,6 +186,30 @@ async def agent_ws(websocket: WebSocket, agent_id: str) -> None:
     }
     logger.info("Agent %s connected via relay", agent_id)
 
+    # Persist agent session to database (upsert)
+    try:
+        from services.common.db import SessionLocal
+        from services.common.models import AgentSessionModel
+
+        db = SessionLocal()
+        existing = db.query(AgentSessionModel).filter(AgentSessionModel.id == agent_id).first()
+        if existing:
+            existing.status = "connected"
+            existing.last_seen_at = datetime.fromtimestamp(now, tz=UTC)
+        else:
+            session = AgentSessionModel(
+                id=agent_id,
+                user_id=agent_id,  # fallback — real user_id from JWT when available
+                manifest={},
+                status="connected",
+                last_seen_at=datetime.fromtimestamp(now, tz=UTC),
+            )
+            db.add(session)
+        db.commit()
+        db.close()
+    except Exception:
+        logger.debug("DB upsert for agent %s failed (non-critical)", agent_id, exc_info=True)
+
     heartbeat_task = asyncio.create_task(_heartbeat(websocket, agent_id))
 
     try:
@@ -229,6 +254,19 @@ async def agent_ws(websocket: WebSocket, agent_id: str) -> None:
     finally:
         heartbeat_task.cancel()
         _connections.pop(agent_id, None)
+        # Persist disconnection to database
+        try:
+            from services.common.db import SessionLocal
+            from services.common.models import AgentSessionModel
+
+            db = SessionLocal()
+            row = db.query(AgentSessionModel).filter(AgentSessionModel.id == agent_id).first()
+            if row:
+                row.status = "disconnected"
+            db.commit()
+            db.close()
+        except Exception:
+            logger.debug("DB status update for agent %s disconnect failed", agent_id, exc_info=True)
 
 
 async def _heartbeat(websocket: WebSocket, agent_id: str) -> None:
