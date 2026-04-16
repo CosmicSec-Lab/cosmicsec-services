@@ -27,6 +27,12 @@ from cosmicsec_platform.middleware.hybrid_router import HybridRouter
 from cosmicsec_platform.middleware.policy_registry import ROUTE_POLICIES
 from cosmicsec_platform.middleware.static_profiles import STATIC_PROFILES
 from services.api_gateway.graphql_runtime import mount_graphql
+from services.api_gateway.ingest_bridge import (
+    check_rust_ingest_health as _check_rust_health,
+)
+from services.api_gateway.ingest_bridge import (
+    ingest_batch as _rust_ingest_batch,
+)
 from services.common.caching import CacheManager, get_redis
 from services.common.exceptions import CosmicSecException
 from services.common.logging import (
@@ -135,6 +141,42 @@ def _build_service_url(service: str, path: str) -> str:
     return urllib.parse.urljoin(base, path)
 
 
+async def _resolve_authenticated_user(request: Request) -> tuple[str, bool]:
+    """Validate bearer token with auth service and return (principal, is_admin)."""
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Bearer token required")
+
+    token = auth[len("Bearer ") :].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Bearer token required")
+
+    try:
+        async with httpx.AsyncClient() as client:
+            verify_resp = await client.get(
+                _build_service_url("auth", "/me"),
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=5.0,
+            )
+    except httpx.HTTPError as exc:
+        logger.warning("Auth service unavailable during token verification: %s", exc)
+        raise HTTPException(status_code=503, detail="Authentication service unavailable")
+
+    if verify_resp.status_code != 200:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    me = verify_resp.json()
+    principal = me.get("email") or me.get("user_id") or me.get("id")
+    if not principal:
+        raise HTTPException(status_code=401, detail="Invalid token payload")
+    return str(principal), me.get("role") == "admin"
+
+
+# Search tuning constants
+_SEARCH_SCAN_FETCH_MULTIPLIER = 10
+_SEARCH_FINDING_SCAN_CANDIDATES = 10
+
+
 # Initialize FastAPI app
 app = FastAPI(
     title="CosmicSec API Gateway",
@@ -185,6 +227,8 @@ _XSS_RE = re.compile(
     re.IGNORECASE,
 )
 
+from services.api_gateway.white_label import WhiteLabelMiddleware, mount_branding_routes
+
 limiter = Limiter(key_func=get_user_identifier)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -204,6 +248,10 @@ app.add_middleware(
 
 # GZip compression
 app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+# White-label org branding middleware (Phase R.5)
+app.add_middleware(WhiteLabelMiddleware)
+mount_branding_routes(app)
 
 # ---------------------------------------------------------------------------
 # Maximum request body size (1 MB default, 10 MB for upload endpoints)
@@ -609,6 +657,121 @@ async def dashboard_overview(request: Request):
         logger.warning("Dashboard overview cache write skipped: %s", exc)
 
     return response_body
+
+
+@app.get("/api/search")
+@limiter.limit("60/minute")
+async def global_search(request: Request, q: str, limit: int = 10):
+    """Authenticated global search across scans, findings, agents, and reports."""
+    principal, is_admin = await _resolve_authenticated_user(request)
+    query = q.strip().lower()
+    per_category = max(1, min(limit, 5))
+
+    empty = {"scans": [], "findings": [], "agents": [], "reports": []}
+    if not query:
+        return empty
+
+    scans: list[dict] = []
+    findings: list[dict] = []
+    reports: list[dict] = []
+    candidates: list[dict] = []
+
+    headers = {}
+    auth = request.headers.get("Authorization")
+    if auth:
+        headers["Authorization"] = auth
+
+    try:
+        async with httpx.AsyncClient() as client:
+            scans_resp = await client.get(
+                _build_service_url("scan", "/scans"),
+                params={"limit": per_category * _SEARCH_SCAN_FETCH_MULTIPLIER, "offset": 0},
+                headers=headers,
+                timeout=8.0,
+            )
+            if scans_resp.status_code == 200 and isinstance(scans_resp.json(), list):
+                all_scans = scans_resp.json()
+                scans = [
+                    scan
+                    for scan in all_scans
+                    if query in str(scan.get("target", "")).lower()
+                    or query in str(scan.get("id", "")).lower()
+                ][:per_category]
+                candidates = all_scans[: min(len(all_scans), _SEARCH_FINDING_SCAN_CANDIDATES)]
+    except httpx.HTTPError as exc:
+        logger.warning("Search scan lookup unavailable: %s", exc)
+
+    if candidates:
+        try:
+            async with httpx.AsyncClient() as client:
+                finding_requests = [
+                    client.get(
+                        _build_service_url("scan", f"/scans/{scan.get('id')}/findings"),
+                        headers=headers,
+                        timeout=5.0,
+                    )
+                    for scan in candidates
+                    if scan.get("id")
+                ]
+                finding_responses = await asyncio.gather(*finding_requests, return_exceptions=True)
+                collected: list[dict] = []
+                for resp in finding_responses:
+                    if isinstance(resp, Exception) or resp.status_code != 200:
+                        continue
+                    payload = resp.json()
+                    if isinstance(payload, list):
+                        collected.extend(payload)
+                findings = [
+                    finding
+                    for finding in collected
+                    if query in str(finding.get("title", "")).lower()
+                    or query in str(finding.get("id", "")).lower()
+                ][:per_category]
+        except httpx.HTTPError as exc:
+            logger.warning("Search finding lookup unavailable: %s", exc)
+
+    for scan in scans:
+        scan_id = str(scan.get("id", "")).strip()
+        if not scan_id:
+            continue
+        report_id = f"report-{scan_id}"
+        if query not in report_id.lower() and query not in scan_id.lower():
+            continue
+        reports.append(
+            {
+                "id": report_id,
+                "scan_id": scan_id,
+                "format": "pdf",
+                "status": "available" if str(scan.get("status")) == "completed" else "pending",
+                "created_at": scan.get("completed_at") or scan.get("created_at"),
+            }
+        )
+        if len(reports) >= per_category:
+            break
+
+    visible_agents = (
+        list(_registered_agents.values())
+        if is_admin
+        else [agent for agent in _registered_agents.values() if agent.get("user_id") == principal]
+    )
+    agents = []
+    for agent in visible_agents:
+        manifest = agent.get("manifest") if isinstance(agent.get("manifest"), dict) else {}
+        name = str(manifest.get("name") or agent.get("agent_id") or "Agent")
+        haystack = f"{name} {agent.get('agent_id', '')} {agent.get('status', '')}".lower()
+        if query not in haystack:
+            continue
+        agents.append(
+            {
+                "id": agent.get("agent_id"),
+                "name": name,
+                "status": agent.get("status", "unknown"),
+            }
+        )
+        if len(agents) >= per_category:
+            break
+
+    return {"scans": scans, "findings": findings, "agents": agents, "reports": reports}
 
 
 async def register(request: Request):
@@ -2593,6 +2756,53 @@ async def _agent_heartbeat(websocket: "WebSocket", agent_id: str) -> None:
             await websocket.send_json({"type": "heartbeat", "ts": time.time()})
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Phase P.2 — Rust Ingest Engine endpoints
+# ---------------------------------------------------------------------------
+# (imports for _check_rust_health and _rust_ingest_batch are at the top of the module)
+
+
+@app.get("/api/ingest/health")
+async def ingest_engine_health():
+    """Return health status of the Rust ingest engine."""
+    healthy = await _check_rust_health()
+    return {
+        "rust_ingest_engine": "healthy" if healthy else "unavailable",
+        "feature_flag": os.environ.get("COSMICSEC_USE_RUST_INGEST", "false"),
+    }
+
+
+@app.post("/api/ingest/batch")
+@limiter.limit("20/minute")
+async def ingest_batch_endpoint(request: Request):
+    """
+    Forward raw scanner output to the Rust ingest engine.
+
+    Body (multipart or JSON):
+      ``scan_id``: str   — which scan produced this output
+      ``tool``:    str   — nmap | nuclei | nikto | zap | generic
+      ``data``:    bytes — raw scanner output (XML / JSONL / JSON)
+
+    Routing is controlled by the COSMICSEC_USE_RUST_INGEST feature flag.
+    When the flag is false or the Rust engine is unavailable the response
+    instructs the caller to use the Python parsers in scan_service.
+    """
+    principal, _ = await _resolve_authenticated_user(request)
+    body = await request.json()
+    scan_id = _validate_path_id(str(body.get("scan_id", "")), "scan_id")
+    tool = str(body.get("tool", "generic"))
+    raw_data = str(body.get("data", "")).encode()
+
+    result = await _rust_ingest_batch(tool=tool, raw_data=raw_data, scan_id=scan_id)
+    logger.info(
+        "ingest_batch scan_id=%s routed_to=%s principal=%s",
+        _sanitize_log(scan_id),
+        result.get("routed_to"),
+        _sanitize_log(principal),
+    )
+    return result
 
 
 if __name__ == "__main__":

@@ -1,10 +1,42 @@
 p, admin, *, *
+p, manager, scan, read
+p, manager, scan, write
+p, manager, report, read
+p, manager, report, write
+p, manager, finding, read
+p, manager, finding, write
+p, manager, recon, read
+p, manager, member, read
+p, manager, member, invite
 p, analyst, scan, read
 p, analyst, scan, write
 p, analyst, report, read
+p, analyst, report, write
+p, analyst, finding, read
+p, analyst, finding, write
+p, analyst, recon, read
+p, analyst, recon, write
+p, analyst, ai, read
+p, pentester, scan, read
+p, pentester, scan, write
+p, pentester, scan, execute
+p, pentester, recon, read
+p, pentester, recon, write
+p, pentester, finding, read
+p, pentester, finding, write
+p, pentester, bugbounty, read
+p, pentester, bugbounty, submit
+p, auditor, scan, read
+p, auditor, finding, read
+p, auditor, report, read
+p, auditor, compliance, read
+p, auditor, audit_log, read
 p, user, scan, read
 p, user, report, read
+p, viewer, scan, read
+p, viewer, finding, read
 
 g, admin, admin
 g, analyst, analyst
 g, user, user
+g, viewer, viewer

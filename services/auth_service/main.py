@@ -16,6 +16,7 @@ from urllib.parse import urlencode
 
 import bcrypt as bcrypt_lib
 from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi.responses import JSONResponse
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -46,10 +47,18 @@ try:
 except ImportError:  # pragma: no cover - optional dependency at runtime
     _HAS_DB = False
 
-from fastapi.responses import JSONResponse
-
 from services.auth_service.encryption import decrypt_2fa_secret, encrypt_2fa_secret
 from services.auth_service.rate_limiter import IP_WINDOW_SECONDS, LoginRateLimiter
+from services.auth_service.rbac_engine import (
+    ACTIONS,
+    BUILT_IN_ROLES,
+    RESOURCES,
+    can_user,
+    check_permission,
+    create_custom_role,
+    delete_custom_role,
+    list_roles,
+)
 
 app = FastAPI(
     title="CosmicSec Auth Service",
@@ -1709,6 +1718,105 @@ async def set_org_retention(
     )
     return {"org_id": org_id, "retention_days": payload.days}
 
+
+# ---------------------------------------------------------------------------
+# Phase R.4 — Advanced RBAC endpoints
+# ---------------------------------------------------------------------------
+
+
+class CustomRoleCreate(BaseModel):
+    name: str = Field(..., min_length=2, max_length=50, pattern=r"^[a-z0-9_-]+$")
+    description: str = Field(default="")
+    permissions: list[list[str]] = Field(
+        ..., description="List of [resource, action] pairs"
+    )
+    inherits: list[str] = Field(default_factory=list)
+
+
+class PermissionCheckRequest(BaseModel):
+    role: str
+    resource: str
+    action: str
+    org_id: str | None = None
+
+
+@app.get("/rbac/roles")
+async def rbac_list_roles(
+    org_id: str | None = None,
+    _: User = Depends(require_permission("read")),
+):
+    """List all built-in and custom roles for an org."""
+    return {"roles": list_roles(org_id=org_id), "total": len(list_roles(org_id=org_id))}
+
+
+@app.post("/rbac/roles")
+async def rbac_create_role(
+    payload: CustomRoleCreate,
+    current_user: User = Depends(require_permission("manage")),
+    org_id: str | None = None,
+):
+    """Create a custom role scoped to an org."""
+    try:
+        perms = [tuple(p) for p in payload.permissions if len(p) == 2]
+        role = create_custom_role(
+            payload.name,
+            description=payload.description,
+            permissions=perms,
+            inherits=payload.inherits,
+            org_id=org_id,
+        )
+        _audit("rbac.role.create", current_user.email, f"role={payload.name} org={org_id}")
+        return role
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.delete("/rbac/roles/{role_name}")
+async def rbac_delete_role(
+    role_name: str,
+    current_user: User = Depends(require_permission("manage")),
+    org_id: str | None = None,
+):
+    """Delete a custom role."""
+    if role_name in BUILT_IN_ROLES:
+        raise HTTPException(status_code=409, detail="Cannot delete built-in roles")
+    deleted = delete_custom_role(role_name, org_id=org_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Role '{role_name}' not found")
+    _audit("rbac.role.delete", current_user.email, f"role={role_name} org={org_id}")
+    return {"deleted": role_name}
+
+
+@app.post("/rbac/check")
+async def rbac_check_permission(
+    payload: PermissionCheckRequest,
+    _: User = Depends(require_permission("read")),
+):
+    """Test whether a role can perform action on resource (permission check tool)."""
+    return can_user(payload.role, payload.resource, payload.action, org_id=payload.org_id)
+
+
+@app.get("/rbac/matrix")
+async def rbac_permission_matrix(
+    _: User = Depends(require_permission("read")),
+):
+    """Return the full permission matrix for all built-in roles."""
+    matrix: dict[str, dict[str, dict[str, bool]]] = {}
+    for role_name in BUILT_IN_ROLES:
+        matrix[role_name] = {}
+        for resource in RESOURCES:
+            matrix[role_name][resource] = {}
+            for action in ACTIONS:
+                matrix[role_name][resource][action] = check_permission(role_name, resource, action)
+    return {
+        "roles": list(BUILT_IN_ROLES.keys()),
+        "resources": RESOURCES,
+        "actions": ACTIONS,
+        "matrix": matrix,
+    }
+
+
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import uvicorn

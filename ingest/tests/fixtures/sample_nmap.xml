@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE nmaprun>
+<nmaprun scanner="nmap" args="nmap -sV -oX sample.xml 192.0.2.1" start="1700000000" version="7.94">
+  <host starttime="1700000001" endtime="1700000010">
+    <address addr="192.0.2.1" addrtype="ipv4"/>
+    <hostnames>
+      <hostname name="target.example.com" type="PTR"/>
+    </hostnames>
+    <ports>
+      <port protocol="tcp" portid="22">
+        <state state="open" reason="syn-ack"/>
+        <service name="ssh" product="OpenSSH" version="8.9"/>
+      </port>
+      <port protocol="tcp" portid="443">
+        <state state="open" reason="syn-ack"/>
+        <service name="https" product="nginx" version="1.24"/>
+        <script id="ssl-cert" output="Subject: CN=target.example.com"/>
+        <script id="ssl-weak-cipher" output="Weak cipher: TLS_RSA_WITH_RC4_128_SHA"/>
+      </port>
+      <port protocol="tcp" portid="8080">
+        <state state="closed" reason="conn-refused"/>
+        <service name="http-proxy"/>
+      </port>
+    </ports>
+  </host>
+</nmaprun>
