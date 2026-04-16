@@ -7,6 +7,8 @@ and dispatches tasks to connected agents.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -138,6 +140,10 @@ async def agent_ws(websocket: WebSocket, agent_id: str) -> None:
     """
     api_key = websocket.query_params.get("api_key") or websocket.headers.get("x-api-key")
     token = websocket.query_params.get("token")
+    if not token:
+        auth_header = websocket.headers.get("authorization", "")
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header[7:].strip()
 
     authenticated = False
 
@@ -149,21 +155,20 @@ async def agent_ws(websocket: WebSocket, agent_id: str) -> None:
             from services.common.db import SessionLocal
             from services.common.models import APIKeyModel
 
+            candidate_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
             db: _SASession = SessionLocal()
             try:
                 row = (
                     db.query(APIKeyModel)
-                    .filter(APIKeyModel.key_hash == api_key, APIKeyModel.is_active.is_(True))
+                    .filter(APIKeyModel.key_hash == candidate_hash, APIKeyModel.is_active.is_(True))
                     .first()
                 )
-                if row is not None:
+                if row is not None and hmac.compare_digest(row.key_hash or "", candidate_hash):
                     authenticated = True
             finally:
                 db.close()
         except Exception:
-            logger.debug("DB-based API key validation unavailable, accepting key", exc_info=True)
-            # Fallback: accept non-empty key when DB is unavailable (dev mode)
-            authenticated = True
+            logger.warning("DB-based API key validation unavailable", exc_info=True)
 
     # Try JWT token authentication
     if token and not authenticated:
