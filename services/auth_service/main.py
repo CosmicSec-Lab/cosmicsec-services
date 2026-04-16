@@ -127,6 +127,8 @@ class OAuthStartResponse(BaseModel):
 
 class SamlAssertionRequest(BaseModel):
     assertion: str
+    signature: str | None = None
+    signature_algorithm: str | None = None
 
 
 class TwoFactorSetupResponse(BaseModel):
@@ -1048,6 +1050,8 @@ def _oauth_provider_config(provider: str) -> dict[str, str]:
             "client_secret": os.getenv("GOOGLE_CLIENT_SECRET", ""),
             "scope": "openid email profile",
             "redirect_uri": callback,
+            "issuer": "https://accounts.google.com",
+            "jwks_url": "https://www.googleapis.com/oauth2/v3/certs",
         },
         "github": {
             "authorize_url": "https://github.com/login/oauth/authorize",
@@ -1057,6 +1061,8 @@ def _oauth_provider_config(provider: str) -> dict[str, str]:
             "client_secret": os.getenv("GITHUB_CLIENT_SECRET", ""),
             "scope": "read:user user:email",
             "redirect_uri": callback,
+            "issuer": "https://github.com/login/oauth",
+            "jwks_url": "",
         },
         "microsoft": {
             "authorize_url": "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
@@ -1066,6 +1072,8 @@ def _oauth_provider_config(provider: str) -> dict[str, str]:
             "client_secret": os.getenv("MICROSOFT_CLIENT_SECRET", ""),
             "scope": "openid profile email",
             "redirect_uri": callback,
+            "issuer": "https://login.microsoftonline.com/common/v2.0",
+            "jwks_url": "https://login.microsoftonline.com/common/discovery/v2.0/keys",
         },
     }
     selected = providers.get(provider.lower())
@@ -1090,6 +1098,77 @@ def _ensure_oauth_user(email: str, full_name: str, provider: str) -> dict:
     }
     fake_users_db[email] = user
     return user
+
+
+async def _verify_oidc_id_token(
+    provider: str,
+    id_token: str,
+    selected: dict[str, str],
+    client: httpx.AsyncClient,
+) -> dict[str, Any]:
+    """Verify OIDC id_token using provider JWKS when available."""
+    try:
+        unverified_claims = jwt.get_unverified_claims(id_token)
+    except JWTError as exc:
+        raise HTTPException(status_code=401, detail="Invalid id_token payload") from exc
+
+    issuer = selected.get("issuer", "").strip()
+    audience = selected.get("client_id", "").strip()
+    jwks_url = selected.get("jwks_url", "").strip()
+
+    if issuer:
+        token_issuer = str(unverified_claims.get("iss", "")).strip()
+        if token_issuer and token_issuer != issuer:
+            raise HTTPException(status_code=401, detail="OIDC issuer mismatch")
+
+    if audience:
+        token_aud = unverified_claims.get("aud")
+        if isinstance(token_aud, list):
+            if audience not in token_aud:
+                raise HTTPException(status_code=401, detail="OIDC audience mismatch")
+        elif token_aud and str(token_aud) != audience:
+            raise HTTPException(status_code=401, detail="OIDC audience mismatch")
+
+    if not jwks_url:
+        return unverified_claims
+
+    jwks_resp = await client.get(jwks_url, headers={"Accept": "application/json"})
+    if jwks_resp.status_code >= 400:
+        raise HTTPException(status_code=401, detail=f"OIDC JWKS fetch failed for {provider}")
+    jwks_payload = jwks_resp.json()
+    keys = jwks_payload.get("keys", []) if isinstance(jwks_payload, dict) else []
+    if not isinstance(keys, list) or not keys:
+        raise HTTPException(status_code=401, detail="OIDC JWKS missing signing keys")
+
+    kid = ""
+    try:
+        kid = str(jwt.get_unverified_header(id_token).get("kid") or "")
+    except JWTError:
+        kid = ""
+    jwk_key: dict[str, Any] | None = None
+    for key in keys:
+        if not isinstance(key, dict):
+            continue
+        if kid and str(key.get("kid", "")) != kid:
+            continue
+        if str(key.get("use", "sig")) not in {"sig", ""}:
+            continue
+        jwk_key = key
+        break
+    if jwk_key is None:
+        raise HTTPException(status_code=401, detail="OIDC JWKS key not found")
+
+    algorithms = [str(jwk_key.get("alg", "RS256"))]
+    decode_kwargs: dict[str, Any] = {"algorithms": algorithms}
+    if audience:
+        decode_kwargs["audience"] = audience
+    if issuer:
+        decode_kwargs["issuer"] = issuer
+    try:
+        verified_claims = jwt.decode(id_token, jwk_key, **decode_kwargs)
+    except JWTError as exc:
+        raise HTTPException(status_code=401, detail="OIDC id_token signature validation failed") from exc
+    return verified_claims
 
 
 @app.post("/oauth2/{provider}", response_model=OAuthStartResponse)
@@ -1155,12 +1234,9 @@ async def oauth_callback(provider: str, code: str, state: str | None = None):
         email = ""
         full_name = ""
         if id_token:
-            try:
-                claims = jwt.get_unverified_claims(id_token)
-                email = str(claims.get("email") or claims.get("upn") or "")
-                full_name = str(claims.get("name") or "")
-            except JWTError:
-                logger.warning("Could not parse id_token claims for provider=%s", provider)
+            claims = await _verify_oidc_id_token(provider, id_token, selected, client)
+            email = str(claims.get("email") or claims.get("upn") or "")
+            full_name = str(claims.get("name") or "")
 
         if not email:
             userinfo_resp = await client.get(
@@ -1544,9 +1620,33 @@ async def saml_acs(payload: SamlAssertionRequest):
     if trusted_issuer and issuer and issuer != trusted_issuer:
         raise HTTPException(status_code=401, detail="Untrusted SAML issuer")
 
+    saml_audience = os.getenv("SAML_TRUSTED_AUDIENCE", "").strip()
+    audience = str(claims.get("aud", "")).strip()
+    if saml_audience and audience and audience != saml_audience:
+        raise HTTPException(status_code=401, detail="SAML audience mismatch")
+
+    not_before = claims.get("nbf")
+    if isinstance(not_before, (int, float)) and datetime.fromtimestamp(
+        not_before, tz=UTC
+    ) > datetime.now(tz=UTC):
+        raise HTTPException(status_code=401, detail="SAML assertion is not yet valid")
+
     exp = claims.get("exp")
     if isinstance(exp, (int, float)) and datetime.fromtimestamp(exp, tz=UTC) < datetime.now(tz=UTC):
         raise HTTPException(status_code=401, detail="SAML assertion expired")
+
+    hmac_secret = os.getenv("SAML_ASSERTION_HMAC_SECRET", "").strip()
+    provided_signature = (payload.signature or str(claims.get("signature") or "")).strip()
+    if hmac_secret:
+        if not provided_signature:
+            raise HTTPException(status_code=401, detail="SAML assertion signature missing")
+        expected_signature = hmac.new(
+            hmac_secret.encode("utf-8"),
+            assertion.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        if not hmac.compare_digest(provided_signature, expected_signature):
+            raise HTTPException(status_code=401, detail="SAML assertion signature invalid")
 
     email = str(claims.get("email") or claims.get("name_id") or "").strip()
     if not email:
