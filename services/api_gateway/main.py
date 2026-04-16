@@ -52,6 +52,7 @@ from services.common.versioning import APIVersionMiddleware
 _RE_ALPHANUMERIC_ID = re.compile(r"^[A-Za-z0-9_\-]{1,128}$")
 _RE_EMAIL = re.compile(r"^[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9.\-]{1,253}\.[A-Za-z]{2,}$")
 _RE_PLUGIN_NAME = re.compile(r"^[A-Za-z0-9_\-]{1,128}$")
+_RE_ORG_SLUG = re.compile(r"^[a-z0-9\-]{2,64}$")
 _RE_UUID = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
 )
@@ -95,6 +96,14 @@ def _validate_uuid_param(value: str, label: str = "id") -> str:
     if not _RE_UUID.match(value):
         raise HTTPException(status_code=400, detail=f"Invalid {label}: must be a valid UUID")
     return value
+
+
+def _validate_org_slug(value: str) -> str:
+    """Validate organization slug path parameter."""
+    normalized = value.strip().lower()
+    if not _RE_ORG_SLUG.match(normalized):
+        raise HTTPException(status_code=400, detail="Invalid organization slug")
+    return normalized
 
 
 def _sanitize_log(value: object, max_len: int = 200) -> str:
@@ -821,6 +830,90 @@ async def refresh_token(request: Request):
         timeout=10.0,
         route_key="auth.refresh",
     )
+
+
+@app.get("/api/auth/sso/{provider}/authorize")
+@limiter.limit("30/minute")
+async def auth_sso_authorize(request: Request, provider: str):
+    """Start provider SSO authorization flow."""
+    provider = _validate_path_id(provider, "provider").lower()
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                _build_service_url("auth", f"/oauth2/{provider}"),
+                timeout=10.0,
+            )
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except httpx.HTTPError as e:
+            logger.error("Auth SSO authorize error: %s", e)
+            raise HTTPException(status_code=503, detail="Authentication service unavailable")
+
+
+@app.get("/api/auth/sso/{provider}/callback")
+@limiter.limit("60/minute")
+async def auth_sso_callback(request: Request, provider: str, code: str, state: str | None = None):
+    """Handle provider callback response and forward to auth service."""
+    provider = _validate_path_id(provider, "provider").lower()
+    params = {"code": code}
+    if state:
+        params["state"] = state
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(
+                _build_service_url("auth", f"/oauth2/{provider}/callback"),
+                params=params,
+                timeout=10.0,
+            )
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except httpx.HTTPError as e:
+            logger.error("Auth SSO callback error: %s", e)
+            raise HTTPException(status_code=503, detail="Authentication service unavailable")
+
+
+@app.get("/api/auth/sso/saml/metadata")
+@limiter.limit("60/minute")
+async def auth_saml_metadata(request: Request):
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(_build_service_url("auth", "/saml/metadata"), timeout=10.0)
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except httpx.HTTPError as e:
+            logger.error("Auth SAML metadata error: %s", e)
+            raise HTTPException(status_code=503, detail="Authentication service unavailable")
+
+
+@app.post("/api/auth/sso/saml/acs")
+@limiter.limit("30/minute")
+async def auth_saml_acs(request: Request):
+    data = await request.json()
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                _build_service_url("auth", "/saml/acs"),
+                json=data,
+                timeout=10.0,
+            )
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except httpx.HTTPError as e:
+            logger.error("Auth SAML ACS error: %s", e)
+            raise HTTPException(status_code=503, detail="Authentication service unavailable")
+
+
+@app.get("/api/orgs/slug/{slug}/sso")
+@limiter.limit("60/minute")
+async def discover_org_sso(request: Request, slug: str):
+    """Resolve organization slug to SSO authorization metadata for login flows."""
+    normalized_slug = _validate_org_slug(slug)
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(
+                _build_service_url("auth", f"/orgs/slug/{normalized_slug}/sso"),
+                timeout=10.0,
+            )
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except httpx.HTTPError as e:
+            logger.error("Org SSO discovery error: %s", e)
+            raise HTTPException(status_code=503, detail="Authentication service unavailable")
 
 
 @app.post("/api/auth/apikeys")

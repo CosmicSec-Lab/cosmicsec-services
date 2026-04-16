@@ -193,6 +193,13 @@ class OrganizationMemberAssign(BaseModel):
     role: str = "member"  # owner | admin | member
 
 
+class OrganizationSSOConfigRequest(BaseModel):
+    provider: str = Field(default="microsoft")
+    enabled: bool = True
+    client_id: str | None = None
+    callback_url: str | None = None
+
+
 class TenantQuotaUpdate(BaseModel):
     max_users: int | None = Field(default=None, ge=1, le=100000)
     max_workspaces: int | None = Field(default=None, ge=1, le=100000)
@@ -525,6 +532,7 @@ organizations_db: dict[str, dict] = {}
 org_memberships: dict[str, dict[str, str]] = {}  # org_id -> {email: role}
 workspaces_db: dict[str, list[dict]] = {}  # org_id -> workspace list
 tenant_quotas: dict[str, dict[str, int]] = {}  # org_id -> quotas
+org_sso_configs: dict[str, dict[str, Any]] = {}  # org_id -> SSO config
 
 redis_client = None
 if redis is not None:
@@ -567,6 +575,67 @@ def _ensure_org_exists(org_id: str) -> dict:
     if org is None:
         raise HTTPException(status_code=404, detail="Organization not found")
     return org
+
+
+def _find_org_by_slug(slug: str) -> tuple[str, dict]:
+    normalized = slug.strip().lower()
+    for org_id, org in organizations_db.items():
+        if str(org.get("slug", "")).lower() == normalized:
+            return org_id, org
+    raise HTTPException(status_code=404, detail="Organization not found")
+
+
+def _provider_authorization_url(provider: str, client_id: str, callback_url: str, state: str) -> str:
+    oauth_conf = {
+        "google": {
+            "url": "https://accounts.google.com/o/oauth2/v2/auth",
+            "scope": "openid email profile",
+        },
+        "github": {
+            "url": "https://github.com/login/oauth/authorize",
+            "scope": "read:user user:email",
+        },
+        "microsoft": {
+            "url": "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+            "scope": "openid profile email",
+        },
+        "okta": {
+            "url": os.getenv("OKTA_AUTHORIZE_URL", "https://example.okta.com/oauth2/v1/authorize"),
+            "scope": "openid profile email",
+        },
+    }
+    selected = oauth_conf.get(provider.lower())
+    if selected is None:
+        raise HTTPException(status_code=400, detail="Unsupported SSO provider")
+    params = {
+        "client_id": client_id,
+        "redirect_uri": callback_url,
+        "response_type": "code",
+        "scope": selected["scope"],
+        "state": state,
+    }
+    return f"{selected['url']}?{urlencode(params)}"
+
+
+def _resolve_org_sso(org_id: str, org: dict | None = None) -> dict[str, Any]:
+    configured = org_sso_configs.get(org_id)
+    if configured:
+        return configured
+
+    if org is None:
+        org = _ensure_org_exists(org_id)
+
+    provider = os.getenv("DEFAULT_ORG_SSO_PROVIDER", "microsoft").strip().lower()
+    callback = os.getenv("OAUTH_CALLBACK_URL", "http://localhost:8000/api/auth/callback")
+    default_client = os.getenv(f"{provider.upper()}_CLIENT_ID", "")
+    return {
+        "enabled": bool(default_client),
+        "provider": provider,
+        "client_id": default_client,
+        "callback_url": callback,
+        "issuer": os.getenv("OIDC_ISSUER_URL"),
+        "organization_slug": org.get("slug"),
+    }
 
 
 def _delete_session(session_id: str) -> None:
@@ -1376,6 +1445,97 @@ async def list_organizations(current_user: User = Depends(require_permission("ma
                 }
             )
     return {"items": visible, "total": len(visible)}
+
+
+@app.post("/orgs/{org_id}/sso")
+async def configure_org_sso(
+    org_id: str,
+    payload: OrganizationSSOConfigRequest,
+    current_user: User = Depends(require_permission("manage")),
+):
+    org = _ensure_org_exists(org_id)
+    _require_org_admin(org_id, current_user.email)
+    provider = payload.provider.strip().lower()
+    if provider not in {"google", "github", "microsoft", "okta", "saml", "oidc"}:
+        raise HTTPException(status_code=400, detail="Unsupported SSO provider")
+
+    callback = payload.callback_url or os.getenv(
+        "OAUTH_CALLBACK_URL", "http://localhost:8000/api/auth/callback"
+    )
+    org_sso_configs[org_id] = {
+        "enabled": payload.enabled,
+        "provider": provider,
+        "client_id": payload.client_id or os.getenv(f"{provider.upper()}_CLIENT_ID", ""),
+        "callback_url": callback,
+        "issuer": os.getenv("OIDC_ISSUER_URL"),
+        "organization_slug": org.get("slug"),
+    }
+    _audit_org("org.sso.config", current_user.email, org_id, f"provider={provider}")
+    return {"org_id": org_id, "sso": org_sso_configs[org_id]}
+
+
+@app.get("/orgs/{org_id}/sso")
+async def get_org_sso(org_id: str, current_user: User = Depends(require_permission("read"))):
+    org = _ensure_org_exists(org_id)
+    if current_user.role not in {"admin", "superadmin"} and current_user.email not in org_memberships.get(
+        org_id, {}
+    ):
+        raise HTTPException(status_code=403, detail="Not a member of this organization")
+
+    sso = _resolve_org_sso(org_id, org)
+    if not sso.get("enabled"):
+        return {"org_id": org_id, "sso_enabled": False, "provider": sso.get("provider")}
+
+    provider = str(sso.get("provider", "")).lower()
+    if provider in {"saml", "oidc"}:
+        authorization_url = os.getenv("OIDC_AUTHORIZE_URL") or os.getenv("SAML_SSO_URL", "")
+    else:
+        authorization_url = _provider_authorization_url(
+            provider=provider,
+            client_id=str(sso.get("client_id", "")),
+            callback_url=str(sso.get("callback_url", "")),
+            state=secrets.token_urlsafe(16),
+        )
+
+    return {
+        "org_id": org_id,
+        "organization_slug": org.get("slug"),
+        "sso_enabled": True,
+        "provider": provider,
+        "authorization_url": authorization_url,
+        "callback_url": sso.get("callback_url"),
+        "issuer": sso.get("issuer"),
+    }
+
+
+@app.get("/orgs/slug/{slug}/sso")
+async def get_org_sso_by_slug(slug: str):
+    org_id, org = _find_org_by_slug(slug)
+    sso = _resolve_org_sso(org_id, org)
+    if not sso.get("enabled"):
+        raise HTTPException(status_code=404, detail="SSO is not configured for this organization")
+
+    provider = str(sso.get("provider", "")).lower()
+    if provider in {"saml", "oidc"}:
+        authorization_url = os.getenv("OIDC_AUTHORIZE_URL") or os.getenv("SAML_SSO_URL", "")
+    else:
+        authorization_url = _provider_authorization_url(
+            provider=provider,
+            client_id=str(sso.get("client_id", "")),
+            callback_url=str(sso.get("callback_url", "")),
+            state=secrets.token_urlsafe(16),
+        )
+    if not authorization_url:
+        raise HTTPException(status_code=400, detail="Organization SSO provider is misconfigured")
+
+    return {
+        "org_id": org_id,
+        "organization_slug": org.get("slug"),
+        "provider": provider,
+        "authorization_url": authorization_url,
+        "callback_url": sso.get("callback_url"),
+        "issuer": sso.get("issuer"),
+    }
 
 
 @app.post("/orgs/{org_id}/members")
