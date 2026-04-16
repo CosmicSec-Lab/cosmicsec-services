@@ -62,7 +62,10 @@ def _get_grpc_stub() -> Any | None:
 
         # Attempt to import generated stubs; fall back gracefully if not present
         try:
-            from services.api_gateway import ingest_pb2, ingest_pb2_grpc  # type: ignore[import-not-found]
+            from services.api_gateway import (  # type: ignore[import-not-found]
+                ingest_pb2,
+                ingest_pb2_grpc,
+            )
 
             channel = grpc.insecure_channel(_INGEST_GRPC_ADDR)
             return ingest_pb2_grpc.IngestServiceStub(channel), ingest_pb2

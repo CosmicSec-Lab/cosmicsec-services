@@ -27,6 +27,12 @@ from cosmicsec_platform.middleware.hybrid_router import HybridRouter
 from cosmicsec_platform.middleware.policy_registry import ROUTE_POLICIES
 from cosmicsec_platform.middleware.static_profiles import STATIC_PROFILES
 from services.api_gateway.graphql_runtime import mount_graphql
+from services.api_gateway.ingest_bridge import (
+    check_rust_ingest_health as _check_rust_health,
+)
+from services.api_gateway.ingest_bridge import (
+    ingest_batch as _rust_ingest_batch,
+)
 from services.common.caching import CacheManager, get_redis
 from services.common.exceptions import CosmicSecException
 from services.common.logging import (
@@ -2749,9 +2755,7 @@ async def _agent_heartbeat(websocket: "WebSocket", agent_id: str) -> None:
 # ---------------------------------------------------------------------------
 # Phase P.2 — Rust Ingest Engine endpoints
 # ---------------------------------------------------------------------------
-
-from services.api_gateway.ingest_bridge import check_rust_ingest_health as _check_rust_health
-from services.api_gateway.ingest_bridge import ingest_batch as _rust_ingest_batch
+# (imports for _check_rust_health and _rust_ingest_batch are at the top of the module)
 
 
 @app.get("/api/ingest/health")
