@@ -1,0 +1,105 @@
+syntax = "proto3";
+package cosmicsec.ingest.v1;
+
+option go_package = "github.com/cosmicsec/ingest/proto;ingestpb";
+
+// ---------------------------------------------------------------------------
+// IngestService — primary gRPC interface for the Rust ingest engine
+// ---------------------------------------------------------------------------
+
+service IngestService {
+  // Submit a batch of raw scan-tool output for parsing and storage.
+  rpc IngestBatch(IngestRequest) returns (IngestResponse);
+
+  // Stream findings back to caller as they are parsed (server-side streaming).
+  rpc StreamIngest(IngestRequest) returns (stream FindingProto);
+
+  // Return engine health and throughput metrics.
+  rpc GetStatus(StatusRequest) returns (StatusResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Request / Response messages
+// ---------------------------------------------------------------------------
+
+message IngestRequest {
+  // Unique identifier for this ingest job (UUID v4).
+  string job_id = 1;
+
+  // Identifier of the originating scan in the CosmicSec platform.
+  string scan_id = 2;
+
+  // Raw bytes of tool output (XML, JSON, JSONL, CSV, …).
+  bytes raw_data = 3;
+
+  // Informs parser selection.
+  ToolType tool = 4;
+
+  // Optional context forwarded to findings (org, workspace, etc.)
+  map<string, string> metadata = 5;
+}
+
+message IngestResponse {
+  string job_id = 1;
+  string scan_id = 2;
+  uint32 findings_parsed = 3;
+  uint32 findings_inserted = 4;
+  uint32 parse_errors = 5;
+  double duration_ms = 6;
+  repeated string error_messages = 7;
+}
+
+message FindingProto {
+  string id = 1;
+  string scan_id = 2;
+  string title = 3;
+  string description = 4;
+  Severity severity = 5;
+  float cvss_score = 6;
+  string category = 7;
+  string cve_id = 8;
+  string host = 9;
+  uint32 port = 10;
+  string protocol = 11;
+  string recommendation = 12;
+  string raw_evidence = 13;
+  string detected_at = 14;
+  map<string, string> extra = 15;
+}
+
+message StatusRequest {}
+
+message StatusResponse {
+  string engine_version = 1;
+  string status = 2;
+  uint64 findings_parsed_total = 3;
+  uint64 parse_errors_total = 4;
+  double avg_parse_rate_per_second = 5;
+  double avg_insert_rate_per_second = 6;
+  string uptime = 7;
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum ToolType {
+  TOOL_UNKNOWN = 0;
+  TOOL_NMAP = 1;
+  TOOL_NUCLEI = 2;
+  TOOL_NIKTO = 3;
+  TOOL_ZAP = 4;
+  TOOL_GENERIC_JSON = 5;
+  TOOL_SEMGREP = 6;
+  TOOL_TRIVY = 7;
+  TOOL_GRYPE = 8;
+}
+
+enum Severity {
+  SEVERITY_UNKNOWN = 0;
+  SEVERITY_INFO = 1;
+  SEVERITY_LOW = 2;
+  SEVERITY_MEDIUM = 3;
+  SEVERITY_HIGH = 4;
+  SEVERITY_CRITICAL = 5;
+}
