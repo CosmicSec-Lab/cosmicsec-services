@@ -27,6 +27,12 @@ from cosmicsec_platform.middleware.hybrid_router import HybridRouter
 from cosmicsec_platform.middleware.policy_registry import ROUTE_POLICIES
 from cosmicsec_platform.middleware.static_profiles import STATIC_PROFILES
 from services.api_gateway.graphql_runtime import mount_graphql
+from services.api_gateway.ingest_bridge import (
+    check_rust_ingest_health as _check_rust_health,
+)
+from services.api_gateway.ingest_bridge import (
+    ingest_batch as _rust_ingest_batch,
+)
 from services.common.caching import CacheManager, get_redis
 from services.common.exceptions import CosmicSecException
 from services.common.logging import (
@@ -2744,6 +2750,53 @@ async def _agent_heartbeat(websocket: "WebSocket", agent_id: str) -> None:
             await websocket.send_json({"type": "heartbeat", "ts": time.time()})
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Phase P.2 — Rust Ingest Engine endpoints
+# ---------------------------------------------------------------------------
+# (imports for _check_rust_health and _rust_ingest_batch are at the top of the module)
+
+
+@app.get("/api/ingest/health")
+async def ingest_engine_health():
+    """Return health status of the Rust ingest engine."""
+    healthy = await _check_rust_health()
+    return {
+        "rust_ingest_engine": "healthy" if healthy else "unavailable",
+        "feature_flag": os.environ.get("COSMICSEC_USE_RUST_INGEST", "false"),
+    }
+
+
+@app.post("/api/ingest/batch")
+@limiter.limit("20/minute")
+async def ingest_batch_endpoint(request: Request):
+    """
+    Forward raw scanner output to the Rust ingest engine.
+
+    Body (multipart or JSON):
+      ``scan_id``: str   — which scan produced this output
+      ``tool``:    str   — nmap | nuclei | nikto | zap | generic
+      ``data``:    bytes — raw scanner output (XML / JSONL / JSON)
+
+    Routing is controlled by the COSMICSEC_USE_RUST_INGEST feature flag.
+    When the flag is false or the Rust engine is unavailable the response
+    instructs the caller to use the Python parsers in scan_service.
+    """
+    principal, _ = await _resolve_authenticated_user(request)
+    body = await request.json()
+    scan_id = _validate_path_id(str(body.get("scan_id", "")), "scan_id")
+    tool = str(body.get("tool", "generic"))
+    raw_data = str(body.get("data", "")).encode()
+
+    result = await _rust_ingest_batch(tool=tool, raw_data=raw_data, scan_id=scan_id)
+    logger.info(
+        "ingest_batch scan_id=%s routed_to=%s principal=%s",
+        _sanitize_log(scan_id),
+        result.get("routed_to"),
+        _sanitize_log(principal),
+    )
+    return result
 
 
 if __name__ == "__main__":
