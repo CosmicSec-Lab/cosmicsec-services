@@ -247,13 +247,24 @@ _cors_origins_raw = os.environ.get(
     "COSMICSEC_CORS_ORIGINS", "http://localhost:3000,http://localhost:4173"
 )
 _cors_origins = [o.strip() for o in _cors_origins_raw.split(",") if o.strip()]
+if "*" in _cors_origins:
+    _cors_origins = [o for o in _cors_origins if o != "*"]
+_cors_origin_set = set(_cors_origins)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
-    allow_credentials="*" not in _cors_origins,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def enforce_cors_allowlist(request: Request, call_next):
+    origin = request.headers.get("origin")
+    if origin and origin not in _cors_origin_set:
+        return JSONResponse(status_code=403, content={"detail": "Origin not allowed"})
+    return await call_next(request)
 
 # GZip compression
 app.add_middleware(GZipMiddleware, minimum_size=1000)
@@ -832,6 +843,30 @@ async def refresh_token(request: Request):
     )
 
 
+@app.get("/api/auth/me")
+@limiter.limit("60/minute")
+async def auth_me(request: Request):
+    """Return authenticated user profile from auth service."""
+    headers: dict[str, str] = {}
+    auth_header = request.headers.get("authorization")
+    api_key = request.headers.get("x-api-key")
+    if auth_header:
+        headers["Authorization"] = auth_header
+    if api_key:
+        headers["X-API-Key"] = api_key
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(
+                _build_service_url("auth", "/me"),
+                headers=headers,
+                timeout=10.0,
+            )
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except httpx.HTTPError as e:
+            logger.error("Auth me proxy error: %s", e)
+            raise HTTPException(status_code=503, detail="Authentication service unavailable")
+
+
 @app.get("/api/auth/sso/{provider}/authorize")
 @limiter.limit("30/minute")
 async def auth_sso_authorize(request: Request, provider: str):
@@ -1115,6 +1150,29 @@ async def create_scan(request: Request):
         timeout=30.0,
         route_key="scan.create",
     )
+
+
+@app.post("/api/findings/import")
+@limiter.limit("20/minute")
+async def import_findings(request: Request):
+    """Import offline findings batches into scan service."""
+    raw_body = await request.body()
+    headers = {}
+    for h in ["Content-Encoding", "Authorization", "X-API-Key", "X-Org-Id", "X-Workspace-Id"]:
+        if request.headers.get(h):
+            headers[h] = request.headers.get(h)
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                _build_service_url("scan", "/findings/import"),
+                content=raw_body,
+                headers=headers,
+                timeout=30.0,
+            )
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except httpx.HTTPError as e:
+            logger.error("Scan service findings import error: %s", e)
+            raise HTTPException(status_code=503, detail="Scan service unavailable")
 
 
 @app.get("/api/scans/{scan_id}")
