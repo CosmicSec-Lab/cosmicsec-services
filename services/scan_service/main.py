@@ -6,6 +6,8 @@ Handles security scanning operations with distributed task processing
 import logging
 import os
 import secrets
+import gzip
+import json
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -22,9 +24,15 @@ from fastapi import (
     status,
 )
 from pydantic import BaseModel, Field
+from sqlalchemy import text
 
 from services.common.db import SessionLocal, get_db
 from services.common.observability import setup_observability
+try:
+    from jose import JWTError, jwt
+except ImportError:  # pragma: no cover
+    JWTError = Exception  # type: ignore[misc,assignment]
+    jwt = None
 
 try:
     from celery import Celery
@@ -173,6 +181,42 @@ if Celery is not None:
     broker_url = os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0")
     backend_url = os.getenv("CELERY_BACKEND_URL", "redis://redis:6379/0")
     celery_app = Celery("cosmicsec_scan", broker=broker_url, backend=backend_url)
+    celery_app.conf.timezone = "UTC"
+    celery_app.conf.beat_schedule = {
+        "refresh-dashboard-stats-view": {
+            "task": "scan_service.refresh_dashboard_stats_view",
+            "schedule": 300.0,
+        }
+    }
+
+
+def _refresh_dashboard_stats_view() -> bool:
+    """Refresh Phase S dashboard materialized view when available."""
+    db = SessionLocal()
+    try:
+        db.execute(text("REFRESH MATERIALIZED VIEW CONCURRENTLY dashboard_stats"))
+        db.commit()
+        return True
+    except Exception:
+        db.rollback()
+        try:
+            db.execute(text("REFRESH MATERIALIZED VIEW dashboard_stats"))
+            db.commit()
+            return True
+        except Exception:
+            db.rollback()
+            logger.warning("Dashboard materialized view refresh failed", exc_info=True)
+            return False
+    finally:
+        db.close()
+
+
+if celery_app is not None:
+
+    @celery_app.task(name="scan_service.refresh_dashboard_stats_view")
+    def refresh_dashboard_stats_view_task() -> dict[str, bool]:
+        ok = _refresh_dashboard_stats_view()
+        return {"ok": ok}
 
 mongo_collection = None
 if MongoClient is not None:
@@ -207,6 +251,22 @@ class ConnectionManager:
 
 
 ws_manager = ConnectionManager()
+
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "")
+JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+
+
+def _validate_ws_token(token: str | None) -> dict[str, Any] | None:
+    if not token or not JWT_SECRET_KEY or jwt is None:
+        return None
+    try:
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+    except JWTError:
+        return None
+    sub = payload.get("sub") or payload.get("user_id")
+    if not sub:
+        return None
+    return payload
 
 
 async def perform_scan(scan_id: str, config: ScanConfig):
@@ -588,10 +648,100 @@ async def get_stats():
     }
 
 
+@app.get("/stats/dashboard")
+async def get_dashboard_stats():
+    """Return materialized dashboard stats when available."""
+    db = SessionLocal()
+    try:
+        row = db.execute(text("SELECT * FROM dashboard_stats LIMIT 1")).mappings().first()
+        if row:
+            return dict(row)
+    except Exception:
+        logger.warning("dashboard_stats materialized view unavailable", exc_info=True)
+    finally:
+        db.close()
+    return await get_stats()
+
+
+@app.post("/stats/dashboard/refresh")
+async def refresh_dashboard_stats():
+    """Force-refresh dashboard materialized view."""
+    ok = _refresh_dashboard_stats_view()
+    if not ok:
+        raise HTTPException(status_code=503, detail="dashboard_stats refresh failed")
+    return {"ok": True, "refreshed_at": datetime.now(tz=UTC).isoformat()}
+
+
 class QuotaUpdateRequest(BaseModel):
     max_scans_per_day: int = Field(default=1000, ge=1, le=100000)
     max_workspaces: int | None = Field(default=None, ge=1)
     max_users: int | None = Field(default=None, ge=1)
+
+
+@app.post("/findings/import")
+async def import_findings_batch(request: Request):
+    """Import external/offline findings payload into persistent store."""
+    raw = await request.body()
+    if request.headers.get("content-encoding", "").lower() == "gzip":
+        try:
+            raw = gzip.decompress(raw)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid gzip payload: {exc}") from exc
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON payload: {exc}") from exc
+
+    findings = payload.get("findings", []) if isinstance(payload, dict) else payload
+    if not isinstance(findings, list):
+        raise HTTPException(status_code=400, detail="findings payload must be a list")
+
+    db = SessionLocal()
+    imported = 0
+    scan_id = str(payload.get("scan_id", f"offline-import-{secrets.token_hex(4)}")) if isinstance(payload, dict) else f"offline-import-{secrets.token_hex(4)}"
+    target = str(payload.get("target", "offline-sync")) if isinstance(payload, dict) else "offline-sync"
+    try:
+        existing = db_get_scan(db, scan_id)
+        if not existing:
+            db_create_scan(
+                db,
+                {
+                    "id": scan_id,
+                    "target": target,
+                    "scan_types": ["web"],
+                    "status": "completed",
+                    "source": "offline_sync",
+                },
+            )
+        for item in findings:
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title", "")).strip()
+            if not title:
+                continue
+            create_finding(
+                db,
+                {
+                    "id": item.get("id"),
+                    "scan_id": item.get("scan_id") or scan_id,
+                    "title": title,
+                    "severity": str(item.get("severity", "info")),
+                    "description": item.get("description"),
+                    "evidence": item.get("evidence"),
+                    "tool": item.get("tool"),
+                    "category": item.get("category"),
+                    "target": item.get("target") or target,
+                    "cve_id": item.get("cve_id"),
+                    "cvss_score": item.get("cvss_score"),
+                    "recommendation": item.get("recommendation", ""),
+                    "source": "offline_sync",
+                },
+            )
+            imported += 1
+    finally:
+        db.close()
+
+    return {"imported": imported, "scan_id": scan_id}
 
 
 @app.get("/orgs/{org_id}/quotas")
@@ -615,6 +765,10 @@ async def set_org_quotas(org_id: str, payload: QuotaUpdateRequest):
 
 @app.websocket("/ws/scans/{scan_id}")
 async def scan_websocket(websocket: WebSocket, scan_id: str):
+    token = websocket.query_params.get("token") or websocket.headers.get("authorization", "").removeprefix("Bearer ").strip()
+    if _validate_ws_token(token) is None:
+        await websocket.close(code=4001)
+        return
     await ws_manager.connect(scan_id, websocket)
     try:
         while True:

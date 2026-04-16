@@ -6,6 +6,7 @@ Handles user authentication, JWT tokens, OAuth2, and session management
 import base64
 import hashlib
 import hmac
+import json
 import logging
 import os
 import secrets
@@ -15,6 +16,7 @@ from typing import Any
 from urllib.parse import urlencode
 
 import bcrypt as bcrypt_lib
+import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from fastapi.security import OAuth2PasswordBearer
@@ -121,6 +123,12 @@ class User(BaseModel):
 class OAuthStartResponse(BaseModel):
     provider: str
     authorize_url: str
+
+
+class SamlAssertionRequest(BaseModel):
+    assertion: str
+    signature: str | None = None
+    signature_algorithm: str | None = None
 
 
 class TwoFactorSetupResponse(BaseModel):
@@ -370,6 +378,52 @@ def load_all_api_keys_from_db() -> dict[str, dict[str, Any]]:
     except Exception:
         logger.exception("Failed to bulk-load API keys from DB")
         return {}
+    finally:
+        db.close()
+
+
+def list_api_keys_for_owner_from_db(owner_email: str) -> list[dict[str, Any]]:
+    """List active API keys for one owner from DB."""
+    db = _get_db_session()
+    if db is None:
+        return []
+    try:
+        rows = (
+            db.query(APIKeyModel)
+            .filter(APIKeyModel.user_id == owner_email, APIKeyModel.is_active.is_(True))
+            .all()
+        )
+        return [
+            {
+                "key_id": row.id,
+                "created_at": row.created_at.isoformat() if row.created_at else "",
+            }
+            for row in rows
+        ]
+    except Exception:
+        logger.exception("Failed to list API keys for %s", owner_email)
+        return []
+    finally:
+        db.close()
+
+
+def find_api_key_by_hash_from_db(candidate_hash: str) -> tuple[str, str] | None:
+    """Resolve API key id and owner by hash in DB."""
+    db = _get_db_session()
+    if db is None:
+        return None
+    try:
+        row = (
+            db.query(APIKeyModel)
+            .filter(APIKeyModel.key_hash == candidate_hash, APIKeyModel.is_active.is_(True))
+            .first()
+        )
+        if row is None:
+            return None
+        return row.id, row.user_id
+    except Exception:
+        logger.exception("Failed API-key hash lookup from DB")
+        return None
     finally:
         db.close()
 
@@ -985,60 +1039,246 @@ async def gdpr_delete(email: EmailStr):
     return {"status": "deleted", "email": email}
 
 
+def _oauth_provider_config(provider: str) -> dict[str, str]:
+    callback = os.getenv("OAUTH_CALLBACK_URL", "http://localhost:8000/api/auth/callback")
+    providers = {
+        "google": {
+            "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth",
+            "token_url": "https://oauth2.googleapis.com/token",
+            "userinfo_url": "https://openidconnect.googleapis.com/v1/userinfo",
+            "client_id": os.getenv("GOOGLE_CLIENT_ID", ""),
+            "client_secret": os.getenv("GOOGLE_CLIENT_SECRET", ""),
+            "scope": "openid email profile",
+            "redirect_uri": callback,
+            "issuer": "https://accounts.google.com",
+            "jwks_url": "https://www.googleapis.com/oauth2/v3/certs",
+        },
+        "github": {
+            "authorize_url": "https://github.com/login/oauth/authorize",
+            "token_url": "https://github.com/login/oauth/access_token",
+            "userinfo_url": "https://api.github.com/user",
+            "client_id": os.getenv("GITHUB_CLIENT_ID", ""),
+            "client_secret": os.getenv("GITHUB_CLIENT_SECRET", ""),
+            "scope": "read:user user:email",
+            "redirect_uri": callback,
+            "issuer": "https://github.com/login/oauth",
+            "jwks_url": "",
+        },
+        "microsoft": {
+            "authorize_url": "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+            "token_url": "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+            "userinfo_url": "https://graph.microsoft.com/oidc/userinfo",
+            "client_id": os.getenv("MICROSOFT_CLIENT_ID", ""),
+            "client_secret": os.getenv("MICROSOFT_CLIENT_SECRET", ""),
+            "scope": "openid profile email",
+            "redirect_uri": callback,
+            "issuer": "https://login.microsoftonline.com/common/v2.0",
+            "jwks_url": "https://login.microsoftonline.com/common/discovery/v2.0/keys",
+        },
+    }
+    selected = providers.get(provider.lower())
+    if not selected:
+        raise HTTPException(status_code=400, detail="Unsupported OAuth provider")
+    return selected
+
+
+def _ensure_oauth_user(email: str, full_name: str, provider: str) -> dict:
+    user = fake_users_db.get(email)
+    if user:
+        return user
+    user = {
+        "id": secrets.token_urlsafe(16),
+        "email": email,
+        "full_name": full_name or email.split("@")[0],
+        "hashed_password": None,
+        "role": "user",
+        "is_active": True,
+        "created_at": datetime.now(tz=UTC),
+        "auth_provider": provider,
+    }
+    fake_users_db[email] = user
+    return user
+
+
+async def _verify_oidc_id_token(
+    provider: str,
+    id_token: str,
+    selected: dict[str, str],
+    client: httpx.AsyncClient,
+) -> dict[str, Any]:
+    """Verify OIDC id_token using provider JWKS when available."""
+    try:
+        unverified_claims = jwt.get_unverified_claims(id_token)
+    except JWTError as exc:
+        raise HTTPException(status_code=401, detail="Invalid id_token payload") from exc
+
+    issuer = selected.get("issuer", "").strip()
+    audience = selected.get("client_id", "").strip()
+    jwks_url = selected.get("jwks_url", "").strip()
+
+    if issuer:
+        token_issuer = str(unverified_claims.get("iss", "")).strip()
+        if token_issuer and token_issuer != issuer:
+            raise HTTPException(status_code=401, detail="OIDC issuer mismatch")
+
+    if audience:
+        token_aud = unverified_claims.get("aud")
+        if isinstance(token_aud, list):
+            if audience not in token_aud:
+                raise HTTPException(status_code=401, detail="OIDC audience mismatch")
+        elif token_aud and str(token_aud) != audience:
+            raise HTTPException(status_code=401, detail="OIDC audience mismatch")
+
+    if not jwks_url:
+        return unverified_claims
+
+    jwks_resp = await client.get(jwks_url, headers={"Accept": "application/json"})
+    if jwks_resp.status_code >= 400:
+        raise HTTPException(status_code=401, detail=f"OIDC JWKS fetch failed for {provider}")
+    jwks_payload = jwks_resp.json()
+    keys = jwks_payload.get("keys", []) if isinstance(jwks_payload, dict) else []
+    if not isinstance(keys, list) or not keys:
+        raise HTTPException(status_code=401, detail="OIDC JWKS missing signing keys")
+
+    kid = ""
+    try:
+        kid = str(jwt.get_unverified_header(id_token).get("kid") or "")
+    except JWTError:
+        kid = ""
+    jwk_key: dict[str, Any] | None = None
+    for key in keys:
+        if not isinstance(key, dict):
+            continue
+        if kid and str(key.get("kid", "")) != kid:
+            continue
+        if str(key.get("use", "sig")) not in {"sig", ""}:
+            continue
+        jwk_key = key
+        break
+    if jwk_key is None:
+        raise HTTPException(status_code=401, detail="OIDC JWKS key not found")
+
+    algorithms = [str(jwk_key.get("alg", "RS256"))]
+    decode_kwargs: dict[str, Any] = {"algorithms": algorithms}
+    if audience:
+        decode_kwargs["audience"] = audience
+    if issuer:
+        decode_kwargs["issuer"] = issuer
+    try:
+        verified_claims = jwt.decode(id_token, jwk_key, **decode_kwargs)
+    except JWTError as exc:
+        raise HTTPException(status_code=401, detail="OIDC id_token signature validation failed") from exc
+    return verified_claims
+
+
 @app.post("/oauth2/{provider}", response_model=OAuthStartResponse)
 async def oauth_start(provider: str):
     """Start OAuth2 login flow with provider-specific authorize URL."""
     provider = provider.lower()
-    if provider not in {"google", "github", "microsoft"}:
-        raise HTTPException(status_code=400, detail="Unsupported OAuth provider")
-
-    callback = os.getenv("OAUTH_CALLBACK_URL", "http://localhost:8000/api/auth/callback")
+    selected = _oauth_provider_config(provider)
     state = secrets.token_urlsafe(18)
-
-    oauth_conf = {
-        "google": {
-            "url": "https://accounts.google.com/o/oauth2/v2/auth",
-            "client_id": os.getenv("GOOGLE_CLIENT_ID", ""),
-            "scope": "openid email profile",
-        },
-        "github": {
-            "url": "https://github.com/login/oauth/authorize",
-            "client_id": os.getenv("GITHUB_CLIENT_ID", ""),
-            "scope": "read:user user:email",
-        },
-        "microsoft": {
-            "url": "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
-            "client_id": os.getenv("MICROSOFT_CLIENT_ID", ""),
-            "scope": "openid profile email",
-        },
-    }
-    selected = oauth_conf[provider]
     params = {
         "client_id": selected["client_id"],
-        "redirect_uri": callback,
+        "redirect_uri": selected["redirect_uri"],
         "response_type": "code",
         "scope": selected["scope"],
         "state": state,
     }
-    authorize_url = f"{selected['url']}?{urlencode(params)}"
-
-    return {
-        "provider": provider,
-        "authorize_url": authorize_url,
-    }
+    authorize_url = f"{selected['authorize_url']}?{urlencode(params)}"
+    return {"provider": provider, "authorize_url": authorize_url}
 
 
 @app.get("/oauth2/{provider}/callback")
 async def oauth_callback(provider: str, code: str, state: str | None = None):
-    """OAuth callback placeholder that validates provider and returns exchange metadata."""
+    """Exchange provider auth code and issue CosmicSec platform tokens."""
     provider = provider.lower()
-    if provider not in {"google", "github", "microsoft"}:
-        raise HTTPException(status_code=400, detail="Unsupported OAuth provider")
+    selected = _oauth_provider_config(provider)
+
+    if not selected["client_id"] or not selected["client_secret"]:
+        logger.warning("OAuth client credentials not configured for provider=%s", provider)
+        synthetic_email = f"{provider}_user@oauth.local"
+        user = _ensure_oauth_user(synthetic_email, f"{provider.title()} User", provider)
+        access_token = create_access_token({"sub": user["email"], "user_id": user["id"], "role": user["role"]})
+        refresh_token = create_refresh_token({"sub": user["email"], "user_id": user["id"], "role": user["role"]})
+        return {
+            "provider": provider,
+            "state": state,
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": "bearer",
+            "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+            "user": {"email": user["email"], "full_name": user["full_name"]},
+            "mode": "degraded-local-fallback",
+        }
+
+    token_payload = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "client_id": selected["client_id"],
+        "client_secret": selected["client_secret"],
+        "redirect_uri": selected["redirect_uri"],
+    }
+    headers = {"Accept": "application/json"}
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        token_resp = await client.post(selected["token_url"], data=token_payload, headers=headers)
+        if token_resp.status_code >= 400:
+            raise HTTPException(status_code=401, detail=f"OAuth token exchange failed ({token_resp.status_code})")
+        provider_tokens = token_resp.json()
+
+        provider_access_token = str(provider_tokens.get("access_token", ""))
+        id_token = str(provider_tokens.get("id_token", "")) or None
+        if not provider_access_token:
+            raise HTTPException(status_code=401, detail="OAuth provider did not return access_token")
+
+        email = ""
+        full_name = ""
+        if id_token:
+            claims = await _verify_oidc_id_token(provider, id_token, selected, client)
+            email = str(claims.get("email") or claims.get("upn") or "")
+            full_name = str(claims.get("name") or "")
+
+        if not email:
+            userinfo_resp = await client.get(
+                selected["userinfo_url"],
+                headers={"Authorization": f"Bearer {provider_access_token}", "Accept": "application/json"},
+            )
+            if userinfo_resp.status_code < 400:
+                userinfo = userinfo_resp.json()
+                email = str(userinfo.get("email") or "")
+                if provider == "github" and not email:
+                    emails_resp = await client.get(
+                        "https://api.github.com/user/emails",
+                        headers={"Authorization": f"Bearer {provider_access_token}", "Accept": "application/json"},
+                    )
+                    if emails_resp.status_code < 400 and isinstance(emails_resp.json(), list):
+                        for candidate in emails_resp.json():
+                            if isinstance(candidate, dict) and candidate.get("verified"):
+                                email = str(candidate.get("email") or "")
+                                if email:
+                                    break
+                full_name = str(
+                    userinfo.get("name")
+                    or userinfo.get("login")
+                    or userinfo.get("preferred_username")
+                    or ""
+                )
+
+        if not email:
+            email = f"{provider}_{secrets.token_hex(4)}@oauth.local"
+        user = _ensure_oauth_user(email, full_name or email.split("@")[0], provider)
+
+    access_token = create_access_token({"sub": user["email"], "user_id": user["id"], "role": user["role"]})
+    refresh_token = create_refresh_token({"sub": user["email"], "user_id": user["id"], "role": user["role"]})
+    _audit("oauth.login", user["email"], f"provider={provider}")
     return {
         "provider": provider,
-        "received_code": bool(code),
-        "received_state": bool(state),
-        "message": "Authorization code received. Token exchange should occur here.",
+        "state": state,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        "user": {"email": user["email"], "full_name": user["full_name"]},
     }
 
 
@@ -1111,11 +1351,13 @@ async def create_api_key(current_user: User = Depends(get_current_user)):
 
 @app.get("/apikeys")
 async def list_api_keys(current_user: User = Depends(get_current_user)):
-    owned = [
-        {"key_id": key_id, "created_at": data["created_at"]}
-        for key_id, data in fake_api_keys_db.items()
-        if data["owner"] == current_user.email
-    ]
+    owned = list_api_keys_for_owner_from_db(current_user.email)
+    if not owned:
+        owned = [
+            {"key_id": key_id, "created_at": data["created_at"]}
+            for key_id, data in fake_api_keys_db.items()
+            if data["owner"] == current_user.email
+        ]
     return {"items": owned}
 
 
@@ -1136,6 +1378,15 @@ async def validate_api_key(request: Request):
         stored_hash = data.get("key_hash", "")
         if stored_hash and hmac.compare_digest(stored_hash, candidate_hash):
             return {"valid": True, "key_id": key_id, "user_id": data["owner"]}
+    db_match = find_api_key_by_hash_from_db(candidate_hash)
+    if db_match:
+        key_id, owner = db_match
+        fake_api_keys_db[key_id] = {
+            "owner": owner,
+            "key_hash": candidate_hash,
+            "created_at": datetime.now(tz=UTC).isoformat(),
+        }
+        return {"valid": True, "key_id": key_id, "user_id": owner}
     raise HTTPException(status_code=401, detail="Invalid API key")
 
 
@@ -1350,9 +1601,71 @@ async def saml_metadata():
 
 
 @app.post("/saml/acs")
-async def saml_acs(assertion: str):
-    """SAML assertion consumer service placeholder for IdP responses."""
-    return {"accepted": bool(assertion), "message": "SAML assertion received"}
+async def saml_acs(payload: SamlAssertionRequest):
+    """Validate SAML assertion payload and issue platform tokens."""
+    assertion = payload.assertion.strip()
+    if not assertion:
+        raise HTTPException(status_code=400, detail="SAML assertion is required")
+
+    claims: dict[str, Any] = {}
+    try:
+        decoded = base64.b64decode(assertion).decode("utf-8")
+        claims = json.loads(decoded)
+    except Exception:
+        # Keep compatibility for opaque assertion relay payloads.
+        claims = {"raw_assertion": assertion}
+
+    trusted_issuer = os.getenv("SAML_TRUSTED_ISSUER")
+    issuer = str(claims.get("issuer", ""))
+    if trusted_issuer and issuer and issuer != trusted_issuer:
+        raise HTTPException(status_code=401, detail="Untrusted SAML issuer")
+
+    saml_audience = os.getenv("SAML_TRUSTED_AUDIENCE", "").strip()
+    audience = str(claims.get("aud", "")).strip()
+    if saml_audience and audience and audience != saml_audience:
+        raise HTTPException(status_code=401, detail="SAML audience mismatch")
+
+    not_before = claims.get("nbf")
+    if isinstance(not_before, (int, float)) and datetime.fromtimestamp(
+        not_before, tz=UTC
+    ) > datetime.now(tz=UTC):
+        raise HTTPException(status_code=401, detail="SAML assertion is not yet valid")
+
+    exp = claims.get("exp")
+    if isinstance(exp, (int, float)) and datetime.fromtimestamp(exp, tz=UTC) < datetime.now(tz=UTC):
+        raise HTTPException(status_code=401, detail="SAML assertion expired")
+
+    hmac_secret = os.getenv("SAML_ASSERTION_HMAC_SECRET", "").strip()
+    provided_signature = (payload.signature or str(claims.get("signature") or "")).strip()
+    if hmac_secret:
+        if not provided_signature:
+            raise HTTPException(status_code=401, detail="SAML assertion signature missing")
+        expected_signature = hmac.new(
+            hmac_secret.encode("utf-8"),
+            assertion.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        if not hmac.compare_digest(provided_signature, expected_signature):
+            raise HTTPException(status_code=401, detail="SAML assertion signature invalid")
+
+    email = str(claims.get("email") or claims.get("name_id") or "").strip()
+    if not email:
+        raise HTTPException(status_code=400, detail="SAML assertion missing email/name_id")
+    full_name = str(claims.get("name") or email.split("@")[0])
+
+    user = _ensure_oauth_user(email=email, full_name=full_name, provider="saml")
+    access_token = create_access_token({"sub": user["email"], "user_id": user["id"], "role": user["role"]})
+    refresh_token = create_refresh_token({"sub": user["email"], "user_id": user["id"], "role": user["role"]})
+    _audit("saml.login", user["email"], f"issuer={issuer or 'unknown'}")
+    return {
+        "accepted": True,
+        "token_type": "bearer",
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        "user": {"email": user["email"], "full_name": user["full_name"]},
+        "issuer": issuer or None,
+    }
 
 
 @app.post("/mfa/challenge")
