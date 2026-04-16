@@ -227,6 +227,8 @@ _XSS_RE = re.compile(
     re.IGNORECASE,
 )
 
+from services.api_gateway.white_label import WhiteLabelMiddleware, mount_branding_routes
+
 limiter = Limiter(key_func=get_user_identifier)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -246,6 +248,10 @@ app.add_middleware(
 
 # GZip compression
 app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+# White-label org branding middleware (Phase R.5)
+app.add_middleware(WhiteLabelMiddleware)
+mount_branding_routes(app)
 
 # ---------------------------------------------------------------------------
 # Maximum request body size (1 MB default, 10 MB for upload endpoints)
