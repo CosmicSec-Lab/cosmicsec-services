@@ -266,7 +266,9 @@ async def agent_ws(websocket: WebSocket, agent_id: str) -> None:
                     sanitize_for_log(msg.get("scan_id")),
                 )
             else:
-                logger.debug("Agent %s unknown message type: %s", safe_agent_id, sanitize_for_log(msg_type))
+                logger.debug(
+                    "Agent %s unknown message type: %s", safe_agent_id, sanitize_for_log(msg_type)
+                )
 
     except WebSocketDisconnect:
         logger.info("Agent %s disconnected from relay", safe_agent_id)
@@ -285,7 +287,9 @@ async def agent_ws(websocket: WebSocket, agent_id: str) -> None:
             db.commit()
             db.close()
         except Exception:
-            logger.debug("DB status update for agent %s disconnect failed", safe_agent_id, exc_info=True)
+            logger.debug(
+                "DB status update for agent %s disconnect failed", safe_agent_id, exc_info=True
+            )
 
 
 async def _heartbeat(websocket: WebSocket, agent_id: str) -> None:

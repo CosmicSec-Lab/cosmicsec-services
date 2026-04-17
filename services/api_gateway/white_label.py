@@ -27,7 +27,12 @@ import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
-from services.common.security_utils import normalize_org_slug, sanitize_for_log, validate_outbound_url
+
+from services.common.security_utils import (
+    normalize_org_slug,
+    sanitize_for_log,
+    validate_outbound_url,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -155,7 +160,9 @@ def mount_branding_routes(app: FastAPI) -> None:
                 if refreshed:
                     branding = refreshed
             except Exception:
-                logger.debug("Branding refresh failed for org %s", sanitize_for_log(safe_slug), exc_info=True)
+                logger.debug(
+                    "Branding refresh failed for org %s", sanitize_for_log(safe_slug), exc_info=True
+                )
 
         return JSONResponse(
             {
