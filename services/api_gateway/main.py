@@ -22,11 +22,11 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
+from cosmicsec_platform.config import get_config
 from cosmicsec_platform.contracts.runtime_metadata import HYBRID_SCHEMA, HYBRID_VERSION
 from cosmicsec_platform.middleware.hybrid_router import HybridRouter
 from cosmicsec_platform.middleware.policy_registry import ROUTE_POLICIES
 from cosmicsec_platform.middleware.static_profiles import STATIC_PROFILES
-from cosmicsec_platform.config import get_config
 from cosmicsec_platform.service_discovery import get_registry, log_service_config
 from services.api_gateway.graphql_runtime import mount_graphql
 from services.api_gateway.ingest_bridge import (

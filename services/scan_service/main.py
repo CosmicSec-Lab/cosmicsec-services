@@ -26,9 +26,9 @@ from fastapi import (
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
+from cosmicsec_platform.service_discovery import get_service_url
 from services.common.db import SessionLocal
 from services.common.observability import setup_observability
-from cosmicsec_platform.service_discovery import get_service_url
 
 try:
     from jose import JWTError, jwt
