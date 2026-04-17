@@ -14,6 +14,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application
 COPY services/api_gateway /app/services/api_gateway
+COPY services/common /app/services/common
+COPY cosmicsec_platform /app/cosmicsec_platform
 
 # Create non-root user
 RUN useradd -m -u 1000 cosmicsec && chown -R cosmicsec:cosmicsec /app
