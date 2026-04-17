@@ -99,7 +99,7 @@ impl StreamConsumer {
             .map
             .get("scan_id")
             .and_then(|v| match v {
-                redis::Value::BulkString(b) => std::str::from_utf8(b).ok().map(|s| s.to_owned()),
+                redis::Value::Data(b) => std::str::from_utf8(b).ok().map(|s| s.to_owned()),
                 _ => None,
             })
             .unwrap_or_default();
@@ -108,13 +108,13 @@ impl StreamConsumer {
             .map
             .get("tool")
             .and_then(|v| match v {
-                redis::Value::BulkString(b) => std::str::from_utf8(b).ok().map(|s| s.to_owned()),
+                redis::Value::Data(b) => std::str::from_utf8(b).ok().map(|s| s.to_owned()),
                 _ => None,
             })
             .unwrap_or_else(|| "generic_json".to_owned());
 
         let raw_data = match entry.map.get("data") {
-            Some(redis::Value::BulkString(b)) => b.clone(),
+            Some(redis::Value::Data(b)) => b.clone(),
             _ => {
                 warn!(id = %entry.id, "stream entry missing 'data' field");
                 return Ok(());
