@@ -6,6 +6,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from pydantic import BaseModel, Field
+from services.common.security_utils import ensure_safe_child_path, sanitize_scan_id
 
 try:
     from docx import Document
@@ -155,7 +156,8 @@ def generate_report(payload: ReportRequest) -> dict:
     if safe_format not in {"pdf", "docx", "json", "csv", "html"}:
         safe_format = "pdf"
 
-    out = REPORT_DIR / f"{payload.scan_id}.{safe_format}"
+    safe_scan_id = sanitize_scan_id(payload.scan_id)
+    out = ensure_safe_child_path(REPORT_DIR, f"{safe_scan_id}.{safe_format}")
     if safe_format == "json":
         _write_json(out, payload)
     elif safe_format == "csv":
@@ -168,7 +170,7 @@ def generate_report(payload: ReportRequest) -> dict:
         _write_pdf(out, payload)
 
     return {
-        "scan_id": payload.scan_id,
+        "scan_id": safe_scan_id,
         "format": safe_format,
         "artifact": str(out),
         "status": "generated",

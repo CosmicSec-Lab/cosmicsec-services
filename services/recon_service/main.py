@@ -13,6 +13,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import socket
 from datetime import UTC, datetime
 from urllib.parse import quote, urlparse
@@ -65,11 +66,17 @@ class ReconRequest(BaseModel):
     target: str
 
 
+_SAFE_HOST_RE = re.compile(r"^[a-z0-9.-]+$", re.IGNORECASE)
+
+
 def _normalize_target(target: str) -> str:
     value = target.strip()
     if "://" in value:
         parsed = urlparse(value)
-        return parsed.hostname or value
+        value = parsed.hostname or value
+    value = value.strip().lower().rstrip(".")
+    if not value or len(value) > 253 or not _SAFE_HOST_RE.fullmatch(value):
+        return "invalid-target"
     return value
 
 
@@ -112,8 +119,8 @@ async def _shodan_lookup(client: httpx.AsyncClient, target: str) -> dict:
         }
         _cache_set(cache_key, result, ttl_seconds=86400)  # 24 hours
         return result
-    except (httpx.HTTPError, ValueError) as exc:
-        return {"enabled": True, "error": str(exc)}
+    except (httpx.HTTPError, ValueError):
+        return {"enabled": True, "error": "Shodan lookup failed"}
 
 
 async def _virustotal_lookup(client: httpx.AsyncClient, target: str) -> dict:
@@ -135,8 +142,8 @@ async def _virustotal_lookup(client: httpx.AsyncClient, target: str) -> dict:
         result = {"enabled": True, "analysis_stats": stats}
         _cache_set(cache_key, result, ttl_seconds=43200)  # 12 hours
         return result
-    except (httpx.HTTPError, ValueError) as exc:
-        return {"enabled": True, "error": str(exc)}
+    except (httpx.HTTPError, ValueError):
+        return {"enabled": True, "error": "VirusTotal lookup failed"}
 
 
 async def _crtsh_lookup(client: httpx.AsyncClient, target: str) -> dict:
@@ -161,8 +168,8 @@ async def _crtsh_lookup(client: httpx.AsyncClient, target: str) -> dict:
         result = {"enabled": True, "subdomains": sorted(names)[:50]}
         _cache_set(cache_key, result, ttl_seconds=21600)  # 6 hours
         return result
-    except (httpx.HTTPError, ValueError) as exc:
-        return {"enabled": True, "error": str(exc)}
+    except (httpx.HTTPError, ValueError):
+        return {"enabled": True, "error": "crt.sh lookup failed"}
 
 
 async def _rdap_lookup(client: httpx.AsyncClient, target: str) -> dict:
@@ -187,8 +194,8 @@ async def _rdap_lookup(client: httpx.AsyncClient, target: str) -> dict:
         }
         _cache_set(cache_key, result, ttl_seconds=21600)  # 6 hours
         return result
-    except (httpx.HTTPError, ValueError) as exc:
-        return {"enabled": True, "error": str(exc)}
+    except (httpx.HTTPError, ValueError):
+        return {"enabled": True, "error": "RDAP lookup failed"}
 
 
 @app.get("/health")
@@ -219,6 +226,12 @@ def cache_stats() -> dict:
 @app.post("/recon")
 async def run_recon(payload: ReconRequest) -> dict:
     target = _normalize_target(payload.target)
+    if target == "invalid-target":
+        return {
+            "status": "rejected",
+            "reason": "target must be a valid hostname or domain",
+            "timestamp": datetime.now(tz=UTC).isoformat(),
+        }
     dns = _dns_recon(target)
 
     async with httpx.AsyncClient() as client:

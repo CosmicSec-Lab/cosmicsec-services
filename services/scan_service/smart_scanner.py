@@ -18,6 +18,8 @@ import os
 import re
 from typing import Any
 
+from services.common.security_utils import sanitize_for_log, validate_outbound_url
+
 logger = logging.getLogger(__name__)
 
 _HTTPX_AVAILABLE = False
@@ -298,6 +300,17 @@ async def fingerprint_target(url: str) -> dict[str, Any]:
     if not _HTTPX_AVAILABLE:
         return _url_fingerprint(url)
 
+    safe_url = validate_outbound_url(url, allow_private_hosts=False)
+    if not safe_url:
+        logger.warning("Fingerprint blocked for unsafe URL: %s", sanitize_for_log(url))
+        return {
+            "url": url,
+            "technologies": [],
+            "tags": ["misconfig"],
+            "risk_multiplier": 1.0,
+            "blocked": True,
+        }
+
     technologies: list[str] = []
     tags: list[str] = []
     risk_multiplier = 1.0
@@ -308,7 +321,7 @@ async def fingerprint_target(url: str) -> dict[str, Any]:
             follow_redirects=True,
             verify=_tls_verify_enabled(),
         ) as client:
-            resp = await client.get(url)
+            resp = await client.get(safe_url)
             headers = {k.lower(): v.lower() for k, v in resp.headers.items()}
             body_snip = resp.text[:15000].lower()
 
@@ -329,7 +342,7 @@ async def fingerprint_target(url: str) -> dict[str, Any]:
                     risk_multiplier = max(risk_multiplier, fp["risk"])
 
     except Exception as exc:
-        logger.debug("Fingerprint HTTP probe failed (%s): %s", url, exc)
+        logger.debug("Fingerprint HTTP probe failed (%s): %s", sanitize_for_log(safe_url), sanitize_for_log(exc))
 
     # Always apply URL-pattern rules
     url_result = _url_fingerprint(url)

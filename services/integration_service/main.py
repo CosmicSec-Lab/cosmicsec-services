@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 
 from services.common.db import SessionLocal, get_db
 from services.common.models import IntegrationConfigModel, IntegrationEventModel
+from services.common.security_utils import sanitize_for_log, validate_outbound_url
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,11 @@ JIRA_API_URL = os.getenv("JIRA_API_URL")
 SERVICENOW_API_URL = os.getenv("SERVICENOW_API_URL")
 GITHUB_ISSUES_API_URL = os.getenv("GITHUB_ISSUES_API_URL")
 EMAIL_API_URL = os.getenv("EMAIL_API_URL")
+_ALLOWED_WEBHOOK_HOSTS = {
+    h.strip().lower()
+    for h in os.getenv("INTEGRATION_ALLOWED_WEBHOOK_HOSTS", "").split(",")
+    if h.strip()
+}
 
 
 class SIEMEvent(BaseModel):
@@ -82,9 +88,17 @@ class IntegrationConfigCreate(BaseModel):
 async def _forward_post(url: str | None, payload: dict[str, Any]) -> bool:
     if not url:
         return False
+    safe_url = validate_outbound_url(
+        url,
+        allowed_hosts=_ALLOWED_WEBHOOK_HOSTS or None,
+        allow_private_hosts=False,
+    )
+    if not safe_url:
+        logger.warning("Blocked outbound webhook URL: %s", sanitize_for_log(url))
+        return False
     async with httpx.AsyncClient() as client:
         try:
-            await client.post(url, json=payload, timeout=5.0)
+            await client.post(safe_url, json=payload, timeout=5.0)
             return True
         except httpx.HTTPError:
             return False

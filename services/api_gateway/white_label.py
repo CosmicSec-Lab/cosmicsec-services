@@ -21,15 +21,18 @@ from __future__ import annotations
 import logging
 import os
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
+from services.common.security_utils import normalize_org_slug, sanitize_for_log, validate_outbound_url
 
 logger = logging.getLogger(__name__)
 
 ORG_SERVICE_URL = os.getenv("ORG_SERVICE_URL", "http://org-service:8006")
+_SAFE_ORG_SERVICE_URL = validate_outbound_url(ORG_SERVICE_URL, allow_private_hosts=True)
 
 # ---------------------------------------------------------------------------
 # In-memory branding cache (populated from org service)
@@ -64,15 +67,24 @@ def update_branding(org_slug: str, branding: dict[str, Any]) -> dict[str, Any]:
 
 async def _fetch_org_branding(org_slug: str) -> dict[str, Any] | None:
     """Fetch branding from org service (non-blocking, best-effort)."""
+    if not _SAFE_ORG_SERVICE_URL:
+        return None
+    safe_slug = normalize_org_slug(org_slug)
     try:
         async with httpx.AsyncClient(timeout=3.0) as client:
-            resp = await client.get(f"{ORG_SERVICE_URL}/api/orgs/slug/{org_slug}/branding")
+            resp = await client.get(
+                f"{_SAFE_ORG_SERVICE_URL}/api/orgs/slug/{quote(safe_slug)}/branding"
+            )
             if resp.status_code == 200:
                 data = resp.json()
-                update_branding(org_slug, data.get("branding") or data)
-                return _branding_cache[org_slug]
+                update_branding(safe_slug, data.get("branding") or data)
+                return _branding_cache[safe_slug]
     except Exception as exc:
-        logger.debug("Could not fetch org branding for '%s': %s", org_slug, exc)
+        logger.debug(
+            "Could not fetch org branding for '%s': %s",
+            sanitize_for_log(safe_slug),
+            sanitize_for_log(exc),
+        )
     return None
 
 
@@ -105,7 +117,7 @@ class WhiteLabelMiddleware(BaseHTTPMiddleware):
     """
 
     async def dispatch(self, request: Request, call_next):
-        org_slug = request.headers.get("X-Org-Slug", "default")
+        org_slug = normalize_org_slug(request.headers.get("X-Org-Slug", "default"))
         branding = get_branding(org_slug)
 
         # Background refresh from org service if slug not cached
@@ -134,19 +146,20 @@ def mount_branding_routes(app: FastAPI) -> None:
         Return org branding including CSS variables for frontend theming.
         Frontend calls this on first load and applies CSS custom properties.
         """
-        branding = get_branding(org_slug)
+        safe_slug = normalize_org_slug(org_slug)
+        branding = get_branding(safe_slug)
         # Attempt live refresh
-        if org_slug != "default":
+        if safe_slug != "default":
             try:
-                refreshed = await _fetch_org_branding(org_slug)
+                refreshed = await _fetch_org_branding(safe_slug)
                 if refreshed:
                     branding = refreshed
             except Exception:
-                logger.debug("Branding refresh failed for org %s", org_slug, exc_info=True)
+                logger.debug("Branding refresh failed for org %s", sanitize_for_log(safe_slug), exc_info=True)
 
         return JSONResponse(
             {
-                "org_slug": org_slug,
+                "org_slug": safe_slug,
                 "branding": branding,
                 "css_variables": to_css_variables(branding),
                 "theme": {
@@ -161,6 +174,7 @@ def mount_branding_routes(app: FastAPI) -> None:
     @app.put("/api/branding/{org_slug}")
     async def update_org_branding(org_slug: str, request: Request) -> JSONResponse:
         """Update org branding (admin only — validated by API gateway auth middleware)."""
+        safe_slug = normalize_org_slug(org_slug)
         body = await request.json()
-        branding = update_branding(org_slug, body)
-        return JSONResponse({"org_slug": org_slug, "branding": branding})
+        branding = update_branding(safe_slug, body)
+        return JSONResponse({"org_slug": safe_slug, "branding": branding})

@@ -19,6 +19,8 @@ from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
+from services.common.security_utils import sanitize_for_log, validate_outbound_url
+
 logger = logging.getLogger(__name__)
 
 _HTTPX_AVAILABLE = False
@@ -274,11 +276,25 @@ class APIFuzzer:
         selected = attack_types or list(_PAYLOADS.keys())
         self._request_count = 0
         findings: list[dict[str, Any]] = []
+        safe_base_url = validate_outbound_url(base_url, allow_private_hosts=False)
+        if not safe_base_url:
+            logger.warning("Blocked API fuzzing for unsafe URL: %s", sanitize_for_log(base_url))
+            return {
+                "base_url": base_url,
+                "endpoints_tested": 0,
+                "requests_sent": 0,
+                "attack_types": selected,
+                "findings": [],
+                "findings_count": 0,
+                "severity_breakdown": {},
+                "timestamp": datetime.now(tz=UTC).isoformat(),
+                "blocked": True,
+            }
 
         endpoints = (
-            _parse_openapi_endpoints(openapi_spec, base_url)
+            _parse_openapi_endpoints(openapi_spec, safe_base_url)
             if openapi_spec
-            else _default_endpoints(base_url)
+            else _default_endpoints(safe_base_url)
         )
 
         if not _HTTPX_AVAILABLE:

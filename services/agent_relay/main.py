@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from services.common.jwt_utils import decode_token
+from services.common.security_utils import sanitize_for_log
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -63,6 +64,15 @@ _connections: dict[str, dict] = {}
 # Internal relay key — shared secret for service-to-service dispatch calls
 # ---------------------------------------------------------------------------
 _RELAY_SECRET = os.environ.get("RELAY_INTERNAL_SECRET", "")
+_API_KEY_HASH_SECRET = os.environ.get("API_KEY_HASH_SECRET", _RELAY_SECRET or "cosmicsec-api-key")
+
+
+def _hash_api_key_token(token: str) -> str:
+    return hmac.new(
+        _API_KEY_HASH_SECRET.encode("utf-8"),
+        token.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +127,7 @@ async def dispatch_task(payload: DispatchTaskRequest, request: Request) -> JSONR
             raise HTTPException(status_code=403, detail="Forbidden")
 
     agent_id = payload.agent_id
+    safe_agent_id = sanitize_for_log(agent_id)
     if agent_id not in _connections:
         raise HTTPException(status_code=404, detail=f"Agent {agent_id!r} is not connected")
 
@@ -124,7 +135,7 @@ async def dispatch_task(payload: DispatchTaskRequest, request: Request) -> JSONR
     try:
         await ws.send_json({"type": "task", "payload": payload.task})
     except (WebSocketDisconnect, RuntimeError, OSError):
-        logger.exception("Failed to dispatch task to agent %s", agent_id)
+        logger.exception("Failed to dispatch task to agent %s", safe_agent_id)
         raise HTTPException(status_code=503, detail="Failed to deliver task to agent")
 
     return JSONResponse(content={"dispatched": True, "agent_id": agent_id})
@@ -138,6 +149,7 @@ async def agent_ws(websocket: WebSocket, agent_id: str) -> None:
     or via a JWT ``token`` query parameter.  If neither is valid the
     connection is rejected with close code 4001.
     """
+    safe_agent_id = sanitize_for_log(agent_id)
     api_key = websocket.query_params.get("api_key") or websocket.headers.get("x-api-key")
     token = websocket.query_params.get("token")
     if not token:
@@ -155,7 +167,7 @@ async def agent_ws(websocket: WebSocket, agent_id: str) -> None:
             from services.common.db import SessionLocal
             from services.common.models import APIKeyModel
 
-            candidate_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+            candidate_hash = _hash_api_key_token(api_key)
             db: _SASession = SessionLocal()
             try:
                 row = (
@@ -189,7 +201,7 @@ async def agent_ws(websocket: WebSocket, agent_id: str) -> None:
         "last_seen_at": now,
         "manifest": {},
     }
-    logger.info("Agent %s connected via relay", agent_id)
+    logger.info("Agent %s connected via relay", safe_agent_id)
 
     # Persist agent session to database (upsert)
     try:
@@ -213,7 +225,7 @@ async def agent_ws(websocket: WebSocket, agent_id: str) -> None:
         db.commit()
         db.close()
     except Exception:
-        logger.debug("DB upsert for agent %s failed (non-critical)", agent_id, exc_info=True)
+        logger.debug("DB upsert for agent %s failed (non-critical)", safe_agent_id, exc_info=True)
 
     heartbeat_task = asyncio.create_task(_heartbeat(websocket, agent_id))
 
@@ -225,12 +237,12 @@ async def agent_ws(websocket: WebSocket, agent_id: str) -> None:
             try:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
-                logger.warning("Agent %s sent non-JSON data", agent_id)
+                logger.warning("Agent %s sent non-JSON data", safe_agent_id)
                 await websocket.send_json({"type": "error", "detail": "Invalid JSON payload"})
                 continue
 
             if not isinstance(msg, dict) or "type" not in msg:
-                logger.warning("Agent %s sent message without 'type' field", agent_id)
+                logger.warning("Agent %s sent message without 'type' field", safe_agent_id)
                 await websocket.send_json(
                     {"type": "error", "detail": "Message must be a JSON object with a 'type' field"}
                 )
@@ -240,20 +252,24 @@ async def agent_ws(websocket: WebSocket, agent_id: str) -> None:
 
             if msg_type == "manifest":
                 _connections[agent_id]["manifest"] = msg.get("payload", {})
-                logger.info("Agent %s registered manifest", agent_id)
+                logger.info("Agent %s registered manifest", safe_agent_id)
             elif msg_type == "finding":
                 logger.info(
                     "Agent %s submitted finding: %s",
-                    agent_id,
-                    msg.get("payload", {}).get("title", "(no title)"),
+                    safe_agent_id,
+                    sanitize_for_log(msg.get("payload", {}).get("title", "(no title)")),
                 )
             elif msg_type == "scan_complete":
-                logger.info("Agent %s scan complete: %s", agent_id, msg.get("scan_id"))
+                logger.info(
+                    "Agent %s scan complete: %s",
+                    safe_agent_id,
+                    sanitize_for_log(msg.get("scan_id")),
+                )
             else:
-                logger.debug("Agent %s unknown message type: %s", agent_id, msg_type)
+                logger.debug("Agent %s unknown message type: %s", safe_agent_id, sanitize_for_log(msg_type))
 
     except WebSocketDisconnect:
-        logger.info("Agent %s disconnected from relay", agent_id)
+        logger.info("Agent %s disconnected from relay", safe_agent_id)
     finally:
         heartbeat_task.cancel()
         _connections.pop(agent_id, None)
@@ -269,7 +285,7 @@ async def agent_ws(websocket: WebSocket, agent_id: str) -> None:
             db.commit()
             db.close()
         except Exception:
-            logger.debug("DB status update for agent %s disconnect failed", agent_id, exc_info=True)
+            logger.debug("DB status update for agent %s disconnect failed", safe_agent_id, exc_info=True)
 
 
 async def _heartbeat(websocket: WebSocket, agent_id: str) -> None:
@@ -279,7 +295,7 @@ async def _heartbeat(websocket: WebSocket, agent_id: str) -> None:
             await asyncio.sleep(30)
             await websocket.send_json({"type": "heartbeat", "ts": time.time()})
     except Exception:
-        logger.debug("Heartbeat loop ended for agent %s", agent_id, exc_info=True)
+        logger.debug("Heartbeat loop ended for agent %s", sanitize_for_log(agent_id), exc_info=True)
 
 
 if __name__ == "__main__":

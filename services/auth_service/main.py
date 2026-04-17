@@ -61,6 +61,7 @@ from services.auth_service.rbac_engine import (
     delete_custom_role,
     list_roles,
 )
+from services.common.security_utils import sanitize_for_log
 
 app = FastAPI(
     title="CosmicSec Auth Service",
@@ -74,6 +75,7 @@ logger = logging.getLogger(__name__)
 
 # Security configuration
 SECRET_KEY = os.getenv("JWT_SECRET_KEY", secrets.token_urlsafe(32))
+API_KEY_HASH_SECRET = os.getenv("API_KEY_HASH_SECRET", SECRET_KEY)
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 REFRESH_TOKEN_EXPIRE_DAYS = 30
@@ -295,6 +297,15 @@ def _get_db_session() -> "SASession | None":
         return None
 
 
+def _hash_api_key_token(token: str) -> str:
+    """Use keyed hashing for API tokens to avoid plain unsalted hash storage."""
+    return hmac.new(
+        API_KEY_HASH_SECRET.encode("utf-8"),
+        token.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
 def save_api_key_to_db(key_id: str, data: dict[str, Any]) -> None:
     """Persist a single API-key record to the database."""
     db = _get_db_session()
@@ -318,7 +329,7 @@ def save_api_key_to_db(key_id: str, data: dict[str, Any]) -> None:
             )
         db.commit()
     except Exception:
-        logger.exception("Failed to persist API key %s to DB", key_id)
+        logger.exception("Failed to persist API key %s to DB", sanitize_for_log(key_id))
         db.rollback()
     finally:
         db.close()
@@ -333,7 +344,7 @@ def delete_api_key_from_db(key_id: str) -> None:
         db.query(APIKeyModel).filter(APIKeyModel.id == key_id).delete()
         db.commit()
     except Exception:
-        logger.exception("Failed to delete API key %s from DB", key_id)
+        logger.exception("Failed to delete API key %s from DB", sanitize_for_log(key_id))
         db.rollback()
     finally:
         db.close()
@@ -354,7 +365,7 @@ def load_api_key_from_db(key_id: str) -> dict[str, Any] | None:
             "created_at": row.created_at.isoformat() if row.created_at else "",
         }
     except Exception:
-        logger.exception("Failed to load API key %s from DB", key_id)
+        logger.exception("Failed to load API key %s from DB", sanitize_for_log(key_id))
         return None
     finally:
         db.close()
@@ -401,7 +412,7 @@ def list_api_keys_for_owner_from_db(owner_email: str) -> list[dict[str, Any]]:
             for row in rows
         ]
     except Exception:
-        logger.exception("Failed to list API keys for %s", owner_email)
+        logger.exception("Failed to list API keys for %s", sanitize_for_log(owner_email))
         return []
     finally:
         db.close()
@@ -441,9 +452,9 @@ def save_2fa_to_db(email: str, secret: str) -> None:
             user.totp_enabled = True
             db.commit()
         else:
-            logger.warning("save_2fa_to_db: no user row for %s", email)
+            logger.warning("save_2fa_to_db: no user row for %s", sanitize_for_log(email))
     except Exception:
-        logger.exception("Failed to persist 2FA secret for %s", email)
+        logger.exception("Failed to persist 2FA secret for %s", sanitize_for_log(email))
         db.rollback()
     finally:
         db.close()
@@ -460,7 +471,7 @@ def load_2fa_from_db(email: str) -> str | None:
             return decrypt_2fa_secret(user.totp_secret)
         return None
     except Exception:
-        logger.exception("Failed to load 2FA secret for %s", email)
+        logger.exception("Failed to load 2FA secret for %s", sanitize_for_log(email))
         return None
     finally:
         db.close()
@@ -482,7 +493,7 @@ def load_all_2fa_from_db() -> dict[str, str]:
             try:
                 result[row.email] = decrypt_2fa_secret(row.totp_secret)
             except Exception:
-                logger.warning("Skipping undecryptable 2FA secret for %s", row.email)
+                logger.warning("Skipping undecryptable 2FA secret for %s", sanitize_for_log(row.email))
         return result
     except Exception:
         logger.exception("Failed to bulk-load 2FA secrets from DB")
@@ -503,7 +514,7 @@ def disable_2fa_in_db(email: str) -> None:
             user.totp_secret = None
             db.commit()
     except Exception:
-        logger.exception("Failed to disable 2FA for %s", email)
+        logger.exception("Failed to disable 2FA for %s", sanitize_for_log(email))
         db.rollback()
     finally:
         db.close()
@@ -511,9 +522,6 @@ def disable_2fa_in_db(email: str) -> None:
 
 def _hash_audit_entry(entry: dict[str, Any], previous_hash: str | None) -> str:
     """Generate a tamper-evident hash chain for audit logs."""
-    import hashlib
-    import json
-
     payload = {
         **entry,
         "previous_hash": previous_hash or "",
@@ -869,7 +877,7 @@ async def register(user_data: UserCreate):
     fake_users_db[user_data.email] = new_user
     _audit("user.register", user_data.email, f"role={user_data.role}")
 
-    logger.info(f"New user registered: {user_data.email}")
+    logger.info("New user registered: %s", sanitize_for_log(user_data.email))
 
     return {"message": "User registered successfully", "user_id": user_id, "email": user_data.email}
 
@@ -921,7 +929,7 @@ async def login(user_data: UserLogin, request: Request):
     _store_session(session_id, user_data.email, refresh_token)
     _audit("user.login", user_data.email, f"session={session_id}")
 
-    logger.info(f"User logged in: {user_data.email}")
+    logger.info("User logged in: %s", sanitize_for_log(user_data.email))
 
     return {
         "access_token": access_token,
@@ -975,7 +983,7 @@ async def get_current_user_info(current_user: User = Depends(get_current_user)):
 async def logout(current_user: User = Depends(get_current_user)):
     """Logout user (invalidate token)"""
     # In production, add token to blacklist in Redis
-    logger.info(f"User logged out: {current_user.email}")
+    logger.info("User logged out: %s", sanitize_for_log(current_user.email))
     _audit("user.logout", current_user.email, "logout requested")
     return {"message": "Successfully logged out"}
 
@@ -1199,7 +1207,10 @@ async def oauth_callback(provider: str, code: str, state: str | None = None):
     selected = _oauth_provider_config(provider)
 
     if not selected["client_id"] or not selected["client_secret"]:
-        logger.warning("OAuth client credentials not configured for provider=%s", provider)
+        logger.warning(
+            "OAuth client credentials not configured for provider=%s",
+            sanitize_for_log(provider),
+        )
         synthetic_email = f"{provider}_user@oauth.local"
         user = _ensure_oauth_user(synthetic_email, f"{provider.title()} User", provider)
         access_token = create_access_token(
@@ -1362,7 +1373,7 @@ async def create_api_key(current_user: User = Depends(get_current_user)):
     key_id = secrets.token_urlsafe(8)
     key_data = {
         "owner": current_user.email,
-        "key_hash": hashlib.sha256(raw_key.encode("utf-8")).hexdigest(),
+        "key_hash": _hash_api_key_token(raw_key),
         "created_at": datetime.now(tz=UTC).isoformat(),
     }
     fake_api_keys_db[key_id] = key_data
@@ -1395,7 +1406,7 @@ async def validate_api_key(request: Request):
         raise HTTPException(status_code=401, detail="X-API-Key header required")
     # API keys are random tokens (not user-chosen passwords), so SHA-256 is
     # appropriate here.  We use hmac.compare_digest to prevent timing attacks.
-    candidate_hash = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    candidate_hash = _hash_api_key_token(key)
     for key_id, data in fake_api_keys_db.items():
         stored_hash = data.get("key_hash", "")
         if stored_hash and hmac.compare_digest(stored_hash, candidate_hash):
