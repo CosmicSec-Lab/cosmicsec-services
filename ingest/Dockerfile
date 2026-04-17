@@ -33,6 +33,7 @@ FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libssl3 \
+    wget \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -46,6 +47,6 @@ USER ingest
 EXPOSE 8099 50051
 
 HEALTHCHECK --interval=10s --timeout=5s --retries=3 \
-    CMD wget -qO- http://localhost:8099/health || exit 1
+    CMD wget -qO- http://localhost:8099/health > /dev/null || exit 1
 
 CMD ["/app/cosmicsec-ingest"]
