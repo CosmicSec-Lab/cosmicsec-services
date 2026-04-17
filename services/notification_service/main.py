@@ -208,7 +208,26 @@ def _event_text(event: NotificationEvent) -> str:
 
 def _escape_markdown_v2(text: str) -> str:
     """Escape Telegram MarkdownV2 reserved characters."""
-    reserved = r"_ * [ ] ( ) ~ ` > # + - = | { } . !".split()
+    reserved = [
+        r"_",
+        r"*",
+        r"[",
+        r"]",
+        r"(",
+        r")",
+        r"~",
+        r"`",
+        r">",
+        r"#",
+        r"+",
+        r"-",
+        r"=",
+        r"|",
+        r"{",
+        r"}",
+        r".",
+        r"!",
+    ]
     out = text
     for ch in reserved:
         out = out.replace(ch, f"\\{ch}")
@@ -294,8 +313,14 @@ def _send_webhook(cfg: dict, payload: dict) -> None:
     timestamp = str(int(time.time()))
     headers = {**headers, "X-CosmicSec-Timestamp": timestamp}
     if webhook_secret:
-        body_bytes = json.dumps(payload, ensure_ascii=True, sort_keys=True, default=str).encode("utf-8")
-        sig = hmac.new(webhook_secret.encode("utf-8"), timestamp.encode("utf-8") + b"." + body_bytes, hashlib.sha256).hexdigest()
+        body_bytes = json.dumps(payload, ensure_ascii=True, sort_keys=True, default=str).encode(
+            "utf-8"
+        )
+        sig = hmac.new(
+            webhook_secret.encode("utf-8"),
+            timestamp.encode("utf-8") + b"." + body_bytes,
+            hashlib.sha256,
+        ).hexdigest()
         headers["X-CosmicSec-Signature"] = f"sha256={sig}"
 
     httpx.request(method, url, json=payload, headers=headers, timeout=10)
@@ -387,7 +412,9 @@ def _send_nats(cfg: dict, payload: dict) -> None:
         subject = str(cfg["subject"])
         nc = await nats.connect(servers=servers)
         try:
-            await nc.publish(subject, json.dumps(payload, ensure_ascii=True, default=str).encode("utf-8"))
+            await nc.publish(
+                subject, json.dumps(payload, ensure_ascii=True, default=str).encode("utf-8")
+            )
             await nc.flush(timeout=2)
         finally:
             await nc.close()
@@ -399,7 +426,7 @@ async def _run_ssh_command(cfg: dict, event: NotificationEvent, text: str) -> st
     global _SSH_RUNNING
 
     max_concurrency = int(cfg.get("max_concurrency", 2))
-    if _SSH_RUNNING >= max_concurrency:
+    if max_concurrency <= _SSH_RUNNING:
         raise ValueError("ssh command concurrency limit reached")
 
     command_template = cfg["command"]
@@ -461,7 +488,9 @@ def _validate_channel_config(channel: str, cfg: Mapping[str, Any]) -> None:
     # replay-window sanity for signed webhooks
     if channel in {"webhook", "slack", "discord", "teams", "google_chat"}:
         if cfg.get("webhook_secret") and int(cfg.get("replay_window_s", 300)) < 30:
-            raise HTTPException(status_code=422, detail="replay_window_s must be >= 30 when webhook_secret is set")
+            raise HTTPException(
+                status_code=422, detail="replay_window_s must be >= 30 when webhook_secret is set"
+            )
 
 
 def _record_delivery(
@@ -811,7 +840,9 @@ def get_delivery_analytics() -> dict[str, Any]:
         channel: {
             "total": meta["total"],
             "success": meta["success"],
-            "success_rate": round((meta["success"] / meta["total"]) * 100, 2) if meta["total"] else 0.0,
+            "success_rate": round((meta["success"] / meta["total"]) * 100, 2)
+            if meta["total"]
+            else 0.0,
         }
         for channel, meta in by_channel.items()
     }
