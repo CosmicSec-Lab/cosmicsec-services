@@ -3,11 +3,11 @@ CosmicSec Scan Service
 Handles security scanning operations with distributed task processing
 """
 
+import gzip
+import json
 import logging
 import os
 import secrets
-import gzip
-import json
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -26,8 +26,9 @@ from fastapi import (
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
-from services.common.db import SessionLocal, get_db
+from services.common.db import SessionLocal
 from services.common.observability import setup_observability
+
 try:
     from jose import JWTError, jwt
 except ImportError:  # pragma: no cover
@@ -53,12 +54,22 @@ from .repository import (
     count_findings,
     count_scans_today_for_org,
     create_finding,
-    create_scan as db_create_scan,
-    delete_scan as db_delete_scan,
-    get_scan as db_get_scan,
     get_severity_breakdown,
     list_findings_for_scan,
+)
+from .repository import (
+    create_scan as db_create_scan,
+)
+from .repository import (
+    delete_scan as db_delete_scan,
+)
+from .repository import (
+    get_scan as db_get_scan,
+)
+from .repository import (
     list_scans as db_list_scans,
+)
+from .repository import (
     update_scan as db_update_scan,
 )
 from .smart_scanner import smart_scan
@@ -217,6 +228,7 @@ if celery_app is not None:
     def refresh_dashboard_stats_view_task() -> dict[str, bool]:
         ok = _refresh_dashboard_stats_view()
         return {"ok": ok}
+
 
 mongo_collection = None
 if MongoClient is not None:
@@ -381,13 +393,17 @@ async def perform_scan(scan_id: str, config: ScanConfig):
         # Persist final state to DB
         try:
             db = SessionLocal()
-            db_update_scan(db, scan_id, {
-                "status": "completed",
-                "progress": 100,
-                "completed_at": scan["completed_at"],
-                "findings_count": scan["findings_count"],
-                "severity_breakdown": severity_breakdown,
-            })
+            db_update_scan(
+                db,
+                scan_id,
+                {
+                    "status": "completed",
+                    "progress": 100,
+                    "completed_at": scan["completed_at"],
+                    "findings_count": scan["findings_count"],
+                    "severity_breakdown": severity_breakdown,
+                },
+            )
             db.close()
         except Exception:
             logger.warning("DB persist failed for scan %s completion", scan_id, exc_info=True)
@@ -698,8 +714,14 @@ async def import_findings_batch(request: Request):
 
     db = SessionLocal()
     imported = 0
-    scan_id = str(payload.get("scan_id", f"offline-import-{secrets.token_hex(4)}")) if isinstance(payload, dict) else f"offline-import-{secrets.token_hex(4)}"
-    target = str(payload.get("target", "offline-sync")) if isinstance(payload, dict) else "offline-sync"
+    scan_id = (
+        str(payload.get("scan_id", f"offline-import-{secrets.token_hex(4)}"))
+        if isinstance(payload, dict)
+        else f"offline-import-{secrets.token_hex(4)}"
+    )
+    target = (
+        str(payload.get("target", "offline-sync")) if isinstance(payload, dict) else "offline-sync"
+    )
     try:
         existing = db_get_scan(db, scan_id)
         if not existing:
@@ -765,7 +787,10 @@ async def set_org_quotas(org_id: str, payload: QuotaUpdateRequest):
 
 @app.websocket("/ws/scans/{scan_id}")
 async def scan_websocket(websocket: WebSocket, scan_id: str):
-    token = websocket.query_params.get("token") or websocket.headers.get("authorization", "").removeprefix("Bearer ").strip()
+    token = (
+        websocket.query_params.get("token")
+        or websocket.headers.get("authorization", "").removeprefix("Bearer ").strip()
+    )
     if _validate_ws_token(token) is None:
         await websocket.close(code=4001)
         return

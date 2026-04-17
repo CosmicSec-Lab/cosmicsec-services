@@ -19,7 +19,6 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import UTC, datetime
-from typing import Any
 
 from fastapi import FastAPI, HTTPException, Path
 from fastapi.middleware.cors import CORSMiddleware
@@ -34,6 +33,7 @@ app = FastAPI(
 )
 
 import os
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:3000").split(","),
@@ -53,7 +53,11 @@ FRAMEWORKS = {
             {"id": "CC6.1", "name": "Access control mechanisms", "category": "Logical Access"},
             {"id": "CC6.2", "name": "Access credentials management", "category": "Logical Access"},
             {"id": "CC6.3", "name": "Role-based access control", "category": "Logical Access"},
-            {"id": "CC7.1", "name": "Vulnerability management program", "category": "System Operations"},
+            {
+                "id": "CC7.1",
+                "name": "Vulnerability management program",
+                "category": "System Operations",
+            },
             {"id": "CC7.2", "name": "Security incident response", "category": "System Operations"},
             {"id": "CC7.4", "name": "Security event monitoring", "category": "System Operations"},
             {"id": "CC8.1", "name": "Change management process", "category": "Change Management"},
@@ -65,25 +69,61 @@ FRAMEWORKS = {
     "pci_dss": {
         "name": "PCI-DSS v4.0",
         "controls": [
-            {"id": "Req-1", "name": "Install and maintain network security controls", "category": "Network"},
+            {
+                "id": "Req-1",
+                "name": "Install and maintain network security controls",
+                "category": "Network",
+            },
             {"id": "Req-2", "name": "Apply secure configurations", "category": "Configuration"},
             {"id": "Req-3", "name": "Protect stored account data", "category": "Data Protection"},
             {"id": "Req-4", "name": "Protect cardholder data in transit", "category": "Encryption"},
-            {"id": "Req-5", "name": "Protect systems against malicious software", "category": "Malware"},
-            {"id": "Req-6", "name": "Develop and maintain secure systems", "category": "Development"},
-            {"id": "Req-7", "name": "Restrict access to system components", "category": "Access Control"},
-            {"id": "Req-8", "name": "Identify users and authenticate access", "category": "Authentication"},
+            {
+                "id": "Req-5",
+                "name": "Protect systems against malicious software",
+                "category": "Malware",
+            },
+            {
+                "id": "Req-6",
+                "name": "Develop and maintain secure systems",
+                "category": "Development",
+            },
+            {
+                "id": "Req-7",
+                "name": "Restrict access to system components",
+                "category": "Access Control",
+            },
+            {
+                "id": "Req-8",
+                "name": "Identify users and authenticate access",
+                "category": "Authentication",
+            },
             {"id": "Req-10", "name": "Log and monitor all access", "category": "Logging"},
-            {"id": "Req-12", "name": "Support information security with policies", "category": "Policy"},
+            {
+                "id": "Req-12",
+                "name": "Support information security with policies",
+                "category": "Policy",
+            },
         ],
     },
     "hipaa": {
         "name": "HIPAA",
         "controls": [
-            {"id": "164.308(a)(1)", "name": "Security management process", "category": "Administrative"},
+            {
+                "id": "164.308(a)(1)",
+                "name": "Security management process",
+                "category": "Administrative",
+            },
             {"id": "164.308(a)(3)", "name": "Workforce security", "category": "Administrative"},
-            {"id": "164.308(a)(4)", "name": "Information access management", "category": "Administrative"},
-            {"id": "164.308(a)(5)", "name": "Security awareness training", "category": "Administrative"},
+            {
+                "id": "164.308(a)(4)",
+                "name": "Information access management",
+                "category": "Administrative",
+            },
+            {
+                "id": "164.308(a)(5)",
+                "name": "Security awareness training",
+                "category": "Administrative",
+            },
             {"id": "164.310(a)", "name": "Facility access controls", "category": "Physical"},
             {"id": "164.310(d)", "name": "Device and media controls", "category": "Physical"},
             {"id": "164.312(a)", "name": "Access control (technical)", "category": "Technical"},
@@ -95,11 +135,19 @@ FRAMEWORKS = {
     "iso27001": {
         "name": "ISO 27001:2022",
         "controls": [
-            {"id": "A.5.1", "name": "Policies for information security", "category": "Organizational"},
+            {
+                "id": "A.5.1",
+                "name": "Policies for information security",
+                "category": "Organizational",
+            },
             {"id": "A.5.15", "name": "Access control policy", "category": "Organizational"},
             {"id": "A.8.2", "name": "Privileged access rights", "category": "People"},
             {"id": "A.8.7", "name": "Protection against malware", "category": "Technological"},
-            {"id": "A.8.8", "name": "Management of technical vulnerabilities", "category": "Technological"},
+            {
+                "id": "A.8.8",
+                "name": "Management of technical vulnerabilities",
+                "category": "Technological",
+            },
             {"id": "A.8.12", "name": "Data leakage prevention", "category": "Technological"},
             {"id": "A.8.16", "name": "Monitoring activities", "category": "Technological"},
             {"id": "A.8.23", "name": "Web filtering", "category": "Technological"},
@@ -108,6 +156,7 @@ FRAMEWORKS = {
         ],
     },
 }
+
 
 # Simulated control compliance checker based on finding data
 def _assess_control(
@@ -236,8 +285,7 @@ async def assess_framework(
 
     # Assess each control
     control_results = [
-        _assess_control(ctrl, payload.findings, framework)
-        for ctrl in fw["controls"]
+        _assess_control(ctrl, payload.findings, framework) for ctrl in fw["controls"]
     ]
 
     # Compute overall score
@@ -256,11 +304,7 @@ async def assess_framework(
         readiness = "significant-gaps"
 
     # Collect gaps
-    gaps = [
-        {"control_id": r["control_id"], "gap": r["gap"]}
-        for r in control_results
-        if r["gap"]
-    ]
+    gaps = [{"control_id": r["control_id"], "gap": r["gap"]} for r in control_results if r["gap"]]
 
     passed = sum(1 for r in control_results if r["status"] == "pass")
     partial = sum(1 for r in control_results if r["status"] == "partial")

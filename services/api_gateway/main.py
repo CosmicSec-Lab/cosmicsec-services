@@ -266,6 +266,7 @@ async def enforce_cors_allowlist(request: Request, call_next):
         return JSONResponse(status_code=403, content={"detail": "Origin not allowed"})
     return await call_next(request)
 
+
 # GZip compression
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
@@ -1639,7 +1640,9 @@ async def ci_build(request: Request):
     data = await request.json()
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.post(_build_service_url("report", "/ci/build"), json=data, timeout=10.0)
+            resp = await client.post(
+                _build_service_url("report", "/ci/build"), json=data, timeout=10.0
+            )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Integration service unavailable")
@@ -1658,7 +1661,9 @@ async def admin_list_users(request: Request):
 async def admin_create_user(request: Request):
     payload = await request.json()
     async with httpx.AsyncClient() as client:
-        response = await client.post(_build_service_url("auth", "/users"), json=payload, timeout=10.0)
+        response = await client.post(
+            _build_service_url("auth", "/users"), json=payload, timeout=10.0
+        )
         return JSONResponse(status_code=response.status_code, content=response.json())
 
 
@@ -1707,7 +1712,9 @@ async def admin_get_config(request: Request):
 async def admin_set_config(request: Request):
     payload = await request.json()
     async with httpx.AsyncClient() as client:
-        response = await client.post(_build_service_url("auth", "/config"), json=payload, timeout=10.0)
+        response = await client.post(
+            _build_service_url("auth", "/config"), json=payload, timeout=10.0
+        )
         return JSONResponse(status_code=response.status_code, content=response.json())
 
 
@@ -1732,7 +1739,9 @@ async def admin_get_audit_logs(request: Request):
 async def create_org(request: Request):
     payload = await request.json()
     async with httpx.AsyncClient() as client:
-        response = await client.post(_build_service_url("auth", "/orgs"), json=payload, timeout=10.0)
+        response = await client.post(
+            _build_service_url("auth", "/orgs"), json=payload, timeout=10.0
+        )
         return JSONResponse(status_code=response.status_code, content=response.json())
 
 
@@ -1761,7 +1770,9 @@ async def add_org_member(request: Request, org_id: str):
 async def list_org_members(request: Request, org_id: str):
     org_id = _validate_path_id(org_id, "org_id")
     async with httpx.AsyncClient() as client:
-        response = await client.get(_build_service_url("auth", f"/orgs/{org_id}/members"), timeout=10.0)
+        response = await client.get(
+            _build_service_url("auth", f"/orgs/{org_id}/members"), timeout=10.0
+        )
         return JSONResponse(status_code=response.status_code, content=response.json())
 
 
@@ -1793,7 +1804,9 @@ async def list_workspaces(request: Request, org_id: str):
 async def get_org_quotas(request: Request, org_id: str):
     org_id = _validate_path_id(org_id, "org_id")
     async with httpx.AsyncClient() as client:
-        response = await client.get(_build_service_url("auth", f"/orgs/{org_id}/quotas"), timeout=10.0)
+        response = await client.get(
+            _build_service_url("auth", f"/orgs/{org_id}/quotas"), timeout=10.0
+        )
         return JSONResponse(status_code=response.status_code, content=response.json())
 
 
@@ -1928,7 +1941,9 @@ async def plugin_detail(request: Request, name: str):
     name = _validate_plugin_name(name)
     async with httpx.AsyncClient() as client:
         try:
-            response = await client.get(_build_service_url("plugins", f"/plugins/{name}"), timeout=5.0)
+            response = await client.get(
+                _build_service_url("plugins", f"/plugins/{name}"), timeout=5.0
+            )
             return JSONResponse(status_code=response.status_code, content=response.json())
         except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Plugin registry unavailable")
@@ -2016,7 +2031,9 @@ async def scan_monitor_jobs(request: Request):
 async def scan_monitor_job_detail(request: Request, job_id: str):
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.get(_build_service_url("scan", f"/monitor/jobs/{job_id}"), timeout=5.0)
+            resp = await client.get(
+                _build_service_url("scan", f"/monitor/jobs/{job_id}"), timeout=5.0
+            )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Scan service unavailable")
@@ -2055,7 +2072,9 @@ async def scan_monitor_resume(request: Request, job_id: str):
 async def scan_monitor_cancel(request: Request, job_id: str):
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.delete(_build_service_url("scan", f"/monitor/jobs/{job_id}"), timeout=5.0)
+            resp = await client.delete(
+                _build_service_url("scan", f"/monitor/jobs/{job_id}"), timeout=5.0
+            )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Scan service unavailable")
@@ -2071,7 +2090,9 @@ async def scans_fuzz(request: Request):
     data = await request.json()
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.post(_build_service_url("scan", "/scans/fuzz"), json=data, timeout=60.0)
+            resp = await client.post(
+                _build_service_url("scan", "/scans/fuzz"), json=data, timeout=60.0
+            )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Scan service unavailable")
@@ -2123,7 +2144,9 @@ async def scans_cloud(request: Request):
     data = await request.json()
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.post(_build_service_url("scan", "/scans/cloud"), json=data, timeout=30.0)
+            resp = await client.post(
+                _build_service_url("scan", "/scans/cloud"), json=data, timeout=30.0
+            )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Scan service unavailable")
@@ -2243,7 +2266,9 @@ async def ai_anomaly_fit(request: Request):
     data = await request.json()
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.post(_build_service_url("ai", "/anomaly/fit"), json=data, timeout=30.0)
+            resp = await client.post(
+                _build_service_url("ai", "/anomaly/fit"), json=data, timeout=30.0
+            )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="AI service unavailable")
@@ -2271,7 +2296,9 @@ async def ai_anomaly_batch(request: Request):
     data = await request.json()
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.post(_build_service_url("ai", "/anomaly/batch"), json=data, timeout=30.0)
+            resp = await client.post(
+                _build_service_url("ai", "/anomaly/batch"), json=data, timeout=30.0
+            )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="AI service unavailable")
@@ -2409,7 +2436,9 @@ async def plugin_rating(request: Request, name: str):
     name = _validate_plugin_name(name)
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.get(_build_service_url("plugins", f"/plugins/{name}/rating"), timeout=5.0)
+            resp = await client.get(
+                _build_service_url("plugins", f"/plugins/{name}/rating"), timeout=5.0
+            )
             return JSONResponse(status_code=resp.status_code, content=resp.json())
         except httpx.HTTPError:
             raise HTTPException(status_code=503, detail="Plugin registry unavailable")

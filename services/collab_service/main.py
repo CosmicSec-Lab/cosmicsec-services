@@ -151,7 +151,9 @@ async def room_websocket(websocket: WebSocket, room_id: str):
         return
 
     user_id: str = claims.get("user_id", "")
-    username: str = claims.get("email") or claims.get("sub") or user_id or f"user_{uuid.uuid4().hex[:6]}"
+    username: str = (
+        claims.get("email") or claims.get("sub") or user_id or f"user_{uuid.uuid4().hex[:6]}"
+    )
     if not user_id:
         logger.warning("JWT token missing user_id claim")
         await websocket.close(code=4001)
@@ -177,9 +179,7 @@ async def room_websocket(websocket: WebSocket, room_id: str):
             try:
                 data = await websocket.receive_json()
             except (json.JSONDecodeError, ValueError):
-                await websocket.send_json(
-                    {"type": "error", "detail": "Invalid JSON payload"}
-                )
+                await websocket.send_json({"type": "error", "detail": "Invalid JSON payload"})
                 continue
 
             if not isinstance(data, dict) or "type" not in data:
@@ -223,9 +223,7 @@ async def room_websocket(websocket: WebSocket, room_id: str):
                 )
 
             elif ev_type == "ping":
-                await websocket.send_json(
-                    {"type": "pong", "ts": datetime.now(UTC).isoformat()}
-                )
+                await websocket.send_json({"type": "pong", "ts": datetime.now(UTC).isoformat()})
 
     except WebSocketDisconnect:
         room.remove_connection(username)

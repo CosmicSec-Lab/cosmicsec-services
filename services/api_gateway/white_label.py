@@ -39,8 +39,8 @@ _branding_cache: dict[str, dict[str, Any]] = {
     "default": {
         "name": "CosmicSec",
         "slug": "cosmicsec",
-        "primary_color": "#6366f1",   # Indigo
-        "accent_color": "#06b6d4",    # Cyan
+        "primary_color": "#6366f1",  # Indigo
+        "accent_color": "#06b6d4",  # Cyan
         "background_color": "#0f172a",
         "logo_url": "/static/logo.svg",
         "favicon_url": "/static/favicon.ico",
@@ -95,6 +95,7 @@ def to_css_variables(branding: dict[str, Any]) -> str:
 # Middleware
 # ---------------------------------------------------------------------------
 
+
 class WhiteLabelMiddleware(BaseHTTPMiddleware):
     """
     Starlette middleware that reads ``X-Org-Slug`` request header and
@@ -125,6 +126,7 @@ class WhiteLabelMiddleware(BaseHTTPMiddleware):
 # Branding API routes (mounted by API gateway)
 # ---------------------------------------------------------------------------
 
+
 def mount_branding_routes(app: FastAPI) -> None:
     @app.get("/api/branding/{org_slug}")
     async def get_org_branding(org_slug: str) -> JSONResponse:
@@ -142,17 +144,19 @@ def mount_branding_routes(app: FastAPI) -> None:
             except Exception:
                 logger.debug("Branding refresh failed for org %s", org_slug, exc_info=True)
 
-        return JSONResponse({
-            "org_slug": org_slug,
-            "branding": branding,
-            "css_variables": to_css_variables(branding),
-            "theme": {
-                "mode": "dark",
-                "primary": branding.get("primary_color", "#6366f1"),
-                "accent": branding.get("accent_color", "#06b6d4"),
-                "background": branding.get("background_color", "#0f172a"),
-            },
-        })
+        return JSONResponse(
+            {
+                "org_slug": org_slug,
+                "branding": branding,
+                "css_variables": to_css_variables(branding),
+                "theme": {
+                    "mode": "dark",
+                    "primary": branding.get("primary_color", "#6366f1"),
+                    "accent": branding.get("accent_color", "#06b6d4"),
+                    "background": branding.get("background_color", "#0f172a"),
+                },
+            }
+        )
 
     @app.put("/api/branding/{org_slug}")
     async def update_org_branding(org_slug: str, request: Request) -> JSONResponse:

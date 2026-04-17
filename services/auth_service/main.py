@@ -639,7 +639,9 @@ def _find_org_by_slug(slug: str) -> tuple[str, dict]:
     raise HTTPException(status_code=404, detail="Organization not found")
 
 
-def _provider_authorization_url(provider: str, client_id: str, callback_url: str, state: str) -> str:
+def _provider_authorization_url(
+    provider: str, client_id: str, callback_url: str, state: str
+) -> str:
     oauth_conf = {
         "google": {
             "url": "https://accounts.google.com/o/oauth2/v2/auth",
@@ -1167,7 +1169,9 @@ async def _verify_oidc_id_token(
     try:
         verified_claims = jwt.decode(id_token, jwk_key, **decode_kwargs)
     except JWTError as exc:
-        raise HTTPException(status_code=401, detail="OIDC id_token signature validation failed") from exc
+        raise HTTPException(
+            status_code=401, detail="OIDC id_token signature validation failed"
+        ) from exc
     return verified_claims
 
 
@@ -1198,8 +1202,12 @@ async def oauth_callback(provider: str, code: str, state: str | None = None):
         logger.warning("OAuth client credentials not configured for provider=%s", provider)
         synthetic_email = f"{provider}_user@oauth.local"
         user = _ensure_oauth_user(synthetic_email, f"{provider.title()} User", provider)
-        access_token = create_access_token({"sub": user["email"], "user_id": user["id"], "role": user["role"]})
-        refresh_token = create_refresh_token({"sub": user["email"], "user_id": user["id"], "role": user["role"]})
+        access_token = create_access_token(
+            {"sub": user["email"], "user_id": user["id"], "role": user["role"]}
+        )
+        refresh_token = create_refresh_token(
+            {"sub": user["email"], "user_id": user["id"], "role": user["role"]}
+        )
         return {
             "provider": provider,
             "state": state,
@@ -1223,13 +1231,17 @@ async def oauth_callback(provider: str, code: str, state: str | None = None):
     async with httpx.AsyncClient(timeout=15.0) as client:
         token_resp = await client.post(selected["token_url"], data=token_payload, headers=headers)
         if token_resp.status_code >= 400:
-            raise HTTPException(status_code=401, detail=f"OAuth token exchange failed ({token_resp.status_code})")
+            raise HTTPException(
+                status_code=401, detail=f"OAuth token exchange failed ({token_resp.status_code})"
+            )
         provider_tokens = token_resp.json()
 
         provider_access_token = str(provider_tokens.get("access_token", ""))
         id_token = str(provider_tokens.get("id_token", "")) or None
         if not provider_access_token:
-            raise HTTPException(status_code=401, detail="OAuth provider did not return access_token")
+            raise HTTPException(
+                status_code=401, detail="OAuth provider did not return access_token"
+            )
 
         email = ""
         full_name = ""
@@ -1241,7 +1253,10 @@ async def oauth_callback(provider: str, code: str, state: str | None = None):
         if not email:
             userinfo_resp = await client.get(
                 selected["userinfo_url"],
-                headers={"Authorization": f"Bearer {provider_access_token}", "Accept": "application/json"},
+                headers={
+                    "Authorization": f"Bearer {provider_access_token}",
+                    "Accept": "application/json",
+                },
             )
             if userinfo_resp.status_code < 400:
                 userinfo = userinfo_resp.json()
@@ -1249,7 +1264,10 @@ async def oauth_callback(provider: str, code: str, state: str | None = None):
                 if provider == "github" and not email:
                     emails_resp = await client.get(
                         "https://api.github.com/user/emails",
-                        headers={"Authorization": f"Bearer {provider_access_token}", "Accept": "application/json"},
+                        headers={
+                            "Authorization": f"Bearer {provider_access_token}",
+                            "Accept": "application/json",
+                        },
                     )
                     if emails_resp.status_code < 400 and isinstance(emails_resp.json(), list):
                         for candidate in emails_resp.json():
@@ -1268,8 +1286,12 @@ async def oauth_callback(provider: str, code: str, state: str | None = None):
             email = f"{provider}_{secrets.token_hex(4)}@oauth.local"
         user = _ensure_oauth_user(email, full_name or email.split("@")[0], provider)
 
-    access_token = create_access_token({"sub": user["email"], "user_id": user["id"], "role": user["role"]})
-    refresh_token = create_refresh_token({"sub": user["email"], "user_id": user["id"], "role": user["role"]})
+    access_token = create_access_token(
+        {"sub": user["email"], "user_id": user["id"], "role": user["role"]}
+    )
+    refresh_token = create_refresh_token(
+        {"sub": user["email"], "user_id": user["id"], "role": user["role"]}
+    )
     _audit("oauth.login", user["email"], f"provider={provider}")
     return {
         "provider": provider,
@@ -1469,7 +1491,9 @@ async def delete_current_account(current_user: User = Depends(get_current_user))
         delete_api_key_from_db(key_id)
 
     scan_defaults_db.pop(email, None)
-    _audit("account.delete", email, f"sessions_revoked={revoked_sessions},api_keys={len(removed_keys)}")
+    _audit(
+        "account.delete", email, f"sessions_revoked={revoked_sessions},api_keys={len(removed_keys)}"
+    )
     return {"deleted": True, "email": email}
 
 
@@ -1654,8 +1678,12 @@ async def saml_acs(payload: SamlAssertionRequest):
     full_name = str(claims.get("name") or email.split("@")[0])
 
     user = _ensure_oauth_user(email=email, full_name=full_name, provider="saml")
-    access_token = create_access_token({"sub": user["email"], "user_id": user["id"], "role": user["role"]})
-    refresh_token = create_refresh_token({"sub": user["email"], "user_id": user["id"], "role": user["role"]})
+    access_token = create_access_token(
+        {"sub": user["email"], "user_id": user["id"], "role": user["role"]}
+    )
+    refresh_token = create_refresh_token(
+        {"sub": user["email"], "user_id": user["id"], "role": user["role"]}
+    )
     _audit("saml.login", user["email"], f"issuer={issuer or 'unknown'}")
     return {
         "accepted": True,
@@ -1790,9 +1818,10 @@ async def configure_org_sso(
 @app.get("/orgs/{org_id}/sso")
 async def get_org_sso(org_id: str, current_user: User = Depends(require_permission("read"))):
     org = _ensure_org_exists(org_id)
-    if current_user.role not in {"admin", "superadmin"} and current_user.email not in org_memberships.get(
-        org_id, {}
-    ):
+    if current_user.role not in {
+        "admin",
+        "superadmin",
+    } and current_user.email not in org_memberships.get(org_id, {}):
         raise HTTPException(status_code=403, detail="Not a member of this organization")
 
     sso = _resolve_org_sso(org_id, org)
@@ -2200,9 +2229,7 @@ async def set_org_retention(
 class CustomRoleCreate(BaseModel):
     name: str = Field(..., min_length=2, max_length=50, pattern=r"^[a-z0-9_-]+$")
     description: str = Field(default="")
-    permissions: list[list[str]] = Field(
-        ..., description="List of [resource, action] pairs"
-    )
+    permissions: list[list[str]] = Field(..., description="List of [resource, action] pairs")
     inherits: list[str] = Field(default_factory=list)
 
 
