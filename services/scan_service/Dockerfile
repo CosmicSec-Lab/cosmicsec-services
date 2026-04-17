@@ -13,7 +13,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application
-COPY services /app/services
+COPY services/scan_service /app/services/scan_service
+COPY services/common /app/services/common
 COPY cosmicsec_platform /app/cosmicsec_platform
 
 # Create non-root user
