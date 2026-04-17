@@ -103,8 +103,9 @@ def validate_totp(code: str) -> bool:
 
 
 async def start_ssh_server() -> None:
+    bind_host = os.getenv("COSMICSEC_SSH_HOST", "127.0.0.1")
     await asyncssh.listen(
-        "0.0.0.0",
+        bind_host,
         int(os.getenv("COSMICSEC_SSH_PORT", "2222")),
         server_factory=CosmicSecSSHServer,
         server_host_keys=[_ensure_host_key()],

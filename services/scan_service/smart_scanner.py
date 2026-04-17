@@ -14,6 +14,7 @@ URL-pattern-only fingerprinting in offline/simulation mode.
 from __future__ import annotations
 
 import logging
+import os
 import re
 from typing import Any
 
@@ -25,7 +26,16 @@ try:
 
     _HTTPX_AVAILABLE = True
 except Exception:
-    pass
+    logger.debug("httpx not available; smart scanner will use URL-only fingerprinting")
+
+
+def _tls_verify_enabled() -> bool:
+    return os.getenv("COSMICSEC_INSECURE_TLS", "false").lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 # ---------------------------------------------------------------------------
 # Technology fingerprint rules
@@ -292,7 +302,11 @@ async def fingerprint_target(url: str) -> dict[str, Any]:
     risk_multiplier = 1.0
 
     try:
-        async with httpx.AsyncClient(timeout=10, follow_redirects=True, verify=False) as client:  # type: ignore[attr-defined]
+        async with httpx.AsyncClient(  # type: ignore[attr-defined]
+            timeout=10,
+            follow_redirects=True,
+            verify=_tls_verify_enabled(),
+        ) as client:
             resp = await client.get(url)
             headers = {k.lower(): v.lower() for k, v in resp.headers.items()}
             body_snip = resp.text[:15000].lower()

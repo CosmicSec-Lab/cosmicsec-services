@@ -402,7 +402,7 @@ async def waf_middleware(request: Request, call_next):
 
             request._receive = receive  # type: ignore[attr-defined]
         except Exception:
-            pass
+            logger.debug("WAF request body inspection skipped due to parsing error", exc_info=True)
     return await call_next(request)
 
 
@@ -1537,7 +1537,7 @@ async def runtime_compliance(request: Request):
         "9_demo_preview_requirements": {
             "demo_privileged_paths_blocked": True,
             "synthetic_preview_data": True,
-            "preview_token_marked": True,
+            "preview_token_marked": True,  # nosec B105
             "runtime_metadata_included": True,
         },
         "10_success_criteria": {
@@ -1545,7 +1545,7 @@ async def runtime_compliance(request: Request):
             "security_critical_no_silent_bypass": ROUTE_POLICIES["auth.refresh"].fallback_policy
             == "disabled",
             "observable_mode_and_fallback": tracing["buffer_size"] > 0,
-            "tests_passing_baseline": True,
+            "tests_passing_baseline": True,  # nosec B105
             "docs_aligned_with_implementation": True,
         },
         "11_operational_next_actions_baseline": {
@@ -2906,7 +2906,7 @@ async def _agent_heartbeat(websocket: "WebSocket", agent_id: str) -> None:
             await asyncio.sleep(30)
             await websocket.send_json({"type": "heartbeat", "ts": time.time()})
     except Exception:
-        pass
+        logger.debug("Gateway heartbeat loop ended for agent %s", agent_id, exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -2959,4 +2959,4 @@ async def ingest_batch_endpoint(request: Request):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host=os.getenv("COSMICSEC_BIND_HOST", "127.0.0.1"), port=8000)

@@ -140,7 +140,7 @@ def mount_branding_routes(app: FastAPI) -> None:
                 if refreshed:
                     branding = refreshed
             except Exception:
-                pass
+                logger.debug("Branding refresh failed for org %s", org_slug, exc_info=True)
 
         return JSONResponse({
             "org_slug": org_slug,

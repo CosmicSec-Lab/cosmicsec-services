@@ -13,8 +13,11 @@ from __future__ import annotations
 
 import re
 import secrets
+import logging
 from datetime import UTC, datetime
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 _YAML_AVAILABLE = False
 try:
@@ -22,7 +25,7 @@ try:
 
     _YAML_AVAILABLE = True
 except Exception:
-    pass
+    logger.debug("PyYAML not available; YAML-based container analysis is disabled")
 
 # ---------------------------------------------------------------------------
 # Constants

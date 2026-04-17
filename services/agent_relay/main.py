@@ -281,10 +281,10 @@ async def _heartbeat(websocket: WebSocket, agent_id: str) -> None:
             await asyncio.sleep(30)
             await websocket.send_json({"type": "heartbeat", "ts": time.time()})
     except Exception:
-        pass
+        logger.debug("Heartbeat loop ended for agent %s", agent_id, exc_info=True)
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8011)
+    uvicorn.run(app, host=os.getenv("COSMICSEC_BIND_HOST", "127.0.0.1"), port=8011)

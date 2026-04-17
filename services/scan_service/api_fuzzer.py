@@ -12,6 +12,7 @@ Performs automated security testing of HTTP API endpoints:
 from __future__ import annotations
 
 import logging
+import os
 import re
 import secrets
 from datetime import UTC, datetime
@@ -26,7 +27,16 @@ try:
 
     _HTTPX_AVAILABLE = True
 except Exception:
-    pass
+    logger.debug("httpx not available; API fuzzer will run in simulation mode")
+
+
+def _tls_verify_enabled() -> bool:
+    return os.getenv("COSMICSEC_INSECURE_TLS", "false").lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 # ---------------------------------------------------------------------------
 # Payload corpus — concise but representative
@@ -276,7 +286,7 @@ class APIFuzzer:
             async with httpx.AsyncClient(  # type: ignore[attr-defined]
                 timeout=self.timeout,
                 follow_redirects=True,
-                verify=False,
+                verify=_tls_verify_enabled(),
             ) as client:
                 for ep in endpoints:
                     if self._request_count >= self.max_requests:

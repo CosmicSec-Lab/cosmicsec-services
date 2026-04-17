@@ -1,5 +1,6 @@
 from datetime import UTC, datetime
 from pathlib import Path
+import tempfile
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
@@ -60,7 +61,7 @@ class ImmersiveViewRequest(BaseModel):
     scene_name: str = Field(default="soc-operations")
 
 
-REPORT_DIR = Path("/tmp/reports")
+REPORT_DIR = Path(tempfile.gettempdir()) / "reports"
 REPORT_DIR.mkdir(parents=True, exist_ok=True)
 scheduled_jobs: list[dict] = []
 

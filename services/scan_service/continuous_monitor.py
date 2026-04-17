@@ -24,7 +24,7 @@ try:
 
     _APSCHEDULER_AVAILABLE = True
 except Exception:
-    pass
+    logger.debug("apscheduler not available; falling back to asyncio scheduler")
 
 
 # ---------------------------------------------------------------------------

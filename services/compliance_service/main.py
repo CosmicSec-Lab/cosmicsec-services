@@ -163,7 +163,7 @@ def _assess_control(
         status = "pass"
         gap = None
 
-    score = {"pass": 100, "partial": 50, "fail": 0}[status]
+    score = {"pass": 100, "partial": 50, "fail": 0}[status]  # nosec B105
     return {
         "control_id": control_id,
         "control_name": control["name"],

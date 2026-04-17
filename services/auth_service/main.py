@@ -924,7 +924,7 @@ async def login(user_data: UserLogin, request: Request):
     return {
         "access_token": access_token,
         "refresh_token": refresh_token,
-        "token_type": "bearer",
+        "token_type": "bearer",  # nosec B105
         "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         "session_id": session_id,
     }
@@ -953,7 +953,7 @@ async def refresh(payload: RefreshRequest):
         return {
             "access_token": new_access_token,
             "refresh_token": new_refresh_token,
-            "token_type": "bearer",
+            "token_type": "bearer",  # nosec B105
             "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         }
 
@@ -1044,7 +1044,7 @@ def _oauth_provider_config(provider: str) -> dict[str, str]:
     providers = {
         "google": {
             "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth",
-            "token_url": "https://oauth2.googleapis.com/token",
+            "token_url": "https://oauth2.googleapis.com/token",  # nosec B105
             "userinfo_url": "https://openidconnect.googleapis.com/v1/userinfo",
             "client_id": os.getenv("GOOGLE_CLIENT_ID", ""),
             "client_secret": os.getenv("GOOGLE_CLIENT_SECRET", ""),
@@ -1055,7 +1055,7 @@ def _oauth_provider_config(provider: str) -> dict[str, str]:
         },
         "github": {
             "authorize_url": "https://github.com/login/oauth/authorize",
-            "token_url": "https://github.com/login/oauth/access_token",
+            "token_url": "https://github.com/login/oauth/access_token",  # nosec B105
             "userinfo_url": "https://api.github.com/user",
             "client_id": os.getenv("GITHUB_CLIENT_ID", ""),
             "client_secret": os.getenv("GITHUB_CLIENT_SECRET", ""),
@@ -1066,7 +1066,7 @@ def _oauth_provider_config(provider: str) -> dict[str, str]:
         },
         "microsoft": {
             "authorize_url": "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
-            "token_url": "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+            "token_url": "https://login.microsoftonline.com/common/oauth2/v2.0/token",  # nosec B105
             "userinfo_url": "https://graph.microsoft.com/oidc/userinfo",
             "client_id": os.getenv("MICROSOFT_CLIENT_ID", ""),
             "client_secret": os.getenv("MICROSOFT_CLIENT_SECRET", ""),
@@ -1090,7 +1090,7 @@ def _ensure_oauth_user(email: str, full_name: str, provider: str) -> dict:
         "id": secrets.token_urlsafe(16),
         "email": email,
         "full_name": full_name or email.split("@")[0],
-        "hashed_password": None,
+        "hashed_password": None,  # nosec B105
         "role": "user",
         "is_active": True,
         "created_at": datetime.now(tz=UTC),
@@ -1205,7 +1205,7 @@ async def oauth_callback(provider: str, code: str, state: str | None = None):
             "state": state,
             "access_token": access_token,
             "refresh_token": refresh_token,
-            "token_type": "bearer",
+            "token_type": "bearer",  # nosec B105
             "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
             "user": {"email": user["email"], "full_name": user["full_name"]},
             "mode": "degraded-local-fallback",
@@ -1276,7 +1276,7 @@ async def oauth_callback(provider: str, code: str, state: str | None = None):
         "state": state,
         "access_token": access_token,
         "refresh_token": refresh_token,
-        "token_type": "bearer",
+        "token_type": "bearer",  # nosec B105
         "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         "user": {"email": user["email"], "full_name": user["full_name"]},
     }
@@ -1659,12 +1659,12 @@ async def saml_acs(payload: SamlAssertionRequest):
     _audit("saml.login", user["email"], f"issuer={issuer or 'unknown'}")
     return {
         "accepted": True,
-        "token_type": "bearer",
+        "token_type": "bearer",  # nosec B105
         "access_token": access_token,
         "refresh_token": refresh_token,
         "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         "user": {"email": user["email"], "full_name": user["full_name"]},
-        "issuer": issuer or None,
+        "issuer": issuer or None,  # nosec B105
     }
 
 
@@ -2294,4 +2294,4 @@ async def rbac_permission_matrix(
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    uvicorn.run(app, host=os.getenv("COSMICSEC_BIND_HOST", "127.0.0.1"), port=8001)
