@@ -13,9 +13,8 @@ import secrets
 import uuid
 from datetime import UTC, datetime
 
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 try:
@@ -98,7 +97,7 @@ def get_db():
         db.close()
 
 
-def _org_to_dict(org: "OrganizationModel") -> dict:
+def _org_to_dict(org: OrganizationModel) -> dict:
     return {
         "id": org.id,
         "name": org.name,
@@ -113,7 +112,7 @@ def _org_to_dict(org: "OrganizationModel") -> dict:
     }
 
 
-def _member_to_dict(member: "OrganizationMemberModel", user: "UserModel | None") -> dict:
+def _member_to_dict(member: OrganizationMemberModel, user: UserModel | None) -> dict:
     return {
         "id": member.id,
         "org_id": member.org_id,
@@ -132,7 +131,11 @@ def _member_to_dict(member: "OrganizationMemberModel", user: "UserModel | None")
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "service": "org-service", "timestamp": datetime.now(UTC).isoformat()}
+    return {
+        "status": "healthy",
+        "service": "org-service",
+        "timestamp": datetime.now(UTC).isoformat(),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +144,7 @@ async def health():
 
 
 @app.post("/api/orgs", status_code=status.HTTP_201_CREATED)
-async def create_org(payload: OrgCreate, db: "SASession" = Depends(get_db)):
+async def create_org(payload: OrgCreate, db: SASession = Depends(get_db)):
     """Create a new organization."""
     existing = db.query(OrganizationModel).filter_by(slug=payload.slug).first()
     if existing:
@@ -163,7 +166,7 @@ async def create_org(payload: OrgCreate, db: "SASession" = Depends(get_db)):
 
 
 @app.get("/api/orgs/{org_id}")
-async def get_org(org_id: str, db: "SASession" = Depends(get_db)):
+async def get_org(org_id: str, db: SASession = Depends(get_db)):
     """Get organization details."""
     org = db.query(OrganizationModel).filter_by(id=org_id).first()
     if not org:
@@ -172,7 +175,7 @@ async def get_org(org_id: str, db: "SASession" = Depends(get_db)):
 
 
 @app.get("/api/orgs/slug/{slug}")
-async def get_org_by_slug(slug: str, db: "SASession" = Depends(get_db)):
+async def get_org_by_slug(slug: str, db: SASession = Depends(get_db)):
     """Get organization by slug (for SSO discovery)."""
     org = db.query(OrganizationModel).filter_by(slug=slug, is_active=True).first()
     if not org:
@@ -181,7 +184,7 @@ async def get_org_by_slug(slug: str, db: "SASession" = Depends(get_db)):
 
 
 @app.put("/api/orgs/{org_id}")
-async def update_org(org_id: str, payload: OrgUpdate, db: "SASession" = Depends(get_db)):
+async def update_org(org_id: str, payload: OrgUpdate, db: SASession = Depends(get_db)):
     """Update organization settings."""
     org = db.query(OrganizationModel).filter_by(id=org_id).first()
     if not org:
@@ -206,7 +209,7 @@ async def update_org(org_id: str, payload: OrgUpdate, db: "SASession" = Depends(
 
 
 @app.delete("/api/orgs/{org_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_org(org_id: str, db: "SASession" = Depends(get_db)):
+async def delete_org(org_id: str, db: SASession = Depends(get_db)):
     """Soft-delete organization."""
     org = db.query(OrganizationModel).filter_by(id=org_id).first()
     if not org:
@@ -221,9 +224,7 @@ async def delete_org(org_id: str, db: "SASession" = Depends(get_db)):
 
 
 @app.post("/api/orgs/{org_id}/invite", status_code=status.HTTP_201_CREATED)
-async def invite_member(
-    org_id: str, payload: InviteMember, db: "SASession" = Depends(get_db)
-):
+async def invite_member(org_id: str, payload: InviteMember, db: SASession = Depends(get_db)):
     """Invite a user to an organization."""
     org = db.query(OrganizationModel).filter_by(id=org_id, is_active=True).first()
     if not org:
@@ -235,18 +236,12 @@ async def invite_member(
         raise HTTPException(404, f"No user found with email '{payload.email}'")
 
     # Check seat limit
-    member_count = (
-        db.query(OrganizationMemberModel).filter_by(org_id=org_id).count()
-    )
+    member_count = db.query(OrganizationMemberModel).filter_by(org_id=org_id).count()
     if member_count >= org.seat_limit:
         raise HTTPException(429, f"Organization seat limit ({org.seat_limit}) reached")
 
     # Prevent duplicate membership
-    existing = (
-        db.query(OrganizationMemberModel)
-        .filter_by(org_id=org_id, user_id=user.id)
-        .first()
-    )
+    existing = db.query(OrganizationMemberModel).filter_by(org_id=org_id, user_id=user.id).first()
     if existing:
         raise HTTPException(409, "User is already a member of this organization")
 
@@ -263,7 +258,7 @@ async def invite_member(
 
 
 @app.get("/api/orgs/{org_id}/members")
-async def list_members(org_id: str, db: "SASession" = Depends(get_db)):
+async def list_members(org_id: str, db: SASession = Depends(get_db)):
     """List organization members."""
     org = db.query(OrganizationModel).filter_by(id=org_id).first()
     if not org:
@@ -278,13 +273,9 @@ async def list_members(org_id: str, db: "SASession" = Depends(get_db)):
 
 
 @app.delete("/api/orgs/{org_id}/members/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def remove_member(org_id: str, user_id: str, db: "SASession" = Depends(get_db)):
+async def remove_member(org_id: str, user_id: str, db: SASession = Depends(get_db)):
     """Remove a member from an organization."""
-    member = (
-        db.query(OrganizationMemberModel)
-        .filter_by(org_id=org_id, user_id=user_id)
-        .first()
-    )
+    member = db.query(OrganizationMemberModel).filter_by(org_id=org_id, user_id=user_id).first()
     if not member:
         raise HTTPException(404, "Member not found")
     db.delete(member)
@@ -297,9 +288,7 @@ async def remove_member(org_id: str, user_id: str, db: "SASession" = Depends(get
 
 
 @app.post("/api/orgs/{org_id}/sso", status_code=status.HTTP_201_CREATED)
-async def configure_sso(
-    org_id: str, payload: SSOProviderCreate, db: "SASession" = Depends(get_db)
-):
+async def configure_sso(org_id: str, payload: SSOProviderCreate, db: SASession = Depends(get_db)):
     """Configure SSO provider for an organization."""
     org = db.query(OrganizationModel).filter_by(id=org_id, is_active=True).first()
     if not org:
@@ -332,7 +321,7 @@ async def configure_sso(
 
 
 @app.get("/api/orgs/{org_id}/sso")
-async def get_sso_providers(org_id: str, db: "SASession" = Depends(get_db)):
+async def get_sso_providers(org_id: str, db: SASession = Depends(get_db)):
     """List SSO providers for an organization."""
     providers = db.query(SSOProviderModel).filter_by(org_id=org_id, is_active=True).all()
     return {
@@ -354,7 +343,7 @@ async def get_sso_providers(org_id: str, db: "SASession" = Depends(get_db)):
 
 
 @app.get("/api/orgs/{org_id}/branding")
-async def get_branding(org_id: str, db: "SASession" = Depends(get_db)):
+async def get_branding(org_id: str, db: SASession = Depends(get_db)):
     """Get organization branding settings."""
     org = db.query(OrganizationModel).filter_by(id=org_id, is_active=True).first()
     if not org:
@@ -372,7 +361,7 @@ async def get_branding(org_id: str, db: "SASession" = Depends(get_db)):
 async def update_branding(
     org_id: str,
     payload: dict,
-    db: "SASession" = Depends(get_db),
+    db: SASession = Depends(get_db),
 ):
     """Update organization branding."""
     org = db.query(OrganizationModel).filter_by(id=org_id, is_active=True).first()

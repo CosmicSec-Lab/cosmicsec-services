@@ -100,7 +100,10 @@ class LoginRateLimiter:
             if email_count is not None and int(email_count) >= EMAIL_MAX_ATTEMPTS:
                 ttl = await self._redis.ttl(self._email_key(email))
                 retry_after = max(ttl, 1)
-                return False, f"Account temporarily locked due to too many failed attempts. Retry after {retry_after}s."
+                return (
+                    False,
+                    f"Account temporarily locked due to too many failed attempts. Retry after {retry_after}s.",
+                )
         except Exception:
             # If Redis fails mid-flight, allow the request through
             logger.warning("Redis error during rate-limit check; allowing request")
@@ -151,7 +154,10 @@ class LoginRateLimiter:
             if len(email_ts) >= EMAIL_MAX_ATTEMPTS:
                 oldest = email_ts[0]
                 retry_after = int(EMAIL_LOCKOUT_SECONDS - (time.monotonic() - oldest)) + 1
-                return False, f"Account temporarily locked due to too many failed attempts. Retry after {retry_after}s."
+                return (
+                    False,
+                    f"Account temporarily locked due to too many failed attempts. Retry after {retry_after}s.",
+                )
 
         return True, None
 

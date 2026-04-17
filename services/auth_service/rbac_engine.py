@@ -107,9 +107,19 @@ BUILT_IN_ROLES: dict[str, dict[str, Any]] = {
 
 # All resources and actions in the system
 RESOURCES = [
-    "scan", "finding", "report", "recon", "ai",
-    "member", "compliance", "audit_log", "bugbounty",
-    "plugin", "agent", "integration", "admin",
+    "scan",
+    "finding",
+    "report",
+    "recon",
+    "ai",
+    "member",
+    "compliance",
+    "audit_log",
+    "bugbounty",
+    "plugin",
+    "agent",
+    "integration",
+    "admin",
 ]
 
 ACTIONS = ["read", "write", "delete", "execute", "invite", "submit", "manage"]
@@ -177,6 +187,7 @@ def require_rbac_permission(resource: str, action: str):
             _: None = Depends(require_rbac_permission("scan", "write"))
         ): ...
     """
+
     async def checker(request: Request) -> None:
         user_state = getattr(request.state, "user", None)
         if user_state is None:
@@ -226,10 +237,7 @@ def create_custom_role(
 
 def list_roles(org_id: str | None = None) -> list[dict[str, Any]]:
     """List all roles visible to an org (built-in + org custom)."""
-    rows = [
-        {"name": name, "built_in": True, **defn}
-        for name, defn in BUILT_IN_ROLES.items()
-    ]
+    rows = [{"name": name, "built_in": True, **defn} for name, defn in BUILT_IN_ROLES.items()]
     for key, defn in _custom_roles.items():
         if org_id is None or defn.get("org_id") in {None, org_id}:
             name = key.split(":", 1)[1] if ":" in key else key
@@ -254,9 +262,7 @@ def can_user(
 ) -> dict[str, Any]:
     """Helper for permission-test endpoint. Returns detailed result."""
     custom = {
-        k.split(":", 1)[1]: v
-        for k, v in _custom_roles.items()
-        if v.get("org_id") in {None, org_id}
+        k.split(":", 1)[1]: v for k, v in _custom_roles.items() if v.get("org_id") in {None, org_id}
     }
     allowed = check_permission(role, resource, action, org_id=org_id, custom_roles=custom)
     return {

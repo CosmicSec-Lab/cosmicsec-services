@@ -23,6 +23,7 @@ from pydantic import BaseModel
 
 try:
     import redis as _redis_module
+
     _sync_redis = _redis_module.from_url(
         f"redis://{os.getenv('REDIS_HOST', 'localhost')}:{os.getenv('REDIS_PORT', '6379')}/0",
         decode_responses=True,
@@ -55,6 +56,7 @@ def _cache_set(key: str, value: dict, ttl_seconds: int) -> None:
 
 def _cache_key(prefix: str, target: str) -> str:
     return f"recon:{prefix}:{hashlib.sha256(target.lower().encode()).hexdigest()}"
+
 
 app = FastAPI(title="CosmicSec Recon Service", version="1.0.0")
 

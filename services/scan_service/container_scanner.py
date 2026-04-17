@@ -11,9 +11,9 @@ Does NOT require a Docker daemon — all analysis is pure static / text-based.
 
 from __future__ import annotations
 
+import logging
 import re
 import secrets
-import logging
 from datetime import UTC, datetime
 from typing import Any
 
