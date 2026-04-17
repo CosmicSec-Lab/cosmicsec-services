@@ -6,6 +6,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from pydantic import BaseModel, Field
+
 from services.common.security_utils import ensure_safe_child_path, sanitize_scan_id
 
 try:

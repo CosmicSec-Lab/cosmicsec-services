@@ -493,7 +493,9 @@ def load_all_2fa_from_db() -> dict[str, str]:
             try:
                 result[row.email] = decrypt_2fa_secret(row.totp_secret)
             except Exception:
-                logger.warning("Skipping undecryptable 2FA secret for %s", sanitize_for_log(row.email))
+                logger.warning(
+                    "Skipping undecryptable 2FA secret for %s", sanitize_for_log(row.email)
+                )
         return result
     except Exception:
         logger.exception("Failed to bulk-load 2FA secrets from DB")

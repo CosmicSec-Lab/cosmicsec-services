@@ -342,7 +342,11 @@ async def fingerprint_target(url: str) -> dict[str, Any]:
                     risk_multiplier = max(risk_multiplier, fp["risk"])
 
     except Exception as exc:
-        logger.debug("Fingerprint HTTP probe failed (%s): %s", sanitize_for_log(safe_url), sanitize_for_log(exc))
+        logger.debug(
+            "Fingerprint HTTP probe failed (%s): %s",
+            sanitize_for_log(safe_url),
+            sanitize_for_log(exc),
+        )
 
     # Always apply URL-pattern rules
     url_result = _url_fingerprint(url)
