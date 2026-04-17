@@ -35,6 +35,7 @@ from services.api_gateway.ingest_bridge import (
 from services.api_gateway.ingest_bridge import (
     ingest_batch as _rust_ingest_batch,
 )
+from services.api_gateway.white_label import WhiteLabelMiddleware, mount_branding_routes
 from services.common.caching import CacheManager, get_redis
 from services.common.exceptions import CosmicSecException
 from services.common.logging import (
@@ -237,8 +238,6 @@ _XSS_RE = re.compile(
     r"(<script|javascript:|vbscript:|onload\s*=|onerror\s*=|<iframe)",
     re.IGNORECASE,
 )
-
-from services.api_gateway.white_label import WhiteLabelMiddleware, mount_branding_routes
 
 limiter = Limiter(key_func=get_user_identifier)
 app.state.limiter = limiter

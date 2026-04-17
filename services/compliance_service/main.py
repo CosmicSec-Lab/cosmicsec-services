@@ -17,6 +17,7 @@ Endpoints:
 from __future__ import annotations
 
 import logging
+import os
 import uuid
 from datetime import UTC, datetime
 
@@ -31,8 +32,6 @@ app = FastAPI(
     description="Automated compliance assessment for SOC2, PCI-DSS, HIPAA, ISO 27001",
     version="1.0.0",
 )
-
-import os
 
 app.add_middleware(
     CORSMiddleware,
