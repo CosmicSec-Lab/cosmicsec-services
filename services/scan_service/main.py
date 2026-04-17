@@ -28,6 +28,7 @@ from sqlalchemy import text
 
 from services.common.db import SessionLocal
 from services.common.observability import setup_observability
+from cosmicsec_platform.service_discovery import get_service_url
 
 try:
     from jose import JWTError, jwt
@@ -168,7 +169,8 @@ async def _fetch_org_quotas(org_id: str) -> dict[str, int]:
 
     try:
         async with httpx.AsyncClient() as client:
-            resp = await client.get(f"{AUTH_SERVICE_URL}/orgs/{org_id}/quotas", timeout=5.0)
+            auth_url = _get_auth_service_url()
+            resp = await client.get(f"{auth_url}/orgs/{org_id}/quotas", timeout=5.0)
             if resp.status_code == 200:
                 return resp.json().get("quotas", {})
     except httpx.HTTPError:
@@ -241,7 +243,14 @@ if MongoClient is not None:
         mongo_collection = None
 
 
-AUTH_SERVICE_URL = os.getenv("AUTH_SERVICE_URL", "http://auth-service:8001")
+# Service discovery - auto-detects OS and deployment environment
+def _get_auth_service_url() -> str:
+    """Get Auth Service URL based on deployment environment."""
+    # Check for explicit override first
+    if explicit_url := os.getenv("AUTH_SERVICE_URL"):
+        return explicit_url
+    # Use service discovery (handles Windows/Linux/macOS automatically)
+    return get_service_url("auth")
 
 
 class ConnectionManager:

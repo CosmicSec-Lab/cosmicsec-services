@@ -26,6 +26,8 @@ from cosmicsec_platform.contracts.runtime_metadata import HYBRID_SCHEMA, HYBRID_
 from cosmicsec_platform.middleware.hybrid_router import HybridRouter
 from cosmicsec_platform.middleware.policy_registry import ROUTE_POLICIES
 from cosmicsec_platform.middleware.static_profiles import STATIC_PROFILES
+from cosmicsec_platform.config import get_config
+from cosmicsec_platform.service_discovery import get_registry, log_service_config
 from services.api_gateway.graphql_runtime import mount_graphql
 from services.api_gateway.ingest_bridge import (
     check_rust_ingest_health as _check_rust_health,
@@ -407,22 +409,17 @@ async def waf_middleware(request: Request, call_next):
     return await call_next(request)
 
 
-# Service URLs (configure via environment variables in production)
-SERVICE_URLS = {
-    "gateway": "http://api-gateway:8000",
-    "auth": "http://auth-service:8001",
-    "scan": "http://scan-service:8002",
-    "ai": "http://ai-service:8003",
-    "recon": "http://recon-service:8004",
-    "report": "http://report-service:8005",
-    "collab": "http://collab-service:8006",
-    "plugins": "http://plugin-registry:8007",
-    "integration": "http://integration-service:8008",
-    "bugbounty": "http://bugbounty-service:8009",
-    "phase5": "http://phase5-service:8010",
-    "agent_relay": "http://agent-relay:8011",
-    "notification": "http://notification-service:8012",
-}
+# Service discovery — auto-detects OS and deployment mode
+# In Docker: Uses service names (auth-service:8001, etc)
+# In local dev: Uses localhost:8001, etc
+# In self-hosted: Uses configured SERVICE_HOST:PORT
+_platform_config = get_config()
+_service_registry = get_registry()
+SERVICE_URLS = _service_registry.get_all_urls()
+
+# Log configuration for debugging
+logger.info(f"Platform Config: {_platform_config}")
+log_service_config()
 
 # Freeze the URL registry for the SSRF-safe URL builder
 _init_service_urls(SERVICE_URLS)
