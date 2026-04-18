@@ -12,12 +12,15 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -33,12 +36,36 @@ app = FastAPI(
     version="1.0.0",
 )
 
+# CORS policy: explicit allowlist only.
+_cors_origins_raw = os.environ.get(
+    "COSMICSEC_CORS_ORIGINS", "http://localhost:3000,http://localhost:4173"
+)
+_cors_origins = [o.strip() for o in _cors_origins_raw.split(",") if o.strip()]
+if "*" in _cors_origins:
+    _cors_origins = [o for o in _cors_origins if o != "*"]
+_cors_origin_set = set(_cors_origins)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def enforce_cors_allowlist(request: Request, call_next):
+    origin = request.headers.get("origin")
+    if origin and origin not in _cors_origin_set:
+        return JSONResponse(status_code=403, content={"detail": "Origin not allowed"})
+    return await call_next(request)
+
+
+_MESSAGE_MAX_LEN = int(os.environ.get("COSMICSEC_COLLAB_MESSAGE_MAX_LEN", "4000"))
+_WS_EVENTS_PER_WINDOW = int(os.environ.get("COSMICSEC_COLLAB_WS_RATE_LIMIT", "40"))
+_WS_WINDOW_SECONDS = int(os.environ.get("COSMICSEC_COLLAB_WS_RATE_WINDOW", "10"))
+_SAFE_TEXT_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
 
 # ---------------------------------------------------------------------------
 # In-memory state for WebSocket connections only (not persisted)
@@ -53,6 +80,7 @@ class _Room:
         self.created_at = datetime.now(UTC).isoformat()
         self.connections: dict[str, WebSocket] = {}
         self.scan_state: dict[str, Any] | None = None
+        self.event_windows: dict[str, list[datetime]] = {}
 
     def add_connection(self, username: str, ws: WebSocket) -> None:
         self.connections[username] = ws
@@ -63,6 +91,16 @@ class _Room:
     @property
     def present_users(self) -> list[str]:
         return list(self.connections.keys())
+
+    def allow_event(self, username: str) -> bool:
+        now = datetime.now(UTC)
+        events = self.event_windows.setdefault(username, [])
+        cutoff = now.timestamp() - _WS_WINDOW_SECONDS
+        self.event_windows[username] = [e for e in events if e.timestamp() >= cutoff]
+        if len(self.event_windows[username]) >= _WS_EVENTS_PER_WINDOW:
+            return False
+        self.event_windows[username].append(now)
+        return True
 
     async def broadcast(self, event: dict[str, Any], exclude: str | None = None) -> None:
         dead: list[str] = []
@@ -84,6 +122,23 @@ def _get_or_create_room(room_id: str) -> _Room:
     if room_id not in _rooms:
         _rooms[room_id] = _Room(room_id)
     return _rooms[room_id]
+
+
+def _sanitize_message_text(raw: Any) -> str:
+    text = str(raw or "")
+    text = _SAFE_TEXT_RE.sub("", text)
+    text = text.replace("\r", "").strip()
+    return text[:_MESSAGE_MAX_LEN]
+
+
+def _extract_ws_token(websocket: WebSocket) -> str | None:
+    query_token: str | None = websocket.query_params.get("token")
+    if query_token:
+        return query_token
+    auth_header = websocket.headers.get("authorization", "")
+    if auth_header.startswith("Bearer "):
+        return auth_header.split(" ", 1)[1].strip() or None
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +195,7 @@ async def room_websocket(websocket: WebSocket, room_id: str):
         {type: "scan_update", room, state, updated_by, ts}
         {type: "user_left",   room, username, present_users}
     """
-    token: str | None = websocket.query_params.get("token")
+    token: str | None = _extract_ws_token(websocket)
     if not token:
         await websocket.close(code=4001)
         return
@@ -190,8 +245,15 @@ async def room_websocket(websocket: WebSocket, room_id: str):
 
             ev_type = data.get("type", "message")
 
+            if not room.allow_event(username):
+                await websocket.send_json({"type": "error", "detail": "Rate limit exceeded"})
+                continue
+
             if ev_type == "message":
-                text = str(data.get("text", ""))
+                text = _sanitize_message_text(data.get("text", ""))
+                if not text:
+                    await websocket.send_json({"type": "error", "detail": "Empty message"})
+                    continue
                 mentions = [w[1:] for w in text.split() if w.startswith("@")]
                 msg: dict[str, Any] = {
                     "type": "message",

@@ -80,6 +80,10 @@ API_KEY_HASH_SECRET = os.getenv("API_KEY_HASH_SECRET", SECRET_KEY)
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 REFRESH_TOKEN_EXPIRE_DAYS = 30
+ALLOW_INSECURE_2FA_FALLBACK = (
+    os.getenv("COSMICSEC_ALLOW_INSECURE_2FA_FALLBACK", "false").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
 
 # Password hashing with bcrypt 4.0+ compatibility
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__ident="2b")
@@ -277,6 +281,7 @@ fake_api_keys_db = {}
 fake_2fa_db = {}
 fake_sessions_db = {}
 fake_password_reset_db: dict[str, dict[str, Any]] = {}
+fake_2fa_resend_tracker: dict[str, list[float]] = {}
 scan_defaults_db: dict[str, dict[str, Any]] = {}
 audit_logs = []
 platform_config = {
@@ -998,6 +1003,16 @@ def _map_action_to_resource(action: str) -> tuple[str, str]:
     return mapping.get(action, ("scan", "read"))
 
 
+def _allow_2fa_resend(email: str, *, limit: int = 5, window_seconds: int = 300) -> bool:
+    now_ts = datetime.now(tz=UTC).timestamp()
+    history = fake_2fa_resend_tracker.setdefault(email, [])
+    fake_2fa_resend_tracker[email] = [ts for ts in history if (now_ts - ts) <= window_seconds]
+    if len(fake_2fa_resend_tracker[email]) >= limit:
+        return False
+    fake_2fa_resend_tracker[email].append(now_ts)
+    return True
+
+
 # Password utilities
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Verify password against hash using bcrypt directly"""
@@ -1279,7 +1294,7 @@ async def verify_2fa_login(payload: Verify2FALoginRequest):
     if pyotp is not None:
         valid = pyotp.TOTP(secret).verify(payload.code)
     else:
-        valid = payload.code == "000000"
+        valid = ALLOW_INSECURE_2FA_FALLBACK and payload.code == "000000"
 
     if not valid:
         raise HTTPException(status_code=401, detail="Invalid verification code")
@@ -1312,6 +1327,8 @@ async def resend_2fa(payload: Verify2FALoginRequest):
     user = fake_users_db.get(payload.email) or load_user_from_db(payload.email)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    if not _allow_2fa_resend(payload.email):
+        raise HTTPException(status_code=429, detail="Too many resend requests")
     secret = fake_2fa_db.get(payload.email) or load_2fa_from_db(payload.email)
     if not secret:
         raise HTTPException(status_code=404, detail="2FA is not configured for this user")
@@ -1706,7 +1723,7 @@ async def verify_2fa(payload: TwoFactorVerifyRequest):
     if pyotp is not None:
         valid = pyotp.TOTP(secret).verify(payload.code)
     else:
-        valid = payload.code == "000000"
+        valid = ALLOW_INSECURE_2FA_FALLBACK and payload.code == "000000"
 
     return {"verified": bool(valid)}
 
