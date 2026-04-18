@@ -307,7 +307,9 @@ def update_submission_status(
 
     if payload.reward_amount is not None:
         if next_status != "paid":
-            raise HTTPException(status_code=400, detail="reward_amount is only valid for paid status")
+            raise HTTPException(
+                status_code=400, detail="reward_amount is only valid for paid status"
+            )
         entry.reward_amount = payload.reward_amount
 
     db.commit()
@@ -343,7 +345,7 @@ def earnings_dashboard(db: Session = Depends(get_db)) -> dict:
 @app.get("/dashboard/status-breakdown")
 def submission_status_breakdown(db: Session = Depends(get_db)) -> dict:
     all_subs = db.query(BugBountySubmissionModel).all()
-    breakdown = {status: 0 for status in sorted(_ALLOWED_STATUS)}
+    breakdown = dict.fromkeys(sorted(_ALLOWED_STATUS), 0)
     for sub in all_subs:
         breakdown[sub.status] = breakdown.get(sub.status, 0) + 1
     return {"breakdown": breakdown, "total": len(all_subs)}
@@ -377,7 +379,9 @@ def timeline(program_id: str | None = None, db: Session = Depends(get_db)) -> di
     activities_q = db.query(BugBountyActivityModel)
     if program_id:
         activities_q = activities_q.filter(BugBountyActivityModel.program_id == program_id)
-    for activity in activities_q.order_by(BugBountyActivityModel.created_at.desc()).limit(200).all():
+    for activity in (
+        activities_q.order_by(BugBountyActivityModel.created_at.desc()).limit(200).all()
+    ):
         events.append(
             {
                 "event": activity.activity_type,
