@@ -17,7 +17,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -1817,6 +1817,78 @@ async def ai_nl_query(request: Request):
 
         logger.error(f"AI service error after retries: {last_exc}")
         raise HTTPException(status_code=503, detail="AI service unavailable")
+
+
+@app.post("/api/ai/query/stream")
+@limiter.limit("20/minute")
+async def ai_nl_query_stream(request: Request):
+    """Proxy natural language query as NDJSON stream for progressive UI updates."""
+    try:
+        data = await request.json()
+    except Exception as exc:
+        logger.warning("Invalid JSON payload for /api/ai/query/stream: %s", exc)
+        raise HTTPException(status_code=400, detail="Invalid JSON payload") from exc
+
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+
+    source_hint = request.headers.get("X-CosmicSec-Client", "").strip().lower()
+    user_agent = request.headers.get("User-Agent", "").lower()
+    inferred_source = (
+        source_hint
+        if source_hint in {"web", "cli"}
+        else ("cli" if "cosmicsec-agent" in user_agent else "web")
+    )
+    data.setdefault("source", inferred_source)
+    data.setdefault("preferred_model", "phi3:mini")
+
+    async def _proxy_stream() -> object:
+        async with httpx.AsyncClient() as client:
+            try:
+                async with client.stream(
+                    "POST",
+                    _build_service_url("ai", "/query/stream"),
+                    json=data,
+                    timeout=60.0,
+                ) as response:
+                    if response.status_code >= 400:
+                        detail = (await response.aread()).decode("utf-8", errors="ignore")
+                        payload = {
+                            "type": "error",
+                            "status": response.status_code,
+                            "detail": detail or "AI service unavailable",
+                        }
+                        yield (json.dumps(payload) + "\n").encode("utf-8")
+                        return
+
+                    async for chunk in response.aiter_bytes():
+                        if chunk:
+                            yield chunk
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as exc:
+                logger.warning("AI stream transient error: %s", exc)
+                payload = {
+                    "type": "error",
+                    "status": 503,
+                    "detail": "AI service unavailable",
+                }
+                yield (json.dumps(payload) + "\n").encode("utf-8")
+            except httpx.HTTPError as exc:
+                logger.error("AI stream proxy error: %s", exc)
+                payload = {
+                    "type": "error",
+                    "status": 503,
+                    "detail": "AI service unavailable",
+                }
+                yield (json.dumps(payload) + "\n").encode("utf-8")
+
+    return StreamingResponse(
+        _proxy_stream(),
+        media_type="application/x-ndjson",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/api/ai/models")
