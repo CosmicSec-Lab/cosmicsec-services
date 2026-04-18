@@ -14,7 +14,7 @@ import uuid
 from datetime import timedelta
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, status
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
@@ -3326,8 +3326,14 @@ async def dispatch_agent_task(agent_id: str, payload: DispatchAgentTaskRequest, 
 
 @app.get("/api/agents/{agent_id}/tasks")
 @limiter.limit("120/minute")
-async def list_agent_tasks(agent_id: str, request: Request) -> JSONResponse:
-    """List recent task records for one agent."""
+async def list_agent_tasks(
+    agent_id: str,
+    request: Request,
+    status_filter: str | None = Query(default=None, alias="status"),
+    limit: int = Query(default=25, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> JSONResponse:
+    """List task records for one agent with optional filtering and pagination."""
     agent_id = _validate_uuid_param(agent_id, "agent_id")
     principal, is_admin = await _resolve_authenticated_user(request)
 
@@ -3339,8 +3345,43 @@ async def list_agent_tasks(agent_id: str, request: Request) -> JSONResponse:
 
     tasks = _agent_tasks.get(agent_id, [])
     tasks_sorted = sorted(tasks, key=lambda t: float(t.get("created_at", 0)), reverse=True)
+
+    allowed_statuses = {
+        "dispatched",
+        "accepted",
+        "rejected",
+        "running",
+        "completed",
+        "failed",
+        "dispatch_failed",
+    }
+    if status_filter:
+        normalized = status_filter.strip().lower()
+        if normalized not in allowed_statuses:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid status filter. Allowed: {', '.join(sorted(allowed_statuses))}",
+            )
+        tasks_sorted = [t for t in tasks_sorted if str(t.get("status", "")).lower() == normalized]
+
+    total = len(tasks_sorted)
+    paged_tasks = tasks_sorted[offset : offset + limit]
+
+    status_counts: dict[str, int] = {}
+    for task in tasks:
+        key = str(task.get("status", "unknown"))
+        status_counts[key] = status_counts.get(key, 0) + 1
+
     return JSONResponse(
-        content={"agent_id": agent_id, "tasks": tasks_sorted[:100], "total": len(tasks)}
+        content={
+            "agent_id": agent_id,
+            "tasks": paged_tasks,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "has_more": offset + len(paged_tasks) < total,
+            "status_counts": status_counts,
+        }
     )
 
 
