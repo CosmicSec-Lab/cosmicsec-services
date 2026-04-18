@@ -80,10 +80,9 @@ API_KEY_HASH_SECRET = os.getenv("API_KEY_HASH_SECRET", SECRET_KEY)
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 REFRESH_TOKEN_EXPIRE_DAYS = 30
-ALLOW_INSECURE_2FA_FALLBACK = (
-    os.getenv("COSMICSEC_ALLOW_INSECURE_2FA_FALLBACK", "false").strip().lower()
-    in {"1", "true", "yes", "on"}
-)
+ALLOW_INSECURE_2FA_FALLBACK = os.getenv(
+    "COSMICSEC_ALLOW_INSECURE_2FA_FALLBACK", "false"
+).strip().lower() in {"1", "true", "yes", "on"}
 
 # Password hashing with bcrypt 4.0+ compatibility
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__ident="2b")
@@ -373,7 +372,9 @@ def save_user_to_db(record: dict[str, Any]) -> None:
             row.is_active = bool(record.get("is_active", row.is_active))
         db.commit()
     except Exception:
-        logger.exception("Failed to persist user to DB for %s", sanitize_for_log(record.get("email")))
+        logger.exception(
+            "Failed to persist user to DB for %s", sanitize_for_log(record.get("email"))
+        )
         db.rollback()
     finally:
         db.close()

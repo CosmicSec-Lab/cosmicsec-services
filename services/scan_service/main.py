@@ -842,12 +842,7 @@ async def list_findings(
         if scan_id:
             query = query.filter(FindingModel.scan_id == scan_id)
         total = query.count()
-        rows = (
-            query.order_by(FindingModel.created_at.desc())
-            .offset(offset)
-            .limit(limit)
-            .all()
-        )
+        rows = query.order_by(FindingModel.created_at.desc()).offset(offset).limit(limit).all()
         db.close()
         items = [
             {
