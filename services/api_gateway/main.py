@@ -18,6 +18,7 @@ from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
+from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
@@ -1789,7 +1790,7 @@ async def ai_nl_query(request: Request):
         else ("cli" if "cosmicsec-agent" in user_agent else "web")
     )
     data.setdefault("source", inferred_source)
-    data.setdefault("preferred_model", "pie:mini")
+    data.setdefault("preferred_model", "phi3:mini")
 
     async with httpx.AsyncClient() as client:
         last_exc: Exception | None = None
@@ -1833,7 +1834,7 @@ async def ai_models(request: Request):
 
 @app.get("/api/ai/model/status")
 @limiter.limit("30/minute")
-async def ai_model_status(request: Request, model: str = "pie:mini"):
+async def ai_model_status(request: Request, model: str = "phi3:mini"):
     """Proxy specific local model status from ai-service."""
     async with httpx.AsyncClient() as client:
         try:
@@ -3293,8 +3294,8 @@ class DispatchAgentTaskRequest(BaseModel):
 
     tool: str
     target: str = ""
-    args: list[str] = []
-    metadata: dict = {}
+    args: list[str] = Field(default_factory=list)
+    task_metadata: dict = Field(default_factory=dict)
 
 
 def _persist_agent_task_create(task_record: dict) -> None:
@@ -3312,7 +3313,7 @@ def _persist_agent_task_create(task_record: dict) -> None:
                 tool=str(task_record.get("tool", "")),
                 target=str(task_record.get("target", "")),
                 args=task_record.get("args") if isinstance(task_record.get("args"), list) else [],
-                metadata=task_record.get("metadata")
+                task_metadata=task_record.get("metadata")
                 if isinstance(task_record.get("metadata"), dict)
                 else {},
                 status=str(task_record.get("status", "dispatched")),
@@ -3415,7 +3416,7 @@ def _list_agent_tasks_from_db(
                         "tool": row.tool,
                         "target": row.target or "",
                         "args": row.args if isinstance(row.args, list) else [],
-                        "metadata": row.metadata if isinstance(row.metadata, dict) else {},
+                        "metadata": row.task_metadata if isinstance(row.task_metadata, dict) else {},
                         "status": row.status,
                         "progress": int(row.progress or 0),
                         "created_at": created_at,
@@ -3638,7 +3639,7 @@ async def dispatch_agent_task(agent_id: str, payload: DispatchAgentTaskRequest, 
         "tool": payload.tool,
         "target": payload.target,
         "args": payload.args,
-        "metadata": payload.metadata,
+        "metadata": payload.task_metadata,
         "status": "dispatched",
         "progress": 0,
         "created_at": time.time(),
@@ -3657,7 +3658,7 @@ async def dispatch_agent_task(agent_id: str, payload: DispatchAgentTaskRequest, 
                     "tool": payload.tool,
                     "target": payload.target,
                     "args": payload.args,
-                    "metadata": payload.metadata,
+                    "metadata": payload.task_metadata,
                 },
             }
         )

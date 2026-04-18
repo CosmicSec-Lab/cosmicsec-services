@@ -389,7 +389,7 @@ def timeline(program_id: str | None = None, db: Session = Depends(get_db)) -> di
                 "submission_id": activity.submission_id,
                 "actor": activity.actor,
                 "detail": activity.detail,
-                "metadata": activity.metadata,
+                "extra_metadata": activity.extra_metadata,
                 "at": activity.created_at.isoformat() if activity.created_at else None,
             }
         )
@@ -514,7 +514,7 @@ def _record_activity(
         activity_type=activity_type,
         actor=actor,
         detail=detail,
-        metadata=metadata or {},
+        extra_metadata=metadata or {},
     )
     db.add(entry)
     db.commit()
