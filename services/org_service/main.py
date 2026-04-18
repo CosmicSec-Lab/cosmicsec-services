@@ -15,7 +15,9 @@ from datetime import UTC, datetime
 
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import SQLAlchemyError
 
 try:
     from sqlalchemy.orm import Session as SASession
@@ -47,6 +49,12 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(SQLAlchemyError)
+async def handle_db_errors(_request, _exc: SQLAlchemyError):
+    logger.warning("Organization service database unavailable; returning 503")
+    return JSONResponse(status_code=503, content={"detail": "Database unavailable"})
 
 # ---------------------------------------------------------------------------
 # Schemas

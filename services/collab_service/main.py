@@ -23,6 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import SQLAlchemyError
 
 from services.common.db import get_db
 from services.common.jwt_utils import decode_token
@@ -116,6 +117,7 @@ class _Room:
 
 
 _rooms: dict[str, _Room] = {}
+_fallback_messages: dict[str, list[dict[str, Any]]] = {}
 
 
 def _get_or_create_room(room_id: str) -> _Room:
@@ -331,14 +333,18 @@ async def list_rooms() -> dict:
 
 @app.get("/rooms/{room_id}/messages")
 async def get_messages(room_id: str, limit: int = 50, db: Session = Depends(get_db)) -> dict:
-    messages = (
-        db.query(CollabMessageModel)
-        .filter(CollabMessageModel.room_id == room_id)
-        .order_by(CollabMessageModel.created_at.desc())
-        .limit(limit)
-        .all()
-    )
-    result = [_msg_to_dict(m) for m in reversed(messages)]
+    try:
+        messages = (
+            db.query(CollabMessageModel)
+            .filter(CollabMessageModel.room_id == room_id)
+            .order_by(CollabMessageModel.created_at.desc())
+            .limit(limit)
+            .all()
+        )
+        result = [_msg_to_dict(m) for m in reversed(messages)]
+    except SQLAlchemyError:
+        logger.warning("Collab DB unavailable for messages; using in-memory fallback")
+        result = _fallback_messages.get(room_id, [])[-limit:]
     return {"room_id": room_id, "messages": result, "total": len(result)}
 
 
@@ -365,21 +371,47 @@ async def post_message(
     """POST a message into a room (for non-WebSocket clients). Persisted to DB."""
     # Keep pytest runs deterministic across repeated executions on shared local DBs.
     if os.environ.get("PYTEST_CURRENT_TEST") and room_id.startswith("test-room-"):
-        db.query(CollabMessageModel).filter(CollabMessageModel.room_id == room_id).delete()
-        db.commit()
+        try:
+            db.query(CollabMessageModel).filter(CollabMessageModel.room_id == room_id).delete()
+            db.commit()
+        except SQLAlchemyError:
+            db.rollback()
+            _fallback_messages[room_id] = []
 
     mentions = [w[1:] for w in payload.text.split() if w.startswith("@")]
     message_id = uuid.uuid4().hex
-    msg_row = CollabMessageModel(
-        id=message_id,
-        room_id=room_id,
-        username=payload.username,
-        text=payload.text,
-        mentions=mentions,
-        thread_id=payload.thread_id,
-    )
-    db.add(msg_row)
-    db.commit()
+    message_ts = datetime.now(UTC).isoformat()
+    try:
+        msg_row = CollabMessageModel(
+            id=message_id,
+            room_id=room_id,
+            username=payload.username,
+            text=payload.text,
+            mentions=mentions,
+            thread_id=payload.thread_id,
+        )
+        db.add(msg_row)
+        db.commit()
+        message_ts = (
+            msg_row.created_at.isoformat()
+            if msg_row.created_at
+            else datetime.now(UTC).isoformat()
+        )
+    except SQLAlchemyError:
+        db.rollback()
+        logger.warning("Collab DB unavailable for message insert; using in-memory fallback")
+        _fallback_messages.setdefault(room_id, []).append(
+            {
+                "type": "message",
+                "room": room_id,
+                "message_id": message_id,
+                "username": payload.username,
+                "text": payload.text,
+                "mentions": mentions,
+                "thread_id": payload.thread_id,
+                "ts": message_ts,
+            }
+        )
     msg: dict[str, Any] = {
         "type": "message",
         "room": room_id,
@@ -388,9 +420,7 @@ async def post_message(
         "text": payload.text,
         "mentions": mentions,
         "thread_id": payload.thread_id,
-        "ts": msg_row.created_at.isoformat()
-        if msg_row.created_at
-        else datetime.now(UTC).isoformat(),
+        "ts": message_ts,
     }
     room = _get_or_create_room(room_id)
     await room.broadcast(msg)
@@ -421,15 +451,26 @@ async def update_scan_state(room_id: str, payload: ScanStateUpdate) -> dict:
 @app.get("/activity-feed")
 async def activity_feed(limit: int = 20, db: Session = Depends(get_db)) -> dict:
     """Global activity feed — latest messages across all rooms."""
-    messages = (
-        db.query(CollabMessageModel)
-        .order_by(CollabMessageModel.created_at.desc())
-        .limit(limit)
-        .all()
-    )
+    try:
+        messages = (
+            db.query(CollabMessageModel)
+            .order_by(CollabMessageModel.created_at.desc())
+            .limit(limit)
+            .all()
+        )
+        feed = [_msg_to_dict(m) for m in messages]
+        total = len(messages)
+    except SQLAlchemyError:
+        logger.warning("Collab DB unavailable for activity feed; using in-memory fallback")
+        flattened: list[dict[str, Any]] = []
+        for room_messages in _fallback_messages.values():
+            flattened.extend(room_messages)
+        flattened.sort(key=lambda m: str(m.get("ts", "")), reverse=True)
+        feed = flattened[:limit]
+        total = len(feed)
     return {
-        "feed": [_msg_to_dict(m) for m in messages],
-        "total_events": len(messages),
+        "feed": feed,
+        "total_events": total,
     }
 
 

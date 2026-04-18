@@ -8,6 +8,7 @@ from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from services.common.db import get_db
@@ -77,6 +78,11 @@ _STATUS_TRANSITIONS = {
     "paid": set(),
 }
 
+_memory_programs: dict[str, dict[str, Any]] = {}
+_memory_submissions: dict[str, dict[str, Any]] = {}
+_memory_threads: dict[str, dict[str, Any]] = {}
+_memory_activities: list[dict[str, Any]] = []
+
 
 @app.get("/health")
 def health() -> dict:
@@ -97,44 +103,77 @@ def create_program(payload: ProgramCreate, db: Session = Depends(get_db)) -> dic
     if payload.platform.lower() not in platforms:
         raise HTTPException(status_code=400, detail="Unsupported bug bounty platform")
     program_id = f"bbp-{uuid.uuid4().hex[:8]}"
-    entry = BugBountyProgramModel(
-        id=program_id,
-        platform=payload.platform.lower(),
-        program_name=payload.program_name,
-        scope=payload.scope,
-        reward_model=payload.reward_model,
-    )
-    db.add(entry)
-    db.commit()
-    db.refresh(entry)
-    _record_activity(
-        db,
-        program_id=entry.id,
-        submission_id=None,
-        activity_type="program_created",
-        actor=None,
-        detail=f"Program created on {entry.platform}",
-        metadata={"program_name": entry.program_name, "reward_model": entry.reward_model},
-    )
-    return _program_to_dict(entry)
+    try:
+        entry = BugBountyProgramModel(
+            id=program_id,
+            platform=payload.platform.lower(),
+            program_name=payload.program_name,
+            scope=payload.scope,
+            reward_model=payload.reward_model,
+        )
+        db.add(entry)
+        db.commit()
+        db.refresh(entry)
+        _record_activity(
+            db,
+            program_id=entry.id,
+            submission_id=None,
+            activity_type="program_created",
+            actor=None,
+            detail=f"Program created on {entry.platform}",
+            metadata={"program_name": entry.program_name, "reward_model": entry.reward_model},
+        )
+        return _program_to_dict(entry)
+    except SQLAlchemyError:
+        db.rollback()
+        now = datetime.now(UTC).isoformat()
+        program = {
+            "program_id": program_id,
+            "platform": payload.platform.lower(),
+            "program_name": payload.program_name,
+            "scope": payload.scope,
+            "reward_model": payload.reward_model,
+            "created_at": now,
+        }
+        _memory_programs[program_id] = program
+        _memory_activities.append(
+            {
+                "event": "program_created",
+                "program_id": program_id,
+                "detail": f"Program created on {program['platform']}",
+                "at": now,
+            }
+        )
+        return program
 
 
 @app.get("/programs")
 def list_programs(platform: str | None = None, db: Session = Depends(get_db)) -> dict:
-    query = db.query(BugBountyProgramModel)
-    if platform:
-        query = query.filter(BugBountyProgramModel.platform == platform.lower())
-    items = query.all()
-    return {"items": [_program_to_dict(p) for p in items], "total": len(items)}
+    try:
+        query = db.query(BugBountyProgramModel)
+        if platform:
+            query = query.filter(BugBountyProgramModel.platform == platform.lower())
+        items = query.all()
+        return {"items": [_program_to_dict(p) for p in items], "total": len(items)}
+    except SQLAlchemyError:
+        db.rollback()
+        items = list(_memory_programs.values())
+        if platform:
+            items = [p for p in items if p.get("platform") == platform.lower()]
+        return {"items": items, "total": len(items)}
 
 
 @app.post("/recon/auto")
 def automated_recon(payload: ReconRequest, db: Session = Depends(get_db)) -> dict:
-    program = (
-        db.query(BugBountyProgramModel)
-        .filter(BugBountyProgramModel.id == payload.program_id)
-        .first()
-    )
+    try:
+        program = (
+            db.query(BugBountyProgramModel)
+            .filter(BugBountyProgramModel.id == payload.program_id)
+            .first()
+        )
+    except SQLAlchemyError:
+        db.rollback()
+        program = _memory_programs.get(payload.program_id)
     if not program:
         raise HTTPException(status_code=404, detail="Program not found")
     assets = [payload.target, f"api.{payload.target}", f"admin.{payload.target}"]
@@ -163,66 +202,117 @@ def build_poc_template(finding: dict) -> dict:
 
 @app.post("/submissions", status_code=201)
 def create_submission(payload: SubmissionCreate, db: Session = Depends(get_db)) -> dict:
-    program = (
-        db.query(BugBountyProgramModel)
-        .filter(BugBountyProgramModel.id == payload.program_id)
-        .first()
-    )
+    try:
+        program = (
+            db.query(BugBountyProgramModel)
+            .filter(BugBountyProgramModel.id == payload.program_id)
+            .first()
+        )
+    except SQLAlchemyError:
+        db.rollback()
+        program = _memory_programs.get(payload.program_id)
     if not program:
         raise HTTPException(status_code=404, detail="Program not found")
     severity = payload.severity.lower().strip()
     if severity not in _ALLOWED_SEVERITIES:
         raise HTTPException(status_code=400, detail="Unsupported severity")
     submission_id = f"sub-{uuid.uuid4().hex[:10]}"
-    entry = BugBountySubmissionModel(
-        id=submission_id,
-        program_id=payload.program_id,
-        title=payload.title,
-        description=payload.description,
-        severity=severity,
-        poc=payload.poc,
-        status="draft",
-    )
-    db.add(entry)
-    db.commit()
-    db.refresh(entry)
-    _record_activity(
-        db,
-        program_id=payload.program_id,
-        submission_id=entry.id,
-        activity_type="submission_created",
-        actor=None,
-        detail="Submission draft created",
-        metadata={"severity": severity, "title": payload.title},
-    )
-    return _submission_to_dict(entry)
+    try:
+        entry = BugBountySubmissionModel(
+            id=submission_id,
+            program_id=payload.program_id,
+            title=payload.title,
+            description=payload.description,
+            severity=severity,
+            poc=payload.poc,
+            status="draft",
+        )
+        db.add(entry)
+        db.commit()
+        db.refresh(entry)
+        _record_activity(
+            db,
+            program_id=payload.program_id,
+            submission_id=entry.id,
+            activity_type="submission_created",
+            actor=None,
+            detail="Submission draft created",
+            metadata={"severity": severity, "title": payload.title},
+        )
+        return _submission_to_dict(entry)
+    except SQLAlchemyError:
+        db.rollback()
+        now = datetime.now(UTC).isoformat()
+        submission = {
+            "submission_id": submission_id,
+            "program_id": payload.program_id,
+            "title": payload.title,
+            "description": payload.description,
+            "severity": severity,
+            "poc": payload.poc,
+            "status": "draft",
+            "reward_amount": 0,
+            "submitted_at": None,
+            "created_at": now,
+        }
+        _memory_submissions[submission_id] = submission
+        _memory_activities.append(
+            {
+                "event": "submission_created",
+                "program_id": payload.program_id,
+                "submission_id": submission_id,
+                "detail": "Submission draft created",
+                "at": now,
+            }
+        )
+        return submission
 
 
 @app.post("/submissions/{submission_id}/submit")
 def submit_submission(submission_id: str, db: Session = Depends(get_db)) -> dict:
-    entry = (
-        db.query(BugBountySubmissionModel)
-        .filter(BugBountySubmissionModel.id == submission_id)
-        .first()
-    )
-    if not entry:
-        raise HTTPException(status_code=404, detail="Submission not found")
-    if entry.status != "draft":
-        raise HTTPException(status_code=400, detail="Only draft submissions can be submitted")
-    entry.status = "submitted"
-    entry.submitted_at = datetime.now(UTC)
-    db.commit()
-    db.refresh(entry)
-    _record_activity(
-        db,
-        program_id=entry.program_id,
-        submission_id=entry.id,
-        activity_type="submission_status_changed",
-        actor=None,
-        detail="Submission moved to submitted",
-        metadata={"from": "draft", "to": "submitted"},
-    )
-    return _submission_to_dict(entry)
+    try:
+        entry = (
+            db.query(BugBountySubmissionModel)
+            .filter(BugBountySubmissionModel.id == submission_id)
+            .first()
+        )
+        if not entry:
+            raise HTTPException(status_code=404, detail="Submission not found")
+        if entry.status != "draft":
+            raise HTTPException(status_code=400, detail="Only draft submissions can be submitted")
+        entry.status = "submitted"
+        entry.submitted_at = datetime.now(UTC)
+        db.commit()
+        db.refresh(entry)
+        _record_activity(
+            db,
+            program_id=entry.program_id,
+            submission_id=entry.id,
+            activity_type="submission_status_changed",
+            actor=None,
+            detail="Submission moved to submitted",
+            metadata={"from": "draft", "to": "submitted"},
+        )
+        return _submission_to_dict(entry)
+    except SQLAlchemyError:
+        db.rollback()
+        entry = _memory_submissions.get(submission_id)
+        if not entry:
+            raise HTTPException(status_code=404, detail="Submission not found")
+        if entry.get("status") != "draft":
+            raise HTTPException(status_code=400, detail="Only draft submissions can be submitted")
+        entry["status"] = "submitted"
+        entry["submitted_at"] = datetime.now(UTC).isoformat()
+        _memory_activities.append(
+            {
+                "event": "submission_status_changed",
+                "program_id": entry["program_id"],
+                "submission_id": submission_id,
+                "detail": "Submission moved to submitted",
+                "at": datetime.now(UTC).isoformat(),
+            }
+        )
+        return entry
 
 
 @app.get("/submissions")
@@ -328,14 +418,25 @@ def update_submission_status(
 
 @app.get("/dashboard/earnings")
 def earnings_dashboard(db: Session = Depends(get_db)) -> dict:
-    all_subs = db.query(BugBountySubmissionModel).all()
-    paid = [s for s in all_subs if s.status == "paid"]
-    total_paid = sum(s.reward_amount for s in paid)
-    pending_review = len([s for s in all_subs if s.status in {"submitted", "triaged"}])
+    try:
+        all_subs = db.query(BugBountySubmissionModel).all()
+        paid = [s for s in all_subs if s.status == "paid"]
+        total_paid = sum(s.reward_amount for s in paid)
+        pending_review = len([s for s in all_subs if s.status in {"submitted", "triaged"}])
+        total_submissions = len(all_subs)
+        paid_submissions = len(paid)
+    except SQLAlchemyError:
+        db.rollback()
+        all_subs = list(_memory_submissions.values())
+        paid = [s for s in all_subs if s.get("status") == "paid"]
+        total_paid = sum(int(s.get("reward_amount") or 0) for s in paid)
+        pending_review = len([s for s in all_subs if s.get("status") in {"submitted", "triaged"}])
+        total_submissions = len(all_subs)
+        paid_submissions = len(paid)
     avg_payout = (total_paid / len(paid)) if paid else 0
     return {
-        "total_submissions": len(all_subs),
-        "paid_submissions": len(paid),
+        "total_submissions": total_submissions,
+        "paid_submissions": paid_submissions,
         "total_paid": total_paid,
         "pending_review": pending_review,
         "average_payout": round(avg_payout, 2),
@@ -398,35 +499,53 @@ def timeline(program_id: str | None = None, db: Session = Depends(get_db)) -> di
 
 @app.post("/collaboration/share")
 def collaboration_share(payload: CollaborationShare, db: Session = Depends(get_db)) -> dict:
-    program = (
-        db.query(BugBountyProgramModel)
-        .filter(BugBountyProgramModel.id == payload.program_id)
-        .first()
-    )
+    try:
+        program = (
+            db.query(BugBountyProgramModel)
+            .filter(BugBountyProgramModel.id == payload.program_id)
+            .first()
+        )
+    except SQLAlchemyError:
+        db.rollback()
+        program = _memory_programs.get(payload.program_id)
     if not program:
         raise HTTPException(status_code=404, detail="Program not found")
-
-    entry = BugBountyThreadModel(
-        id=f"thread-{uuid.uuid4().hex[:8]}",
-        program_id=payload.program_id,
-        title=payload.title,
-        message=payload.message,
-        participants=payload.participants,
-        created_by=payload.created_by,
-    )
-    db.add(entry)
-    db.commit()
-    db.refresh(entry)
-    _record_activity(
-        db,
-        program_id=payload.program_id,
-        submission_id=None,
-        activity_type="collaboration_thread_created",
-        actor=payload.created_by,
-        detail=f"Collaboration thread created: {payload.title}",
-        metadata={"thread_id": entry.id, "participants": payload.participants},
-    )
-    return _thread_to_dict(entry)
+    try:
+        entry = BugBountyThreadModel(
+            id=f"thread-{uuid.uuid4().hex[:8]}",
+            program_id=payload.program_id,
+            title=payload.title,
+            message=payload.message,
+            participants=payload.participants,
+            created_by=payload.created_by,
+        )
+        db.add(entry)
+        db.commit()
+        db.refresh(entry)
+        _record_activity(
+            db,
+            program_id=payload.program_id,
+            submission_id=None,
+            activity_type="collaboration_thread_created",
+            actor=payload.created_by,
+            detail=f"Collaboration thread created: {payload.title}",
+            metadata={"thread_id": entry.id, "participants": payload.participants},
+        )
+        return _thread_to_dict(entry)
+    except SQLAlchemyError:
+        db.rollback()
+        thread_id = f"thread-{uuid.uuid4().hex[:8]}"
+        thread = {
+            "thread_id": thread_id,
+            "program_id": payload.program_id,
+            "title": payload.title,
+            "message": payload.message,
+            "participants": payload.participants,
+            "created_by": payload.created_by,
+            "created_at": datetime.now(UTC).isoformat(),
+        }
+        _memory_threads[thread_id] = thread
+        return thread
 
 
 @app.get("/collaboration/threads")
@@ -436,13 +555,23 @@ def collaboration_threads_list(
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
 ) -> dict:
-    query = db.query(BugBountyThreadModel)
-    if program_id:
-        query = query.filter(BugBountyThreadModel.program_id == program_id)
-    total = query.count()
-    items = query.order_by(BugBountyThreadModel.created_at.desc()).offset(offset).limit(limit).all()
+    try:
+        query = db.query(BugBountyThreadModel)
+        if program_id:
+            query = query.filter(BugBountyThreadModel.program_id == program_id)
+        total = query.count()
+        items = query.order_by(BugBountyThreadModel.created_at.desc()).offset(offset).limit(limit).all()
+        payload_items = [_thread_to_dict(item) for item in items]
+    except SQLAlchemyError:
+        db.rollback()
+        mem_items = list(_memory_threads.values())
+        if program_id:
+            mem_items = [item for item in mem_items if item.get("program_id") == program_id]
+        mem_items.sort(key=lambda item: str(item.get("created_at", "")), reverse=True)
+        total = len(mem_items)
+        payload_items = mem_items[offset : offset + limit]
     return {
-        "items": [_thread_to_dict(item) for item in items],
+        "items": payload_items,
         "total": total,
         "limit": limit,
         "offset": offset,

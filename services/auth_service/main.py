@@ -969,10 +969,7 @@ def _consume_oauth_state(state: str, provider: str, request: Request) -> bool:
 
     expected_ip = str(stored.get("client_ip", ""))
     current_ip = request.client.host if request.client else ""
-    if expected_ip and current_ip and expected_ip != current_ip:
-        return False
-
-    return True
+    return not (expected_ip and current_ip and expected_ip != current_ip)
 
 
 def _audit(action: str, actor: str, detail: str) -> None:
