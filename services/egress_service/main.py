@@ -13,7 +13,12 @@ import httpx
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-from services.common.egress import EgressOptions, EgressStrategyError, create_async_client
+from services.common.egress import (
+    EgressOptions,
+    EgressStrategyError,
+    create_async_client,
+    resolve_egress_strategy,
+)
 
 app = FastAPI(title="CosmicSec Egress Service", version="1.0.0")
 
@@ -53,11 +58,10 @@ async def resolve_strategy(payload: StrategyRequest) -> dict[str, Any]:
         tor_mode=payload.tor_mode if payload.tor_mode in {"enabled", "disabled", "auto"} else None,
     )
     try:
-        _, strategy = create_async_client(
+        strategy = resolve_egress_strategy(
             "egress-service",
             target_url=payload.target_url,
             options=options,
-            timeout=5.0,
         )
         return {
             "status": "ok",

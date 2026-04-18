@@ -19,13 +19,20 @@ from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
-from services.common.egress import EgressOptions, create_async_client
+from services.common.egress import (
+    EgressOptions,
+    EgressStrategyError,
+    create_async_client,
+    resolve_egress_strategy,
+)
 from services.common.security_utils import sanitize_for_log, validate_outbound_url
 
 logger = logging.getLogger(__name__)
 
 _HTTPX_AVAILABLE = False
 try:
+    import httpx  # noqa: F401
+
     _HTTPX_AVAILABLE = True
 except Exception:
     logger.debug("httpx not available; API fuzzer will run in simulation mode")
@@ -281,7 +288,28 @@ class APIFuzzer:
         selected = attack_types or list(_PAYLOADS.keys())
         self._request_count = 0
         findings: list[dict[str, Any]] = []
-        safe_base_url = validate_outbound_url(base_url, allow_private_hosts=False)
+        onion_reason: str | None = None
+        parsed = urlparse(base_url)
+        hostname = (parsed.hostname or "").strip().lower()
+        allow_onion_hosts = False
+        if hostname.endswith(".onion"):
+            try:
+                strategy = resolve_egress_strategy(
+                    "scan-service",
+                    target_url=base_url,
+                    options=self.egress_options,
+                )
+                allow_onion_hosts = bool(strategy.get("tor_enabled"))
+                if not allow_onion_hosts:
+                    onion_reason = "onion target requires Tor-enabled egress strategy"
+            except EgressStrategyError as exc:
+                onion_reason = str(exc)
+
+        safe_base_url = validate_outbound_url(
+            base_url,
+            allow_private_hosts=False,
+            allow_onion_hosts=allow_onion_hosts,
+        )
         if not safe_base_url:
             logger.warning("Blocked API fuzzing for unsafe URL: %s", sanitize_for_log(base_url))
             return {
@@ -294,6 +322,7 @@ class APIFuzzer:
                 "severity_breakdown": {},
                 "timestamp": datetime.now(tz=UTC).isoformat(),
                 "blocked": True,
+                "block_reason": onion_reason or "unsafe_outbound_url",
             }
 
         endpoints = (
@@ -305,21 +334,28 @@ class APIFuzzer:
         if not _HTTPX_AVAILABLE:
             findings = self._simulate(base_url, selected)
         else:
-            client, _ = create_async_client(
-                "scan-service",
-                target_url=safe_base_url,
-                options=self.egress_options,
-                timeout=self.timeout,
-                follow_redirects=True,
-                verify=_tls_verify_enabled(),
-            )
-            async with client:
-                for ep in endpoints:
-                    if self._request_count >= self.max_requests:
-                        break
-                    for attack in selected:
-                        ep_hits = await self._fuzz_endpoint(client, ep, attack)
-                        findings.extend(ep_hits)
+            try:
+                client, _ = create_async_client(
+                    "scan-service",
+                    target_url=safe_base_url,
+                    options=self.egress_options,
+                    timeout=self.timeout,
+                    follow_redirects=True,
+                    verify=_tls_verify_enabled(),
+                )
+                async with client:
+                    for ep in endpoints:
+                        if self._request_count >= self.max_requests:
+                            break
+                        for attack in selected:
+                            ep_hits = await self._fuzz_endpoint(client, ep, attack)
+                            findings.extend(ep_hits)
+            except ImportError as exc:
+                logger.warning(
+                    "Fuzzer transport unavailable (%s); falling back to simulation mode",
+                    sanitize_for_log(exc),
+                )
+                findings = self._simulate(base_url, selected)
 
         severity_counts: dict[str, int] = {}
         for f in findings:

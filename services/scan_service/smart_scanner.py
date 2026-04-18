@@ -17,14 +17,22 @@ import logging
 import os
 import re
 from typing import Any
+from urllib.parse import urlparse
 
-from services.common.egress import EgressOptions, create_async_client
+from services.common.egress import (
+    EgressOptions,
+    EgressStrategyError,
+    create_async_client,
+    resolve_egress_strategy,
+)
 from services.common.security_utils import sanitize_for_log, validate_outbound_url
 
 logger = logging.getLogger(__name__)
 
 _HTTPX_AVAILABLE = False
 try:
+    import httpx  # noqa: F401
+
     _HTTPX_AVAILABLE = True
 except Exception:
     logger.debug("httpx not available; smart scanner will use URL-only fingerprinting")
@@ -298,10 +306,28 @@ async def fingerprint_target(
     Returns:
         Dict: technologies (list[str]), tags (list[str]), risk_multiplier (float), url (str)
     """
-    if not _HTTPX_AVAILABLE:
-        return _url_fingerprint(url)
+    onion_reason: str | None = None
+    parsed = urlparse(url)
+    hostname = (parsed.hostname or "").strip().lower()
+    allow_onion_hosts = False
+    if hostname.endswith(".onion"):
+        try:
+            strategy = resolve_egress_strategy(
+                "scan-service",
+                target_url=url,
+                options=egress_options,
+            )
+            allow_onion_hosts = bool(strategy.get("tor_enabled"))
+            if not allow_onion_hosts:
+                onion_reason = "onion target requires Tor-enabled egress strategy"
+        except EgressStrategyError as exc:
+            onion_reason = str(exc)
 
-    safe_url = validate_outbound_url(url, allow_private_hosts=False)
+    safe_url = validate_outbound_url(
+        url,
+        allow_private_hosts=False,
+        allow_onion_hosts=allow_onion_hosts,
+    )
     if not safe_url:
         logger.warning("Fingerprint blocked for unsafe URL: %s", sanitize_for_log(url))
         return {
@@ -310,7 +336,13 @@ async def fingerprint_target(
             "tags": ["misconfig"],
             "risk_multiplier": 1.0,
             "blocked": True,
+            "block_reason": onion_reason or "unsafe_outbound_url",
         }
+
+    if not _HTTPX_AVAILABLE:
+        fp = _url_fingerprint(safe_url)
+        fp["url"] = url
+        return fp
 
     technologies: list[str] = []
     tags: list[str] = []
