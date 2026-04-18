@@ -59,12 +59,14 @@ _scan_cache = _LRUCache()
 
 
 def _scan_to_dict(row: ScanModel) -> dict[str, Any]:
+    scan_types = [str(v) for v in (row.scan_types or []) if v]
+    primary_scan_type = scan_types[0] if scan_types else "web"
     return {
         "id": row.id,
         "user_id": row.user_id,
         "target": row.target,
-        "scan_type": row.scan_type,
-        "scan_types": [row.scan_type] if row.scan_type else [],
+        "scan_type": primary_scan_type,
+        "scan_types": scan_types,
         "tool": row.tool,
         "status": row.status,
         "progress": row.progress,
@@ -122,7 +124,7 @@ def create_scan(db: Session, scan_data: dict[str, Any]) -> dict[str, Any]:
         id=scan_id,
         user_id=scan_data.get("user_id"),
         target=scan_data["target"],
-        scan_type=scan_data.get("scan_types", ["web"])[0] if scan_data.get("scan_types") else "web",
+        scan_types=scan_data.get("scan_types") or ["web"],
         status=scan_data.get("status", "pending"),
         progress=scan_data.get("progress", 0),
         source=scan_data.get("source", "web_scan"),
@@ -134,7 +136,8 @@ def create_scan(db: Session, scan_data: dict[str, Any]) -> dict[str, Any]:
 
     result = _scan_to_dict(row)
     # Merge original scan_data keys that aren't stored directly in the ORM model
-    result["scan_types"] = scan_data.get("scan_types", [result.get("scan_type", "web")])
+    result["scan_types"] = scan_data.get("scan_types", result.get("scan_types", ["web"]))
+    result["scan_type"] = result["scan_types"][0] if result["scan_types"] else "web"
     _scan_cache.put(scan_id, result)
     return result
 

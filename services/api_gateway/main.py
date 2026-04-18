@@ -1467,7 +1467,7 @@ async def recon_lookup(request: Request):
         path="/recon",
         method="POST",
         payload=data,
-        timeout=15.0,
+        timeout=35.0,
         route_key="recon.lookup",
     )
 

@@ -15,12 +15,14 @@ import json
 import os
 import re
 import socket
+from asyncio import gather
 from datetime import UTC, datetime
 from urllib.parse import quote, urlparse
 
 import httpx
 from fastapi import FastAPI
 from pydantic import BaseModel
+from starlette.responses import PlainTextResponse
 
 from services.common.egress import EgressOptions, EgressStrategyError, create_async_client
 
@@ -215,6 +217,16 @@ def health() -> dict:
     }
 
 
+@app.get("/metrics")
+def metrics() -> PlainTextResponse:
+    body = (
+        "# HELP cosmicsec_recon_service_up Recon service health status\n"
+        "# TYPE cosmicsec_recon_service_up gauge\n"
+        "cosmicsec_recon_service_up 1\n"
+    )
+    return PlainTextResponse(content=body, media_type="text/plain; version=0.0.4")
+
+
 @app.get("/cache/stats")
 def cache_stats() -> dict:
     """Return cache health and (if Redis available) info."""
@@ -273,10 +285,12 @@ async def run_recon(payload: ReconRequest) -> dict:
         }
 
     async with client:
-        shodan = await _shodan_lookup(client, target)
-        virustotal = await _virustotal_lookup(client, target)
-        crtsh = await _crtsh_lookup(client, target)
-        rdap = await _rdap_lookup(client, target)
+        shodan, virustotal, crtsh, rdap = await gather(
+            _shodan_lookup(client, target),
+            _virustotal_lookup(client, target),
+            _crtsh_lookup(client, target),
+            _rdap_lookup(client, target),
+        )
 
     return {
         "target": target,
