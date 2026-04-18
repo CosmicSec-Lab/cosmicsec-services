@@ -382,6 +382,21 @@ def save_user_to_db(record: dict[str, Any]) -> None:
         db.close()
 
 
+def delete_user_from_db(email: str) -> None:
+    """Delete one user from DB by email for GDPR/account erasure paths."""
+    db = _get_db_session()
+    if db is None:
+        return
+    try:
+        db.query(UserModel).filter(UserModel.email == email).delete()
+        db.commit()
+    except Exception:
+        logger.exception("Failed to delete user from DB for %s", sanitize_for_log(email))
+        db.rollback()
+    finally:
+        db.close()
+
+
 def load_all_users_from_db() -> dict[str, dict[str, Any]]:
     """Warm user cache from DB."""
     db = _get_db_session()
@@ -1485,19 +1500,22 @@ async def verify_token_endpoint(token: str):
 @app.get("/gdpr/export")
 async def gdpr_export(email: EmailStr):
     """Export GDPR user data for the provided email."""
-    user = fake_users_db.get(email) or load_user_from_db(str(email))
+    email_value = str(email)
+    user = fake_users_db.get(email_value) or load_user_from_db(email_value)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
     # Collect all user-related data from this service
-    sessions = [s for s in fake_sessions_db.values() if s.startswith(f"{email}:")]
-    sessions.extend(list_sessions_for_email_from_db(str(email)))
-    api_keys = [{"key_id": k, **v} for k, v in fake_api_keys_db.items() if v.get("owner") == email]
+    sessions = [s for s in fake_sessions_db.values() if s.startswith(f"{email_value}:")]
+    sessions.extend(list_sessions_for_email_from_db(email_value))
+    api_keys = [
+        {"key_id": k, **v} for k, v in fake_api_keys_db.items() if v.get("owner") == email_value
+    ]
     memberships = [
         {"org_id": org_id, "role": role}
         for org_id, members in org_memberships.items()
         for member_email, role in members.items()
-        if member_email == email
+        if member_email == email_value
     ]
 
     return {
@@ -1505,29 +1523,30 @@ async def gdpr_export(email: EmailStr):
         "sessions": sessions,
         "api_keys": api_keys,
         "memberships": memberships,
-        "audit_logs": [a for a in audit_logs if a.get("actor") == email],
+        "audit_logs": [a for a in audit_logs if a.get("actor") == email_value],
     }
 
 
 @app.delete("/gdpr/delete")
 async def gdpr_delete(email: EmailStr):
     """Delete all stored PII for a given email (Right to be forgotten)."""
-    if email in fake_users_db:
-        del fake_users_db[email]
+    email_value = str(email)
+    fake_users_db.pop(email_value, None)
     for key in list(fake_api_keys_db.keys()):
-        if fake_api_keys_db[key].get("owner") == email:
+        if fake_api_keys_db[key].get("owner") == email_value:
             del fake_api_keys_db[key]
             delete_api_key_from_db(key)
     for sid in list(fake_sessions_db.keys()):
-        if fake_sessions_db[sid].startswith(f"{email}:"):
+        if fake_sessions_db[sid].startswith(f"{email_value}:"):
             del fake_sessions_db[sid]
-    delete_sessions_for_email_from_db(str(email))
+    delete_sessions_for_email_from_db(email_value)
+    delete_user_from_db(email_value)
     # Remove from org memberships
     for members in org_memberships.values():
-        members.pop(email, None)
+        members.pop(email_value, None)
 
-    _audit("gdpr.delete", email, "User requested data erasure")
-    return {"status": "deleted", "email": email}
+    _audit("gdpr.delete", email_value, "User requested data erasure")
+    return {"status": "deleted", "email": email_value}
 
 
 def _oauth_provider_config(provider: str) -> dict[str, str]:
@@ -1998,6 +2017,7 @@ async def delete_current_account(current_user: User = Depends(get_current_user))
     fake_users_db.pop(email, None)
     fake_2fa_db.pop(email, None)
     disable_2fa_in_db(email)
+    delete_user_from_db(email)
 
     revoked_sessions = 0
     for sid in list(fake_sessions_db.keys()):
@@ -2086,6 +2106,7 @@ async def delete_user(email: str, current_user: User = Depends(require_permissio
     if email not in fake_users_db:
         raise HTTPException(status_code=404, detail="User not found")
     del fake_users_db[email]
+    delete_user_from_db(email)
     _audit("user.delete", current_user.email, f"deleted={email}")
     return {"message": "User deleted", "email": email}
 

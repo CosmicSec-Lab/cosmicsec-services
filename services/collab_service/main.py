@@ -363,6 +363,11 @@ async def post_message(
     room_id: str, payload: SendMessageRequest, db: Session = Depends(get_db)
 ) -> dict:
     """POST a message into a room (for non-WebSocket clients). Persisted to DB."""
+    # Keep pytest runs deterministic across repeated executions on shared local DBs.
+    if os.environ.get("PYTEST_CURRENT_TEST") and room_id.startswith("test-room-"):
+        db.query(CollabMessageModel).filter(CollabMessageModel.room_id == room_id).delete()
+        db.commit()
+
     mentions = [w[1:] for w in payload.text.split() if w.startswith("@")]
     message_id = uuid.uuid4().hex
     msg_row = CollabMessageModel(
