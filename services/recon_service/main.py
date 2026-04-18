@@ -21,6 +21,7 @@ from urllib.parse import quote, urlparse
 import httpx
 from fastapi import FastAPI
 from pydantic import BaseModel
+
 from services.common.egress import EgressOptions, EgressStrategyError, create_async_client
 
 try:
@@ -252,7 +253,9 @@ async def run_recon(payload: ReconRequest) -> dict:
                 rotate_identity=payload.rotate_identity,
                 client_profile=payload.client_profile,
                 use_tor=payload.use_tor,
-                tor_mode=payload.tor_mode if payload.tor_mode in {"enabled", "disabled", "auto"} else None,
+                tor_mode=payload.tor_mode
+                if payload.tor_mode in {"enabled", "disabled", "auto"}
+                else None,
             ),
             timeout=10.0,
         )

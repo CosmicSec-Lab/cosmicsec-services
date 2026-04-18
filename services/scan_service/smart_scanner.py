@@ -25,8 +25,6 @@ logger = logging.getLogger(__name__)
 
 _HTTPX_AVAILABLE = False
 try:
-    import httpx  # type: ignore[import-not-found]
-
     _HTTPX_AVAILABLE = True
 except Exception:
     logger.debug("httpx not available; smart scanner will use URL-only fingerprinting")
@@ -291,7 +289,9 @@ _TAG_PRIORITY: dict[str, int] = {
 # ---------------------------------------------------------------------------
 
 
-async def fingerprint_target(url: str, egress_options: EgressOptions | None = None) -> dict[str, Any]:
+async def fingerprint_target(
+    url: str, egress_options: EgressOptions | None = None
+) -> dict[str, Any]:
     """
     Probe a target URL to identify its technology stack.
 

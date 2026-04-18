@@ -358,10 +358,7 @@ def load_api_key_from_db(key_id: str) -> dict[str, Any] | None:
         return None
     try:
         row = db.execute(
-            text(
-                "SELECT user_id, key_hash, created_at "
-                "FROM api_keys WHERE id = :id LIMIT 1"
-            ),
+            text("SELECT user_id, key_hash, created_at FROM api_keys WHERE id = :id LIMIT 1"),
             {"id": key_id},
         ).first()
         if row is None:
@@ -385,10 +382,7 @@ def load_all_api_keys_from_db() -> dict[str, dict[str, Any]]:
         return {}
     try:
         rows = db.execute(
-            text(
-                "SELECT id, user_id, key_hash, created_at "
-                "FROM api_keys WHERE is_active IS true"
-            )
+            text("SELECT id, user_id, key_hash, created_at FROM api_keys WHERE is_active IS true")
         ).all()
         return {
             row[0]: {
@@ -413,8 +407,7 @@ def list_api_keys_for_owner_from_db(owner_email: str) -> list[dict[str, Any]]:
     try:
         rows = db.execute(
             text(
-                "SELECT id, created_at FROM api_keys "
-                "WHERE user_id = :owner AND is_active IS true"
+                "SELECT id, created_at FROM api_keys WHERE user_id = :owner AND is_active IS true"
             ),
             {"owner": owner_email},
         ).all()
@@ -481,8 +474,7 @@ def save_2fa_to_db(email: str, secret: str) -> None:
         encrypted = encrypt_2fa_secret(secret)
         result = db.execute(
             text(
-                "UPDATE users SET totp_secret = :secret, totp_enabled = true "
-                "WHERE email = :email"
+                "UPDATE users SET totp_secret = :secret, totp_enabled = true WHERE email = :email"
             ),
             {"secret": encrypted, "email": email},
         )

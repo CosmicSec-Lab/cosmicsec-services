@@ -26,8 +26,6 @@ logger = logging.getLogger(__name__)
 
 _HTTPX_AVAILABLE = False
 try:
-    import httpx  # type: ignore[import-not-found]
-
     _HTTPX_AVAILABLE = True
 except Exception:
     logger.debug("httpx not available; API fuzzer will run in simulation mode")
