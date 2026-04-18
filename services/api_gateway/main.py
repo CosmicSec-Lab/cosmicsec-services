@@ -1367,6 +1367,30 @@ async def import_findings(request: Request):
             raise HTTPException(status_code=503, detail="Scan service unavailable")
 
 
+@app.post("/api/scans/agent-results")
+@limiter.limit("60/minute")
+async def ingest_agent_results(request: Request):
+    """Proxy agent task results to scan service for durable scan/finding aggregation."""
+    data = await request.json()
+    headers = {}
+    for h in ["Authorization", "X-Org-Id", "X-Workspace-Id", "X-API-Key"]:
+        if request.headers.get(h):
+            headers[h] = request.headers.get(h)
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                _build_service_url("scan", "/scans/agent-results"),
+                json=data,
+                headers=headers,
+                timeout=20.0,
+            )
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except httpx.HTTPError as e:
+            logger.error("Scan service agent result ingest error: %s", e)
+            raise HTTPException(status_code=503, detail="Scan service unavailable")
+
+
 @app.get("/api/findings")
 @limiter.limit("120/minute")
 async def list_findings(request: Request):
@@ -3282,6 +3306,51 @@ def _list_agent_tasks_from_db(
         return None
 
 
+async def _forward_agent_task_result_to_scan_service(
+    *,
+    agent_id: str,
+    task_id: str,
+    task_record: dict,
+    result: dict,
+) -> None:
+    """Forward agent findings to scan service for unified persistence/analytics."""
+    findings = result.get("findings") if isinstance(result, dict) else None
+    if not isinstance(findings, list) or not findings:
+        return
+
+    metadata = task_record.get("metadata") if isinstance(task_record.get("metadata"), dict) else {}
+    payload = {
+        "agent_id": agent_id,
+        "task_id": task_id,
+        "scan_id": metadata.get("scan_id") if isinstance(metadata.get("scan_id"), str) else None,
+        "requested_by": task_record.get("requested_by"),
+        "target": task_record.get("target") or result.get("target"),
+        "tool": task_record.get("tool") or result.get("tool"),
+        "findings": findings,
+        "metadata": metadata,
+    }
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                _build_service_url("scan", "/scans/agent-results"),
+                json=payload,
+                timeout=20.0,
+            )
+        if response.status_code >= 300:
+            logger.warning(
+                "Forwarding agent task result failed for task %s (status=%s)",
+                _sanitize_log(task_id),
+                response.status_code,
+            )
+    except httpx.HTTPError:
+        logger.warning(
+            "Forwarding agent task result failed for task %s (transport error)",
+            _sanitize_log(task_id),
+            exc_info=True,
+        )
+
+
 @app.post("/api/agents/register")
 @limiter.limit("30/minute")
 async def register_agent(request: Request) -> JSONResponse:
@@ -3680,6 +3749,12 @@ async def agent_websocket(websocket: WebSocket, agent_id: str) -> None:
                             status=task["status"],
                             progress=100,
                             result=result,
+                        )
+                        await _forward_agent_task_result_to_scan_service(
+                            agent_id=agent_id,
+                            task_id=task_id,
+                            task_record=task,
+                            result=result if isinstance(result, dict) else {},
                         )
                         break
             else:

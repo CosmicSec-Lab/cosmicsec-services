@@ -178,6 +178,32 @@ class Finding(BaseModel):
     detected_at: datetime
 
 
+class AgentFindingPayload(BaseModel):
+    id: str | None = None
+    title: str
+    description: str = ""
+    severity: str = "info"
+    evidence: str | None = None
+    target: str | None = None
+    tool: str | None = None
+    category: str | None = None
+    cve_id: str | None = None
+    cvss_score: float | None = None
+    recommendation: str | None = None
+    detected_at: datetime | None = None
+
+
+class AgentTaskResultPayload(BaseModel):
+    agent_id: str
+    task_id: str
+    scan_id: str | None = None
+    requested_by: str | None = None
+    target: str | None = None
+    tool: str | None = None
+    findings: list[AgentFindingPayload] = []
+    metadata: dict[str, Any] = {}
+
+
 # Legacy in-memory storage — kept as hot cache / backward compat for tests
 # All writes now go through the repository (DB-backed); these dicts act as
 # fast-path caches that are populated on read and invalidated on write.
@@ -884,6 +910,96 @@ async def import_findings_batch(request: Request):
         db.close()
 
     return {"imported": imported, "scan_id": scan_id}
+
+
+@app.post("/scans/agent-results")
+async def ingest_agent_task_results(payload: AgentTaskResultPayload) -> dict[str, Any]:
+    """Persist CLI agent task findings into unified scan/finding storage."""
+    scan_id = payload.scan_id or f"agent-task-{payload.task_id}"
+    target = payload.target or "local-agent-target"
+    imported = 0
+    findings_count = 0
+    severity_breakdown: dict[str, int] = {}
+
+    db = SessionLocal()
+    try:
+        existing_scan = db_get_scan(db, scan_id)
+        if not existing_scan:
+            db_create_scan(
+                db,
+                {
+                    "id": scan_id,
+                    "target": target,
+                    "scan_types": ["network"],
+                    "status": "running",
+                    "source": "agent_local",
+                    "user_id": payload.requested_by,
+                },
+            )
+            existing_scan = db_get_scan(db, scan_id)
+
+        for finding in payload.findings:
+            finding_data = {
+                "id": finding.id,
+                "scan_id": scan_id,
+                "user_id": payload.requested_by,
+                "title": finding.title,
+                "severity": finding.severity,
+                "description": finding.description,
+                "evidence": finding.evidence,
+                "tool": finding.tool or payload.tool,
+                "category": finding.category or finding.tool or payload.tool,
+                "target": finding.target or target,
+                "cve_id": finding.cve_id,
+                "cvss_score": finding.cvss_score,
+                "recommendation": finding.recommendation or "",
+                "source": "agent_local",
+                "detected_at": finding.detected_at or datetime.now(tz=UTC),
+            }
+            create_finding(db, finding_data)
+            imported += 1
+
+        findings_count = count_findings(db, scan_id=scan_id)
+        severity_breakdown = get_severity_breakdown(db, scan_id=scan_id)
+        db_update_scan(
+            db,
+            scan_id,
+            {
+                "status": "completed",
+                "progress": 100,
+                "completed_at": datetime.now(tz=UTC),
+                "findings_count": findings_count,
+                "severity_breakdown": severity_breakdown,
+            },
+        )
+    except Exception:
+        logger.warning("Failed to persist agent task results for scan %s", scan_id, exc_info=True)
+        raise HTTPException(status_code=503, detail="Could not persist agent task results")
+    finally:
+        db.close()
+
+    scans_db[scan_id] = {
+        "id": scan_id,
+        "target": target,
+        "scan_types": [ScanType.NETWORK],
+        "status": ScanStatus.COMPLETED,
+        "created_at": datetime.now(tz=UTC),
+        "completed_at": datetime.now(tz=UTC),
+        "progress": 100,
+        "findings_count": findings_count,
+        "severity_breakdown": severity_breakdown,
+        "source": "agent_local",
+    }
+
+    return {
+        "accepted": True,
+        "scan_id": scan_id,
+        "agent_id": payload.agent_id,
+        "task_id": payload.task_id,
+        "imported": imported,
+        "findings_count": findings_count,
+        "severity_breakdown": severity_breakdown,
+    }
 
 
 @app.get("/findings")
