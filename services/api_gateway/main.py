@@ -1413,13 +1413,75 @@ async def ai_mitre(request: Request):
 @limiter.limit("20/minute")
 async def ai_nl_query(request: Request):
     """Proxy natural language security query to Helix AI."""
-    data = await request.json()
+    try:
+        data = await request.json()
+    except Exception as exc:
+        logger.warning("Invalid JSON payload for /api/ai/query: %s", exc)
+        raise HTTPException(status_code=400, detail="Invalid JSON payload") from exc
+
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+
+    source_hint = request.headers.get("X-CosmicSec-Client", "").strip().lower()
+    user_agent = request.headers.get("User-Agent", "").lower()
+    inferred_source = (
+        source_hint
+        if source_hint in {"web", "cli"}
+        else ("cli" if "cosmicsec-agent" in user_agent else "web")
+    )
+    data.setdefault("source", inferred_source)
+    data.setdefault("preferred_model", "pie:mini")
+
+    async with httpx.AsyncClient() as client:
+        last_exc: Exception | None = None
+        for attempt, backoff in enumerate((0.0, 0.35, 0.8), start=1):
+            if backoff:
+                await asyncio.sleep(backoff)
+            try:
+                response = await client.post(
+                    _build_service_url("ai", "/query"),
+                    json=data,
+                    timeout=20.0,
+                )
+                return JSONResponse(status_code=response.status_code, content=response.json())
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as e:
+                last_exc = e
+                logger.warning(
+                    "AI service transient error on /api/ai/query (attempt %s): %s",
+                    attempt,
+                    e,
+                )
+            except httpx.HTTPError as e:
+                logger.error(f"AI service error: {e}")
+                raise HTTPException(status_code=503, detail="AI service unavailable")
+
+        logger.error(f"AI service error after retries: {last_exc}")
+        raise HTTPException(status_code=503, detail="AI service unavailable")
+
+
+@app.get("/api/ai/models")
+@limiter.limit("30/minute")
+async def ai_models(request: Request):
+    """Proxy AI model inventory/status from ai-service."""
     async with httpx.AsyncClient() as client:
         try:
-            response = await client.post(
-                _build_service_url("ai", "/query"),
-                json=data,
-                timeout=20.0,
+            response = await client.get(_build_service_url("ai", "/ai/models"), timeout=15.0)
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except httpx.HTTPError as e:
+            logger.error(f"AI service error: {e}")
+            raise HTTPException(status_code=503, detail="AI service unavailable")
+
+
+@app.get("/api/ai/model/status")
+@limiter.limit("30/minute")
+async def ai_model_status(request: Request, model: str = "pie:mini"):
+    """Proxy specific local model status from ai-service."""
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(
+                _build_service_url("ai", "/ai/model/status"),
+                params={"model": model},
+                timeout=15.0,
             )
             return JSONResponse(status_code=response.status_code, content=response.json())
         except httpx.HTTPError as e:
