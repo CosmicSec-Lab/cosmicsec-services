@@ -1379,6 +1379,28 @@ async def get_scan_findings(request: Request, scan_id: str):
             raise HTTPException(status_code=503, detail="Scan service unavailable")
 
 
+@app.post("/api/scans/{scan_id}/cancel")
+@limiter.limit("20/minute")
+async def cancel_scan(request: Request, scan_id: str):
+    """Cancel a running scan."""
+    headers = {}
+    for h in ["Authorization", "X-Org-Id", "X-Workspace-Id", "X-API-Key"]:
+        if request.headers.get(h):
+            headers[h] = request.headers.get(h)
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                _build_service_url("scan", f"/scans/{scan_id}/cancel"),
+                headers=headers,
+                timeout=10.0,
+            )
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except httpx.HTTPError as e:
+            logger.error("Scan service cancellation error for %s: %s", _sanitize_log(scan_id), e)
+            raise HTTPException(status_code=503, detail="Scan service unavailable")
+
+
 @app.get("/api/info")
 async def platform_info():
     """Get platform information and branding"""

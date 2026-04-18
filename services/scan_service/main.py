@@ -116,6 +116,7 @@ class ScanStatus(StrEnum):
     PENDING = "pending"
     RUNNING = "running"
     COMPLETED = "completed"
+    CANCELLED = "cancelled"
     FAILED = "failed"
 
 
@@ -340,6 +341,12 @@ async def perform_scan(scan_id: str, config: ScanConfig):
         return
 
     try:
+        def _is_cancelled() -> bool:
+            return str(scan.get("status", "")).lower() == ScanStatus.CANCELLED.value
+
+        if _is_cancelled():
+            return
+
         # Update status
         scan["status"] = ScanStatus.RUNNING
         scan["started_at"] = datetime.now(tz=UTC)
@@ -361,6 +368,8 @@ async def perform_scan(scan_id: str, config: ScanConfig):
 
         # Network scan simulation
         if ScanType.NETWORK in config.scan_types:
+            if _is_cancelled():
+                return
             scan["progress"] = 25
             await ws_manager.broadcast(
                 scan_id, {"scan_id": scan_id, "status": "running", "progress": 25}
@@ -389,6 +398,8 @@ async def perform_scan(scan_id: str, config: ScanConfig):
 
         # Web scan simulation
         if ScanType.WEB in config.scan_types:
+            if _is_cancelled():
+                return
             scan["progress"] = 50
             await ws_manager.broadcast(
                 scan_id, {"scan_id": scan_id, "status": "running", "progress": 50}
@@ -416,6 +427,8 @@ async def perform_scan(scan_id: str, config: ScanConfig):
 
         # API scan simulation
         if ScanType.API in config.scan_types:
+            if _is_cancelled():
+                return
             scan["progress"] = 75
             await ws_manager.broadcast(
                 scan_id, {"scan_id": scan_id, "status": "running", "progress": 75}
@@ -423,6 +436,8 @@ async def perform_scan(scan_id: str, config: ScanConfig):
             logger.info(f"Scan {scan_id}: API scan in progress...")
 
         # Complete scan
+        if _is_cancelled():
+            return
         scan["progress"] = 100
         scan["status"] = ScanStatus.COMPLETED
         scan["completed_at"] = datetime.now(tz=UTC)
@@ -676,6 +691,51 @@ async def delete_scan(scan_id: str):
     logger.info(f"Deleted scan {scan_id}")
 
     return {"message": "Scan deleted successfully"}
+
+
+@app.post("/scans/{scan_id}/cancel")
+async def cancel_scan(scan_id: str):
+    """Cancel an active scan and persist cancellation state."""
+    scan = _load_scan_from_cache_or_db(scan_id)
+    if scan is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scan not found")
+
+    current_status = str(scan.get("status", "")).lower()
+    if current_status in {
+        ScanStatus.COMPLETED.value,
+        ScanStatus.FAILED.value,
+        ScanStatus.CANCELLED.value,
+    }:
+        return {
+            "scan_id": scan_id,
+            "status": current_status,
+            "cancelled": current_status == ScanStatus.CANCELLED.value,
+            "message": "Scan is no longer cancellable",
+        }
+
+    scan["status"] = ScanStatus.CANCELLED
+    scan["completed_at"] = datetime.now(tz=UTC)
+
+    try:
+        db = SessionLocal()
+        db_update_scan(
+            db,
+            scan_id,
+            {"status": ScanStatus.CANCELLED.value, "completed_at": scan["completed_at"]},
+        )
+        db.close()
+    except Exception:
+        logger.warning("DB persist failed for scan %s cancellation", scan_id, exc_info=True)
+
+    await ws_manager.broadcast(
+        scan_id,
+        {
+            "scan_id": scan_id,
+            "status": ScanStatus.CANCELLED,
+            "progress": scan.get("progress", 0),
+        },
+    )
+    return {"scan_id": scan_id, "status": ScanStatus.CANCELLED, "cancelled": True}
 
 
 @app.get("/stats")
