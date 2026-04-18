@@ -11,7 +11,12 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from services.common.db import get_db
-from services.common.models import BugBountyProgramModel, BugBountySubmissionModel
+from services.common.models import (
+    BugBountyActivityModel,
+    BugBountyProgramModel,
+    BugBountySubmissionModel,
+    BugBountyThreadModel,
+)
 
 app = FastAPI(title="CosmicSec Bug Bounty Service", version="1.0.0")
 
@@ -49,6 +54,8 @@ class SubmissionCreate(BaseModel):
 class SubmissionStatusUpdate(BaseModel):
     status: str = Field(..., description="draft | submitted | triaged | accepted | rejected | paid")
     reward_amount: int | None = Field(default=None, ge=0)
+    actor: str | None = None
+    note: str | None = None
 
 
 class CollaborationShare(BaseModel):
@@ -56,10 +63,8 @@ class CollaborationShare(BaseModel):
     title: str
     message: str
     participants: list[str] = Field(default_factory=list)
+    created_by: str | None = None
 
-
-# In-memory collaboration threads (non-critical, ephemeral)
-_collaboration_threads: list[dict[str, Any]] = []
 
 _ALLOWED_SEVERITIES = {"critical", "high", "medium", "low", "info"}
 _ALLOWED_STATUS = {"draft", "submitted", "triaged", "accepted", "rejected", "paid"}
@@ -102,6 +107,15 @@ def create_program(payload: ProgramCreate, db: Session = Depends(get_db)) -> dic
     db.add(entry)
     db.commit()
     db.refresh(entry)
+    _record_activity(
+        db,
+        program_id=entry.id,
+        submission_id=None,
+        activity_type="program_created",
+        actor=None,
+        detail=f"Program created on {entry.platform}",
+        metadata={"program_name": entry.program_name, "reward_model": entry.reward_model},
+    )
     return _program_to_dict(entry)
 
 
@@ -172,6 +186,15 @@ def create_submission(payload: SubmissionCreate, db: Session = Depends(get_db)) 
     db.add(entry)
     db.commit()
     db.refresh(entry)
+    _record_activity(
+        db,
+        program_id=payload.program_id,
+        submission_id=entry.id,
+        activity_type="submission_created",
+        actor=None,
+        detail="Submission draft created",
+        metadata={"severity": severity, "title": payload.title},
+    )
     return _submission_to_dict(entry)
 
 
@@ -190,6 +213,15 @@ def submit_submission(submission_id: str, db: Session = Depends(get_db)) -> dict
     entry.submitted_at = datetime.now(UTC)
     db.commit()
     db.refresh(entry)
+    _record_activity(
+        db,
+        program_id=entry.program_id,
+        submission_id=entry.id,
+        activity_type="submission_status_changed",
+        actor=None,
+        detail="Submission moved to submitted",
+        metadata={"from": "draft", "to": "submitted"},
+    )
     return _submission_to_dict(entry)
 
 
@@ -268,6 +300,7 @@ def update_submission_status(
             detail=f"Invalid status transition: {entry.status} -> {next_status}",
         )
 
+    previous_status = entry.status
     entry.status = next_status
     if next_status == "submitted" and entry.submitted_at is None:
         entry.submitted_at = datetime.now(UTC)
@@ -279,6 +312,15 @@ def update_submission_status(
 
     db.commit()
     db.refresh(entry)
+    _record_activity(
+        db,
+        program_id=entry.program_id,
+        submission_id=entry.id,
+        activity_type="submission_status_changed",
+        actor=payload.actor,
+        detail=payload.note or f"Submission status changed to {next_status}",
+        metadata={"from": previous_status, "to": next_status, "reward_amount": entry.reward_amount},
+    )
     return _submission_to_dict(entry)
 
 
@@ -332,29 +374,75 @@ def timeline(program_id: str | None = None, db: Session = Depends(get_db)) -> di
                 "status": sub.status,
             }
         )
+    activities_q = db.query(BugBountyActivityModel)
+    if program_id:
+        activities_q = activities_q.filter(BugBountyActivityModel.program_id == program_id)
+    for activity in activities_q.order_by(BugBountyActivityModel.created_at.desc()).limit(200).all():
+        events.append(
+            {
+                "event": activity.activity_type,
+                "program_id": activity.program_id,
+                "submission_id": activity.submission_id,
+                "actor": activity.actor,
+                "detail": activity.detail,
+                "metadata": activity.metadata,
+                "at": activity.created_at.isoformat() if activity.created_at else None,
+            }
+        )
     return {"events": events, "total": len(events)}
 
 
 @app.post("/collaboration/share")
-def collaboration_share(payload: CollaborationShare) -> dict:
-    entry = {
-        "thread_id": f"thread-{uuid.uuid4().hex[:8]}",
-        "program_id": payload.program_id,
-        "title": payload.title,
-        "message": payload.message,
-        "participants": payload.participants,
-        "created_at": datetime.now(UTC).isoformat(),
-    }
-    _collaboration_threads.append(entry)
-    return entry
+def collaboration_share(payload: CollaborationShare, db: Session = Depends(get_db)) -> dict:
+    program = (
+        db.query(BugBountyProgramModel)
+        .filter(BugBountyProgramModel.id == payload.program_id)
+        .first()
+    )
+    if not program:
+        raise HTTPException(status_code=404, detail="Program not found")
+
+    entry = BugBountyThreadModel(
+        id=f"thread-{uuid.uuid4().hex[:8]}",
+        program_id=payload.program_id,
+        title=payload.title,
+        message=payload.message,
+        participants=payload.participants,
+        created_by=payload.created_by,
+    )
+    db.add(entry)
+    db.commit()
+    db.refresh(entry)
+    _record_activity(
+        db,
+        program_id=payload.program_id,
+        submission_id=None,
+        activity_type="collaboration_thread_created",
+        actor=payload.created_by,
+        detail=f"Collaboration thread created: {payload.title}",
+        metadata={"thread_id": entry.id, "participants": payload.participants},
+    )
+    return _thread_to_dict(entry)
 
 
 @app.get("/collaboration/threads")
-def collaboration_threads_list(program_id: str | None = None) -> dict:
-    items = _collaboration_threads
+def collaboration_threads_list(
+    program_id: str | None = None,
+    limit: int = Query(default=25, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+) -> dict:
+    query = db.query(BugBountyThreadModel)
     if program_id:
-        items = [t for t in items if t["program_id"] == program_id]
-    return {"items": items, "total": len(items)}
+        query = query.filter(BugBountyThreadModel.program_id == program_id)
+    total = query.count()
+    items = query.order_by(BugBountyThreadModel.created_at.desc()).offset(offset).limit(limit).all()
+    return {
+        "items": [_thread_to_dict(item) for item in items],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
 
 
 @app.get("/reports/templates")
@@ -391,3 +479,38 @@ def _submission_to_dict(s: BugBountySubmissionModel) -> dict:
         "submitted_at": s.submitted_at.isoformat() if s.submitted_at else None,
         "created_at": s.created_at.isoformat() if s.created_at else None,
     }
+
+
+def _thread_to_dict(t: BugBountyThreadModel) -> dict:
+    return {
+        "thread_id": t.id,
+        "program_id": t.program_id,
+        "title": t.title,
+        "message": t.message,
+        "participants": t.participants,
+        "created_by": t.created_by,
+        "created_at": t.created_at.isoformat() if t.created_at else None,
+    }
+
+
+def _record_activity(
+    db: Session,
+    *,
+    program_id: str,
+    submission_id: str | None,
+    activity_type: str,
+    actor: str | None,
+    detail: str,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    entry = BugBountyActivityModel(
+        id=f"act-{uuid.uuid4().hex[:10]}",
+        program_id=program_id,
+        submission_id=submission_id,
+        activity_type=activity_type,
+        actor=actor,
+        detail=detail,
+        metadata=metadata or {},
+    )
+    db.add(entry)
+    db.commit()
