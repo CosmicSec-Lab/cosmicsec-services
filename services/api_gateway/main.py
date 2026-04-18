@@ -2244,6 +2244,20 @@ async def plugin_disable(request: Request, name: str):
             raise HTTPException(status_code=503, detail="Plugin registry unavailable")
 
 
+@app.get("/api/plugins/audit")
+@limiter.limit("60/minute")
+async def plugin_audit(request: Request):
+    params = dict(request.query_params)
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(
+                _build_service_url("plugins", "/plugins/audit"), params=params, timeout=5.0
+            )
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except httpx.HTTPError:
+            raise HTTPException(status_code=503, detail="Plugin registry unavailable")
+
+
 # ==========================================================================
 # Phase 2 — New proxy routes: monitoring, fuzzing, container, smart scan
 # ==========================================================================
