@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import httpx
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -449,6 +449,67 @@ async def ci_build(trigger: dict[str, Any]) -> dict:
         "build_id": build_id,
         "trigger": trigger,
         "timestamp": datetime.now(UTC).isoformat(),
+    }
+
+
+@app.get("/events")
+async def list_events(
+    provider: str | None = None,
+    event_type: str | None = None,
+    status: str | None = None,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+) -> dict:
+    """List integration events from persistent storage with filters and pagination."""
+    query = db.query(IntegrationEventModel)
+    if provider:
+        query = query.filter(IntegrationEventModel.provider == provider)
+    if event_type:
+        query = query.filter(IntegrationEventModel.event_type == event_type)
+    if status:
+        query = query.filter(IntegrationEventModel.status == status)
+
+    total = query.count()
+    rows = query.order_by(IntegrationEventModel.created_at.desc()).offset(offset).limit(limit).all()
+
+    return {
+        "items": [
+            {
+                "id": row.id,
+                "provider": row.provider,
+                "event_type": row.event_type,
+                "status": row.status,
+                "response_code": row.response_code,
+                "payload": row.payload,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+            }
+            for row in rows
+        ],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@app.get("/events/summary")
+async def events_summary(db: Session = Depends(get_db)) -> dict:
+    """Provide high-level integration event summary metrics for dashboards."""
+    rows = db.query(IntegrationEventModel).all()
+    by_provider: dict[str, int] = {}
+    by_type: dict[str, int] = {}
+    by_status: dict[str, int] = {}
+
+    for row in rows:
+        by_provider[row.provider] = by_provider.get(row.provider, 0) + 1
+        by_type[row.event_type] = by_type.get(row.event_type, 0) + 1
+        by_status[row.status] = by_status.get(row.status, 0) + 1
+
+    return {
+        "total_events": len(rows),
+        "provider_breakdown": dict(sorted(by_provider.items())),
+        "event_type_breakdown": dict(sorted(by_type.items())),
+        "status_breakdown": dict(sorted(by_status.items())),
     }
 
 

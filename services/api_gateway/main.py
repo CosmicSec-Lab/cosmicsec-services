@@ -735,11 +735,35 @@ async def dashboard_overview(request: Request):
 
 @app.get("/api/search")
 @limiter.limit("60/minute")
-async def global_search(request: Request, q: str, limit: int = 10):
+async def global_search(
+    request: Request,
+    q: str,
+    limit: int = 10,
+    category: str | None = Query(default=None, description="single category filter"),
+):
     """Authenticated global search across scans, findings, agents, reports, plugins, and events."""
     principal, is_admin = await _resolve_authenticated_user(request)
     query = q.strip().lower()
     per_category = max(1, min(limit, 5))
+    selected_category = (category or "").strip().lower()
+    valid_categories = {"", "all", "scans", "findings", "agents", "reports", "plugins", "events"}
+    if selected_category not in valid_categories:
+        raise HTTPException(status_code=400, detail="Unsupported search category")
+
+    def _category_enabled(name: str) -> bool:
+        return selected_category in {"", "all", name}
+
+    def _score(text: str) -> int:
+        hay = text.lower().strip()
+        if not hay:
+            return 0
+        if hay == query:
+            return 100
+        if hay.startswith(query):
+            return 80
+        if query in hay:
+            return 50
+        return 0
 
     empty = {"scans": [], "findings": [], "agents": [], "reports": [], "plugins": [], "events": []}
     if not query:
@@ -757,27 +781,35 @@ async def global_search(request: Request, q: str, limit: int = 10):
     if auth:
         headers["Authorization"] = auth
 
-    try:
-        async with httpx.AsyncClient() as client:
-            scans_resp = await client.get(
-                _build_service_url("scan", "/scans"),
-                params={"limit": per_category * _SEARCH_SCAN_FETCH_MULTIPLIER, "offset": 0},
-                headers=headers,
-                timeout=8.0,
-            )
-            if scans_resp.status_code == 200 and isinstance(scans_resp.json(), list):
-                all_scans = scans_resp.json()
-                scans = [
-                    scan
-                    for scan in all_scans
-                    if query in str(scan.get("target", "")).lower()
-                    or query in str(scan.get("id", "")).lower()
-                ][:per_category]
-                candidates = all_scans[: min(len(all_scans), _SEARCH_FINDING_SCAN_CANDIDATES)]
-    except httpx.HTTPError as exc:
-        logger.warning("Search scan lookup unavailable: %s", exc)
+    if _category_enabled("scans") or _category_enabled("findings") or _category_enabled("reports"):
+        try:
+            async with httpx.AsyncClient() as client:
+                scans_resp = await client.get(
+                    _build_service_url("scan", "/scans"),
+                    params={"limit": per_category * _SEARCH_SCAN_FETCH_MULTIPLIER, "offset": 0},
+                    headers=headers,
+                    timeout=8.0,
+                )
+                if scans_resp.status_code == 200 and isinstance(scans_resp.json(), list):
+                    all_scans = scans_resp.json()
 
-    if candidates:
+                    scored_scans: list[tuple[int, dict]] = []
+                    for scan in all_scans:
+                        score = max(
+                            _score(str(scan.get("target", ""))),
+                            _score(str(scan.get("id", ""))),
+                            _score(str(scan.get("status", ""))),
+                        )
+                        if score > 0:
+                            scored_scans.append((score, scan))
+
+                    scored_scans.sort(key=lambda item: item[0], reverse=True)
+                    scans = [item[1] for item in scored_scans[:per_category]]
+                    candidates = all_scans[: min(len(all_scans), _SEARCH_FINDING_SCAN_CANDIDATES)]
+        except httpx.HTTPError as exc:
+            logger.warning("Search scan lookup unavailable: %s", exc)
+
+    if candidates and _category_enabled("findings"):
         try:
             async with httpx.AsyncClient() as client:
                 finding_requests = [
@@ -797,140 +829,169 @@ async def global_search(request: Request, q: str, limit: int = 10):
                     payload = resp.json()
                     if isinstance(payload, list):
                         collected.extend(payload)
-                findings = [
-                    finding
-                    for finding in collected
-                    if query in str(finding.get("title", "")).lower()
-                    or query in str(finding.get("id", "")).lower()
-                ][:per_category]
+                scored_findings: list[tuple[int, dict]] = []
+                for finding in collected:
+                    score = max(
+                        _score(str(finding.get("title", ""))),
+                        _score(str(finding.get("id", ""))),
+                        _score(str(finding.get("severity", ""))),
+                    )
+                    if score > 0:
+                        scored_findings.append((score, finding))
+                scored_findings.sort(key=lambda item: item[0], reverse=True)
+                findings = [item[1] for item in scored_findings[:per_category]]
         except httpx.HTTPError as exc:
             logger.warning("Search finding lookup unavailable: %s", exc)
 
-    try:
-        async with httpx.AsyncClient() as client:
-            plugin_resp = await client.get(
-                _build_service_url("plugins", "/plugins"),
-                headers=headers,
-                timeout=5.0,
-            )
-            if plugin_resp.status_code == 200:
-                payload = plugin_resp.json()
-                all_plugins = payload.get("plugins", []) if isinstance(payload, dict) else []
-                for plugin in all_plugins:
-                    if not isinstance(plugin, dict):
-                        continue
-                    haystack = " ".join(
-                        str(plugin.get(field, ""))
-                        for field in ("name", "description", "author", "version")
-                    ).lower()
-                    haystack += " " + " ".join(str(tag) for tag in plugin.get("tags", []) if tag)
-                    haystack += " " + " ".join(
-                        str(permission) for permission in plugin.get("permissions", []) if permission
-                    )
-                    if query in haystack:
-                        plugins.append(
-                            {
-                                "name": plugin.get("name"),
-                                "version": plugin.get("version"),
-                                "description": plugin.get("description"),
-                                "author": plugin.get("author"),
-                                "tags": plugin.get("tags", []),
-                                "permissions": plugin.get("permissions", []),
-                            }
+    if _category_enabled("plugins"):
+        try:
+            async with httpx.AsyncClient() as client:
+                plugin_resp = await client.get(
+                    _build_service_url("plugins", "/plugins"),
+                    headers=headers,
+                    timeout=5.0,
+                )
+                if plugin_resp.status_code == 200:
+                    payload = plugin_resp.json()
+                    all_plugins = payload.get("plugins", []) if isinstance(payload, dict) else []
+                    scored_plugins: list[tuple[int, dict]] = []
+                    for plugin in all_plugins:
+                        if not isinstance(plugin, dict):
+                            continue
+                        score = max(
+                            _score(str(plugin.get("name", ""))),
+                            _score(str(plugin.get("description", ""))),
+                            _score(str(plugin.get("author", ""))),
+                            _score(" ".join(str(tag) for tag in plugin.get("tags", []) if tag)),
                         )
-                        if len(plugins) >= per_category:
-                            break
-    except httpx.HTTPError as exc:
-        logger.warning("Search plugin lookup unavailable: %s", exc)
+                        if score > 0:
+                            scored_plugins.append(
+                                (
+                                    score,
+                                    {
+                                        "name": plugin.get("name"),
+                                        "version": plugin.get("version"),
+                                        "description": plugin.get("description"),
+                                        "author": plugin.get("author"),
+                                        "tags": plugin.get("tags", []),
+                                        "permissions": plugin.get("permissions", []),
+                                    },
+                                )
+                            )
+                    scored_plugins.sort(key=lambda item: item[0], reverse=True)
+                    plugins = [item[1] for item in scored_plugins[:per_category]]
+        except httpx.HTTPError as exc:
+            logger.warning("Search plugin lookup unavailable: %s", exc)
 
-    try:
-        async with httpx.AsyncClient() as client:
-            audit_resp = await client.get(
-                _build_service_url("plugins", "/plugins/audit"),
-                headers={
-                    "X-CosmicSec-Viewer": principal,
-                    "X-CosmicSec-Viewer-Admin": "true" if is_admin else "false",
-                },
-                params={"limit": per_category * 4},
-                timeout=5.0,
-            )
-            if audit_resp.status_code == 200:
-                payload = audit_resp.json()
-                audit_items = payload.get("items", []) if isinstance(payload, dict) else []
-                for item in audit_items:
-                    if not isinstance(item, dict):
-                        continue
-                    haystack = " ".join(
-                        [
-                            str(item.get("action", "")),
-                            str(item.get("plugin", "")),
-                            str(item.get("detail", "")),
-                            str(item.get("actor", "")),
-                            str(item.get("actor_role", "")),
-                            str(item.get("status", "")),
-                            str((item.get("context") or {}).get("target", "")),
-                            str((item.get("context") or {}).get("scan_id", "")),
-                        ]
-                    ).lower()
-                    if query in haystack:
+    if _category_enabled("events"):
+        try:
+            async with httpx.AsyncClient() as client:
+                audit_resp = await client.get(
+                    _build_service_url("plugins", "/plugins/audit"),
+                    headers={
+                        "X-CosmicSec-Viewer": principal,
+                        "X-CosmicSec-Viewer-Admin": "true" if is_admin else "false",
+                    },
+                    params={"limit": per_category * 4},
+                    timeout=5.0,
+                )
+                if audit_resp.status_code == 200:
+                    payload = audit_resp.json()
+                    audit_items = payload.get("items", []) if isinstance(payload, dict) else []
+                    scored_events: list[tuple[int, dict]] = []
+                    for item in audit_items:
+                        if not isinstance(item, dict):
+                            continue
                         context = item.get("context") if isinstance(item.get("context"), dict) else {}
-                        events.append(
-                            {
-                                "id": f"{item.get('timestamp', '')}-{item.get('plugin', 'plugin')}-{item.get('action', 'event')}",
-                                "title": f"{item.get('action', 'event')} · {item.get('plugin', 'plugin')}",
-                                "description": item.get("detail", ""),
-                                "plugin": item.get("plugin"),
-                                "scan_id": context.get("scan_id"),
-                                "target": context.get("target"),
-                                "status": item.get("status"),
-                                "timestamp": item.get("timestamp"),
-                            }
+                        score = max(
+                            _score(str(item.get("action", ""))),
+                            _score(str(item.get("plugin", ""))),
+                            _score(str(item.get("detail", ""))),
+                            _score(str(context.get("target", ""))),
+                            _score(str(context.get("scan_id", ""))),
                         )
-                        if len(events) >= per_category:
-                            break
-    except httpx.HTTPError as exc:
-        logger.warning("Search audit lookup unavailable: %s", exc)
+                        if score > 0:
+                            scored_events.append(
+                                (
+                                    score,
+                                    {
+                                        "id": f"{item.get('timestamp', '')}-{item.get('plugin', 'plugin')}-{item.get('action', 'event')}",
+                                        "title": f"{item.get('action', 'event')} · {item.get('plugin', 'plugin')}",
+                                        "description": item.get("detail", ""),
+                                        "plugin": item.get("plugin"),
+                                        "scan_id": context.get("scan_id"),
+                                        "target": context.get("target"),
+                                        "status": item.get("status"),
+                                        "timestamp": item.get("timestamp"),
+                                    },
+                                )
+                            )
+                    scored_events.sort(key=lambda item: item[0], reverse=True)
+                    events = [item[1] for item in scored_events[:per_category]]
+        except httpx.HTTPError as exc:
+            logger.warning("Search audit lookup unavailable: %s", exc)
 
-    for scan in scans:
-        scan_id = str(scan.get("id", "")).strip()
-        if not scan_id:
-            continue
-        report_id = f"report-{scan_id}"
-        if query not in report_id.lower() and query not in scan_id.lower():
-            continue
-        reports.append(
-            {
-                "id": report_id,
-                "scan_id": scan_id,
-                "format": "pdf",
-                "status": "available" if str(scan.get("status")) == "completed" else "pending",
-                "created_at": scan.get("completed_at") or scan.get("created_at"),
-            }
-        )
-        if len(reports) >= per_category:
-            break
+    if _category_enabled("reports"):
+        scored_reports: list[tuple[int, dict]] = []
+        for scan in scans:
+            scan_id = str(scan.get("id", "")).strip()
+            if not scan_id:
+                continue
+            report_id = f"report-{scan_id}"
+            score = max(_score(report_id), _score(scan_id), _score(str(scan.get("target", ""))))
+            if score <= 0:
+                continue
+            scored_reports.append(
+                (
+                    score,
+                    {
+                        "id": report_id,
+                        "scan_id": scan_id,
+                        "format": "pdf",
+                        "status": "available" if str(scan.get("status")) == "completed" else "pending",
+                        "created_at": scan.get("completed_at") or scan.get("created_at"),
+                    },
+                )
+            )
+        scored_reports.sort(key=lambda item: item[0], reverse=True)
+        reports = [item[1] for item in scored_reports[:per_category]]
 
-    visible_agents = (
-        list(_registered_agents.values())
-        if is_admin
-        else [agent for agent in _registered_agents.values() if agent.get("user_id") == principal]
-    )
-    agents = []
-    for agent in visible_agents:
-        manifest = agent.get("manifest") if isinstance(agent.get("manifest"), dict) else {}
-        name = str(manifest.get("name") or agent.get("agent_id") or "Agent")
-        haystack = f"{name} {agent.get('agent_id', '')} {agent.get('status', '')}".lower()
-        if query not in haystack:
-            continue
-        agents.append(
-            {
-                "id": agent.get("agent_id"),
-                "name": name,
-                "status": agent.get("status", "unknown"),
-            }
+    if _category_enabled("agents"):
+        visible_agents = (
+            list(_registered_agents.values())
+            if is_admin
+            else [agent for agent in _registered_agents.values() if agent.get("user_id") == principal]
         )
-        if len(agents) >= per_category:
-            break
+        scored_agents: list[tuple[int, dict]] = []
+        for agent in visible_agents:
+            manifest = agent.get("manifest") if isinstance(agent.get("manifest"), dict) else {}
+            name = str(manifest.get("name") or agent.get("agent_id") or "Agent")
+            score = max(
+                _score(name),
+                _score(str(agent.get("agent_id", ""))),
+                _score(str(agent.get("status", ""))),
+            )
+            if score <= 0:
+                continue
+            scored_agents.append(
+                (
+                    score,
+                    {
+                        "id": agent.get("agent_id"),
+                        "name": name,
+                        "status": agent.get("status", "unknown"),
+                    },
+                )
+            )
+        scored_agents.sort(key=lambda item: item[0], reverse=True)
+        agents = [item[1] for item in scored_agents[:per_category]]
+
+    scans = scans if _category_enabled("scans") else []
+    findings = findings if _category_enabled("findings") else []
+    agents = agents if _category_enabled("agents") else []
+    reports = reports if _category_enabled("reports") else []
+    plugins = plugins if _category_enabled("plugins") else []
+    events = events if _category_enabled("events") else []
 
     return {
         "scans": scans,
@@ -939,6 +1000,19 @@ async def global_search(request: Request, q: str, limit: int = 10):
         "reports": reports,
         "plugins": plugins,
         "events": events,
+        "meta": {
+            "query": query,
+            "category": selected_category or "all",
+            "limit": per_category,
+            "counts": {
+                "scans": len(scans),
+                "findings": len(findings),
+                "agents": len(agents),
+                "reports": len(reports),
+                "plugins": len(plugins),
+                "events": len(events),
+            },
+        },
     }
 
 

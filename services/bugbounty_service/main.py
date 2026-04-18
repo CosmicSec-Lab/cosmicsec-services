@@ -6,7 +6,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -46,6 +46,11 @@ class SubmissionCreate(BaseModel):
     poc: str | None = None
 
 
+class SubmissionStatusUpdate(BaseModel):
+    status: str = Field(..., description="draft | submitted | triaged | accepted | rejected | paid")
+    reward_amount: int | None = Field(default=None, ge=0)
+
+
 class CollaborationShare(BaseModel):
     program_id: str
     title: str
@@ -55,6 +60,17 @@ class CollaborationShare(BaseModel):
 
 # In-memory collaboration threads (non-critical, ephemeral)
 _collaboration_threads: list[dict[str, Any]] = []
+
+_ALLOWED_SEVERITIES = {"critical", "high", "medium", "low", "info"}
+_ALLOWED_STATUS = {"draft", "submitted", "triaged", "accepted", "rejected", "paid"}
+_STATUS_TRANSITIONS = {
+    "draft": {"submitted", "rejected"},
+    "submitted": {"triaged", "accepted", "rejected"},
+    "triaged": {"accepted", "rejected"},
+    "accepted": {"paid"},
+    "rejected": set(),
+    "paid": set(),
+}
 
 
 @app.get("/health")
@@ -140,13 +156,16 @@ def create_submission(payload: SubmissionCreate, db: Session = Depends(get_db)) 
     )
     if not program:
         raise HTTPException(status_code=404, detail="Program not found")
+    severity = payload.severity.lower().strip()
+    if severity not in _ALLOWED_SEVERITIES:
+        raise HTTPException(status_code=400, detail="Unsupported severity")
     submission_id = f"sub-{uuid.uuid4().hex[:10]}"
     entry = BugBountySubmissionModel(
         id=submission_id,
         program_id=payload.program_id,
         title=payload.title,
         description=payload.description,
-        severity=payload.severity,
+        severity=severity,
         poc=payload.poc,
         status="draft",
     )
@@ -165,8 +184,99 @@ def submit_submission(submission_id: str, db: Session = Depends(get_db)) -> dict
     )
     if not entry:
         raise HTTPException(status_code=404, detail="Submission not found")
+    if entry.status != "draft":
+        raise HTTPException(status_code=400, detail="Only draft submissions can be submitted")
     entry.status = "submitted"
     entry.submitted_at = datetime.now(UTC)
+    db.commit()
+    db.refresh(entry)
+    return _submission_to_dict(entry)
+
+
+@app.get("/submissions")
+def list_submissions(
+    status: str | None = None,
+    program_id: str | None = None,
+    severity: str | None = None,
+    limit: int = Query(default=25, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+) -> dict:
+    query = db.query(BugBountySubmissionModel)
+
+    if status:
+        normalized_status = status.lower().strip()
+        if normalized_status not in _ALLOWED_STATUS:
+            raise HTTPException(status_code=400, detail="Unsupported status filter")
+        query = query.filter(BugBountySubmissionModel.status == normalized_status)
+
+    if program_id:
+        query = query.filter(BugBountySubmissionModel.program_id == program_id)
+
+    if severity:
+        normalized_severity = severity.lower().strip()
+        if normalized_severity not in _ALLOWED_SEVERITIES:
+            raise HTTPException(status_code=400, detail="Unsupported severity filter")
+        query = query.filter(BugBountySubmissionModel.severity == normalized_severity)
+
+    total = query.count()
+    rows = (
+        query.order_by(BugBountySubmissionModel.created_at.desc()).offset(offset).limit(limit).all()
+    )
+    return {
+        "items": [_submission_to_dict(s) for s in rows],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@app.get("/submissions/{submission_id}")
+def get_submission(submission_id: str, db: Session = Depends(get_db)) -> dict:
+    entry = (
+        db.query(BugBountySubmissionModel)
+        .filter(BugBountySubmissionModel.id == submission_id)
+        .first()
+    )
+    if not entry:
+        raise HTTPException(status_code=404, detail="Submission not found")
+    return _submission_to_dict(entry)
+
+
+@app.patch("/submissions/{submission_id}/status")
+def update_submission_status(
+    submission_id: str,
+    payload: SubmissionStatusUpdate,
+    db: Session = Depends(get_db),
+) -> dict:
+    entry = (
+        db.query(BugBountySubmissionModel)
+        .filter(BugBountySubmissionModel.id == submission_id)
+        .first()
+    )
+    if not entry:
+        raise HTTPException(status_code=404, detail="Submission not found")
+
+    next_status = payload.status.lower().strip()
+    if next_status not in _ALLOWED_STATUS:
+        raise HTTPException(status_code=400, detail="Unsupported status")
+
+    allowed = _STATUS_TRANSITIONS.get(entry.status, set())
+    if next_status not in allowed and next_status != entry.status:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid status transition: {entry.status} -> {next_status}",
+        )
+
+    entry.status = next_status
+    if next_status == "submitted" and entry.submitted_at is None:
+        entry.submitted_at = datetime.now(UTC)
+
+    if payload.reward_amount is not None:
+        if next_status != "paid":
+            raise HTTPException(status_code=400, detail="reward_amount is only valid for paid status")
+        entry.reward_amount = payload.reward_amount
+
     db.commit()
     db.refresh(entry)
     return _submission_to_dict(entry)
@@ -177,11 +287,24 @@ def earnings_dashboard(db: Session = Depends(get_db)) -> dict:
     all_subs = db.query(BugBountySubmissionModel).all()
     paid = [s for s in all_subs if s.status == "paid"]
     total_paid = sum(s.reward_amount for s in paid)
+    pending_review = len([s for s in all_subs if s.status in {"submitted", "triaged"}])
+    avg_payout = (total_paid / len(paid)) if paid else 0
     return {
         "total_submissions": len(all_subs),
         "paid_submissions": len(paid),
         "total_paid": total_paid,
+        "pending_review": pending_review,
+        "average_payout": round(avg_payout, 2),
     }
+
+
+@app.get("/dashboard/status-breakdown")
+def submission_status_breakdown(db: Session = Depends(get_db)) -> dict:
+    all_subs = db.query(BugBountySubmissionModel).all()
+    breakdown = {status: 0 for status in sorted(_ALLOWED_STATUS)}
+    for sub in all_subs:
+        breakdown[sub.status] = breakdown.get(sub.status, 0) + 1
+    return {"breakdown": breakdown, "total": len(all_subs)}
 
 
 @app.get("/timeline")
