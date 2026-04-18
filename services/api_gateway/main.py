@@ -690,18 +690,20 @@ async def dashboard_overview(request: Request):
 @app.get("/api/search")
 @limiter.limit("60/minute")
 async def global_search(request: Request, q: str, limit: int = 10):
-    """Authenticated global search across scans, findings, agents, and reports."""
+    """Authenticated global search across scans, findings, agents, reports, plugins, and events."""
     principal, is_admin = await _resolve_authenticated_user(request)
     query = q.strip().lower()
     per_category = max(1, min(limit, 5))
 
-    empty = {"scans": [], "findings": [], "agents": [], "reports": []}
+    empty = {"scans": [], "findings": [], "agents": [], "reports": [], "plugins": [], "events": []}
     if not query:
         return empty
 
     scans: list[dict] = []
     findings: list[dict] = []
     reports: list[dict] = []
+    plugins: list[dict] = []
+    events: list[dict] = []
     candidates: list[dict] = []
 
     headers = {}
@@ -758,6 +760,91 @@ async def global_search(request: Request, q: str, limit: int = 10):
         except httpx.HTTPError as exc:
             logger.warning("Search finding lookup unavailable: %s", exc)
 
+    try:
+        async with httpx.AsyncClient() as client:
+            plugin_resp = await client.get(
+                _build_service_url("plugins", "/plugins"),
+                headers=headers,
+                timeout=5.0,
+            )
+            if plugin_resp.status_code == 200:
+                payload = plugin_resp.json()
+                all_plugins = payload.get("plugins", []) if isinstance(payload, dict) else []
+                for plugin in all_plugins:
+                    if not isinstance(plugin, dict):
+                        continue
+                    haystack = " ".join(
+                        str(plugin.get(field, ""))
+                        for field in ("name", "description", "author", "version")
+                    ).lower()
+                    haystack += " " + " ".join(str(tag) for tag in plugin.get("tags", []) if tag)
+                    haystack += " " + " ".join(
+                        str(permission) for permission in plugin.get("permissions", []) if permission
+                    )
+                    if query in haystack:
+                        plugins.append(
+                            {
+                                "name": plugin.get("name"),
+                                "version": plugin.get("version"),
+                                "description": plugin.get("description"),
+                                "author": plugin.get("author"),
+                                "tags": plugin.get("tags", []),
+                                "permissions": plugin.get("permissions", []),
+                            }
+                        )
+                        if len(plugins) >= per_category:
+                            break
+    except httpx.HTTPError as exc:
+        logger.warning("Search plugin lookup unavailable: %s", exc)
+
+    try:
+        async with httpx.AsyncClient() as client:
+            audit_resp = await client.get(
+                _build_service_url("plugins", "/plugins/audit"),
+                headers={
+                    "X-CosmicSec-Viewer": principal,
+                    "X-CosmicSec-Viewer-Admin": "true" if is_admin else "false",
+                },
+                params={"limit": per_category * 4},
+                timeout=5.0,
+            )
+            if audit_resp.status_code == 200:
+                payload = audit_resp.json()
+                audit_items = payload.get("items", []) if isinstance(payload, dict) else []
+                for item in audit_items:
+                    if not isinstance(item, dict):
+                        continue
+                    haystack = " ".join(
+                        [
+                            str(item.get("action", "")),
+                            str(item.get("plugin", "")),
+                            str(item.get("detail", "")),
+                            str(item.get("actor", "")),
+                            str(item.get("actor_role", "")),
+                            str(item.get("status", "")),
+                            str((item.get("context") or {}).get("target", "")),
+                            str((item.get("context") or {}).get("scan_id", "")),
+                        ]
+                    ).lower()
+                    if query in haystack:
+                        context = item.get("context") if isinstance(item.get("context"), dict) else {}
+                        events.append(
+                            {
+                                "id": f"{item.get('timestamp', '')}-{item.get('plugin', 'plugin')}-{item.get('action', 'event')}",
+                                "title": f"{item.get('action', 'event')} · {item.get('plugin', 'plugin')}",
+                                "description": item.get("detail", ""),
+                                "plugin": item.get("plugin"),
+                                "scan_id": context.get("scan_id"),
+                                "target": context.get("target"),
+                                "status": item.get("status"),
+                                "timestamp": item.get("timestamp"),
+                            }
+                        )
+                        if len(events) >= per_category:
+                            break
+    except httpx.HTTPError as exc:
+        logger.warning("Search audit lookup unavailable: %s", exc)
+
     for scan in scans:
         scan_id = str(scan.get("id", "")).strip()
         if not scan_id:
@@ -799,7 +886,14 @@ async def global_search(request: Request, q: str, limit: int = 10):
         if len(agents) >= per_category:
             break
 
-    return {"scans": scans, "findings": findings, "agents": agents, "reports": reports}
+    return {
+        "scans": scans,
+        "findings": findings,
+        "agents": agents,
+        "reports": reports,
+        "plugins": plugins,
+        "events": events,
+    }
 
 
 @app.post("/api/auth/register")
@@ -1148,6 +1242,23 @@ async def save_scan_defaults(request: Request):
                 json=data,
                 headers=headers,
                 timeout=10.0,
+            )
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except httpx.HTTPError as e:
+            logger.error("Auth service error: %s", e)
+            raise HTTPException(status_code=503, detail="Authentication service unavailable")
+
+
+@app.get("/api/settings/scan-defaults")
+@limiter.limit("20/minute")
+async def get_scan_defaults(request: Request):
+    headers = {}
+    if request.headers.get("Authorization"):
+        headers["Authorization"] = request.headers.get("Authorization")
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(
+                _build_service_url("auth", "/settings/scan-defaults"), headers=headers, timeout=10.0
             )
             return JSONResponse(status_code=response.status_code, content=response.json())
         except httpx.HTTPError as e:
