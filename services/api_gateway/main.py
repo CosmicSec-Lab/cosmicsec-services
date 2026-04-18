@@ -650,7 +650,11 @@ async def dashboard_overview(request: Request):
                         int(v or 0)
                         for p in points
                         if isinstance(p, dict)
-                        for v in ((p.get("severity_breakdown") or {}).values() if isinstance(p.get("severity_breakdown"), dict) else [])
+                        for v in (
+                            (p.get("severity_breakdown") or {}).values()
+                            if isinstance(p.get("severity_breakdown"), dict)
+                            else []
+                        )
                     )
         except httpx.HTTPError:
             pass
@@ -902,7 +906,9 @@ async def global_search(
                     for item in audit_items:
                         if not isinstance(item, dict):
                             continue
-                        context = item.get("context") if isinstance(item.get("context"), dict) else {}
+                        context = (
+                            item.get("context") if isinstance(item.get("context"), dict) else {}
+                        )
                         score = max(
                             _score(str(item.get("action", ""))),
                             _score(str(item.get("plugin", ""))),
@@ -948,7 +954,9 @@ async def global_search(
                         "id": report_id,
                         "scan_id": scan_id,
                         "format": "pdf",
-                        "status": "available" if str(scan.get("status")) == "completed" else "pending",
+                        "status": "available"
+                        if str(scan.get("status")) == "completed"
+                        else "pending",
                         "created_at": scan.get("completed_at") or scan.get("created_at"),
                     },
                 )
@@ -960,7 +968,9 @@ async def global_search(
         visible_agents = (
             list(_registered_agents.values())
             if is_admin
-            else [agent for agent in _registered_agents.values() if agent.get("user_id") == principal]
+            else [
+                agent for agent in _registered_agents.values() if agent.get("user_id") == principal
+            ]
         )
         scored_agents: list[tuple[int, dict]] = []
         for agent in visible_agents:
@@ -3307,8 +3317,12 @@ def _persist_agent_task_create(task_record: dict) -> None:
                 else {},
                 status=str(task_record.get("status", "dispatched")),
                 progress=int(task_record.get("progress", 0)),
-                created_at=datetime.fromtimestamp(float(task_record.get("created_at", time.time())), tz=UTC),
-                updated_at=datetime.fromtimestamp(float(task_record.get("updated_at", time.time())), tz=UTC),
+                created_at=datetime.fromtimestamp(
+                    float(task_record.get("created_at", time.time())), tz=UTC
+                ),
+                updated_at=datetime.fromtimestamp(
+                    float(task_record.get("updated_at", time.time())), tz=UTC
+                ),
             )
             db.add(row)
             db.commit()
@@ -3348,7 +3362,10 @@ def _persist_agent_task_update(agent_id: str, task_id: str, **updates: object) -
         finally:
             db.close()
     except Exception:
-        logger.debug("Agent task update persistence failed (memory state remains authoritative)", exc_info=True)
+        logger.debug(
+            "Agent task update persistence failed (memory state remains authoritative)",
+            exc_info=True,
+        )
 
 
 def _list_agent_tasks_from_db(

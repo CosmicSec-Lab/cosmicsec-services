@@ -1983,13 +1983,13 @@ async def save_scan_defaults(
 
 @app.get("/settings/scan-defaults")
 async def get_scan_defaults(current_user: User = Depends(get_current_user)):
-        defaults = scan_defaults_db.get(current_user.email)
-        if defaults is None:
-            defaults = {
-                    "scan_timeout_seconds": 300,
-                    "auto_analyze": True,
-            }
-        return {"defaults": defaults}
+    defaults = scan_defaults_db.get(current_user.email)
+    if defaults is None:
+        defaults = {
+            "scan_timeout_seconds": 300,
+            "auto_analyze": True,
+        }
+    return {"defaults": defaults}
 
 
 @app.delete("/account")
