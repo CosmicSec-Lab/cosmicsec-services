@@ -852,6 +852,54 @@ async def refresh_token(request: Request):
     )
 
 
+@app.post("/api/auth/forgot-password")
+@limiter.limit("20/minute")
+async def forgot_password(request: Request):
+    """Request password reset flow from auth service."""
+    data = await request.json()
+    return await hybrid_router.execute(
+        request=request,
+        service="auth",
+        path="/forgot-password",
+        method="POST",
+        payload=data,
+        timeout=10.0,
+        route_key="auth.forgot_password",
+    )
+
+
+@app.post("/api/auth/verify-2fa")
+@limiter.limit("30/minute")
+async def verify_2fa(request: Request):
+    """Verify 2FA challenge and complete login token exchange."""
+    data = await request.json()
+    return await hybrid_router.execute(
+        request=request,
+        service="auth",
+        path="/verify-2fa",
+        method="POST",
+        payload=data,
+        timeout=10.0,
+        route_key="auth.verify_2fa",
+    )
+
+
+@app.post("/api/auth/resend-2fa")
+@limiter.limit("20/minute")
+async def resend_2fa(request: Request):
+    """Request a fresh 2FA challenge from auth service."""
+    data = await request.json()
+    return await hybrid_router.execute(
+        request=request,
+        service="auth",
+        path="/resend-2fa",
+        method="POST",
+        payload=data,
+        timeout=10.0,
+        route_key="auth.resend_2fa",
+    )
+
+
 @app.get("/api/auth/me")
 @limiter.limit("60/minute")
 async def auth_me(request: Request):

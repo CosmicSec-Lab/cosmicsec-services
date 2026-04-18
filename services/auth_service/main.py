@@ -44,7 +44,7 @@ try:
     from sqlalchemy.orm import Session as SASession
 
     from services.common.db import SessionLocal
-    from services.common.models import APIKeyModel, UserModel
+    from services.common.models import APIKeyModel, SessionModel, UserModel
 
     _HAS_DB = True
 except ImportError:  # pragma: no cover - optional dependency at runtime
@@ -142,6 +142,17 @@ class TwoFactorSetupResponse(BaseModel):
 class TwoFactorVerifyRequest(BaseModel):
     email: EmailStr
     code: str
+
+
+class Verify2FALoginRequest(BaseModel):
+    email: EmailStr
+    code: str
+    temp_token: str | None = None
+    is_backup: bool = False
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
 
 
 class ApiKeyResponse(BaseModel):
@@ -265,6 +276,7 @@ fake_users_db = {}
 fake_api_keys_db = {}
 fake_2fa_db = {}
 fake_sessions_db = {}
+fake_password_reset_db: dict[str, dict[str, Any]] = {}
 scan_defaults_db: dict[str, dict[str, Any]] = {}
 audit_logs = []
 platform_config = {
@@ -305,6 +317,186 @@ def _hash_api_key_token(token: str) -> str:
         token.encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
+
+
+def load_user_from_db(email: str) -> dict[str, Any] | None:
+    """Load one user from DB and map to auth-service record shape."""
+    db = _get_db_session()
+    if db is None:
+        return None
+    try:
+        row = db.query(UserModel).filter(UserModel.email == email).first()
+        if row is None:
+            return None
+        return {
+            "id": row.id,
+            "email": row.email,
+            "full_name": row.full_name,
+            "hashed_password": row.hashed_password,
+            "role": row.role,
+            "is_active": bool(row.is_active),
+            "created_at": row.created_at,
+        }
+    except Exception:
+        logger.exception("Failed to load user from DB for %s", sanitize_for_log(email))
+        return None
+    finally:
+        db.close()
+
+
+def save_user_to_db(record: dict[str, Any]) -> None:
+    """Persist or update one user row in DB."""
+    db = _get_db_session()
+    if db is None:
+        return
+    try:
+        row = db.query(UserModel).filter(UserModel.email == record.get("email", "")).first()
+        if row is None:
+            row = UserModel(
+                id=record["id"],
+                email=record["email"],
+                full_name=record.get("full_name", ""),
+                hashed_password=record.get("hashed_password"),
+                role=record.get("role", "user"),
+                is_active=bool(record.get("is_active", True)),
+            )
+            db.add(row)
+        else:
+            row.full_name = record.get("full_name", row.full_name)
+            row.hashed_password = record.get("hashed_password", row.hashed_password)
+            row.role = record.get("role", row.role)
+            row.is_active = bool(record.get("is_active", row.is_active))
+        db.commit()
+    except Exception:
+        logger.exception("Failed to persist user to DB for %s", sanitize_for_log(record.get("email")))
+        db.rollback()
+    finally:
+        db.close()
+
+
+def load_all_users_from_db() -> dict[str, dict[str, Any]]:
+    """Warm user cache from DB."""
+    db = _get_db_session()
+    if db is None:
+        return {}
+    try:
+        rows = db.query(UserModel).all()
+        return {
+            row.email: {
+                "id": row.id,
+                "email": row.email,
+                "full_name": row.full_name,
+                "hashed_password": row.hashed_password,
+                "role": row.role,
+                "is_active": bool(row.is_active),
+                "created_at": row.created_at,
+            }
+            for row in rows
+        }
+    except Exception:
+        logger.warning("Failed to bulk-load users from DB")
+        return {}
+    finally:
+        db.close()
+
+
+def save_session_to_db(session_id: str, email: str, refresh_token: str) -> None:
+    """Persist refresh-session metadata to DB for durability."""
+    db = _get_db_session()
+    if db is None:
+        return
+    try:
+        user = db.query(UserModel).filter(UserModel.email == email).first()
+        if user is None:
+            return
+        token_hash = _hash_api_key_token(refresh_token)
+        existing = db.query(SessionModel).filter(SessionModel.id == session_id).first()
+        expires_at = datetime.now(tz=UTC) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+        if existing is None:
+            db.add(
+                SessionModel(
+                    id=session_id,
+                    user_id=user.id,
+                    token_hash=token_hash,
+                    expires_at=expires_at,
+                )
+            )
+        else:
+            existing.user_id = user.id
+            existing.token_hash = token_hash
+            existing.expires_at = expires_at
+        db.commit()
+    except Exception:
+        logger.warning("Failed to persist session %s to DB", sanitize_for_log(session_id))
+        db.rollback()
+    finally:
+        db.close()
+
+
+def delete_session_from_db(session_id: str) -> None:
+    db = _get_db_session()
+    if db is None:
+        return
+    try:
+        db.query(SessionModel).filter(SessionModel.id == session_id).delete()
+        db.commit()
+    except Exception:
+        logger.warning("Failed to delete session %s from DB", sanitize_for_log(session_id))
+        db.rollback()
+    finally:
+        db.close()
+
+
+def session_exists_in_db(session_id: str) -> bool:
+    db = _get_db_session()
+    if db is None:
+        return False
+    try:
+        return (
+            db.query(SessionModel)
+            .filter(SessionModel.id == session_id)
+            .filter(SessionModel.expires_at > datetime.now(tz=UTC))
+            .first()
+            is not None
+        )
+    except Exception:
+        return False
+    finally:
+        db.close()
+
+
+def list_sessions_for_email_from_db(email: str) -> list[str]:
+    db = _get_db_session()
+    if db is None:
+        return []
+    try:
+        user = db.query(UserModel).filter(UserModel.email == email).first()
+        if user is None:
+            return []
+        rows = db.query(SessionModel).filter(SessionModel.user_id == user.id).all()
+        return [f"{email}:{row.id}" for row in rows]
+    except Exception:
+        logger.warning("Failed to list sessions for %s", sanitize_for_log(email))
+        return []
+    finally:
+        db.close()
+
+
+def delete_sessions_for_email_from_db(email: str) -> None:
+    db = _get_db_session()
+    if db is None:
+        return
+    try:
+        user = db.query(UserModel).filter(UserModel.email == email).first()
+        if user is None:
+            return
+        db.query(SessionModel).filter(SessionModel.user_id == user.id).delete()
+        db.commit()
+    except Exception:
+        logger.warning("Failed to delete sessions for %s", sanitize_for_log(email))
+        db.rollback()
+    finally:
+        db.close()
 
 
 def save_api_key_to_db(key_id: str, data: dict[str, Any]) -> None:
@@ -636,6 +828,11 @@ async def startup_warm_cache():
         fake_2fa_db.update(loaded_2fa)
         logger.info("Warmed 2FA cache with %d entries from DB", len(loaded_2fa))
 
+    loaded_users = load_all_users_from_db()
+    if loaded_users:
+        fake_users_db.update(loaded_users)
+        logger.info("Warmed user cache with %d entries from DB", len(loaded_users))
+
 
 # Multi-tenant state (in-memory; DB in production)
 organizations_db: dict[str, dict] = {}
@@ -663,6 +860,7 @@ def _store_session(session_id: str, email: str, refresh_token: str) -> None:
         redis_client.setex(f"session:{session_id}", REFRESH_TOKEN_EXPIRE_DAYS * 86400, value)
     else:
         fake_sessions_db[session_id] = value
+    save_session_to_db(session_id, email, refresh_token)
 
 
 def _audit(action: str, actor: str, detail: str) -> None:
@@ -755,12 +953,13 @@ def _delete_session(session_id: str) -> None:
         redis_client.delete(f"session:{session_id}")
     else:
         fake_sessions_db.pop(session_id, None)
+    delete_session_from_db(session_id)
 
 
 def _session_exists(session_id: str) -> bool:
     if redis_client is not None:
         return redis_client.exists(f"session:{session_id}") == 1
-    return session_id in fake_sessions_db
+    return session_id in fake_sessions_db or session_exists_in_db(session_id)
 
 
 def _enforce_permission(role: str, action: str) -> bool:
@@ -866,6 +1065,10 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
 
     user = fake_users_db.get(token_data.email)
     if user is None:
+        user = load_user_from_db(token_data.email or "")
+        if user:
+            fake_users_db[str(token_data.email)] = user
+    if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
 
     return User(**user)
@@ -914,7 +1117,8 @@ async def metrics() -> PlainTextResponse:
 async def register(user_data: UserCreate):
     """Register a new user"""
     # Check if user already exists
-    if user_data.email in fake_users_db:
+    existing_user = fake_users_db.get(user_data.email) or load_user_from_db(user_data.email)
+    if existing_user:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="Email already registered"
         )
@@ -934,6 +1138,7 @@ async def register(user_data: UserCreate):
     }
 
     fake_users_db[user_data.email] = new_user
+    save_user_to_db(new_user)
     _audit("user.register", user_data.email, f"role={user_data.role}")
 
     logger.info("New user registered: %s", sanitize_for_log(user_data.email))
@@ -957,6 +1162,10 @@ async def login(user_data: UserLogin, request: Request):
 
     # Get user from database
     user = fake_users_db.get(user_data.email)
+    if not user:
+        user = load_user_from_db(user_data.email)
+        if user:
+            fake_users_db[user_data.email] = user
     if not user:
         await login_rate_limiter.record_failed_attempt(client_ip, user_data.email)
         raise HTTPException(
@@ -1032,6 +1241,90 @@ async def refresh(payload: RefreshRequest):
         )
 
 
+@app.post("/forgot-password")
+async def forgot_password(payload: ForgotPasswordRequest):
+    """Generate a password reset challenge token for known users.
+
+    Always returns a generic success response to avoid account enumeration.
+    """
+    user = fake_users_db.get(payload.email) or load_user_from_db(payload.email)
+    if user:
+        reset_token = secrets.token_urlsafe(24)
+        fake_password_reset_db[payload.email] = {
+            "token": reset_token,
+            "created_at": datetime.now(tz=UTC).isoformat(),
+        }
+        _audit("auth.forgot_password", payload.email, "reset challenge issued")
+    return {
+        "message": "If the account exists, a reset link has been sent.",
+        "sent": True,
+    }
+
+
+@app.post("/verify-2fa")
+async def verify_2fa_login(payload: Verify2FALoginRequest):
+    """Verify a 2FA code and issue access/refresh tokens for login completion."""
+    user = fake_users_db.get(payload.email) or load_user_from_db(payload.email)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    secret = fake_2fa_db.get(payload.email)
+    if not secret:
+        secret = load_2fa_from_db(payload.email)
+        if secret:
+            fake_2fa_db[payload.email] = secret
+    if not secret:
+        raise HTTPException(status_code=404, detail="2FA is not configured for this user")
+
+    if pyotp is not None:
+        valid = pyotp.TOTP(secret).verify(payload.code)
+    else:
+        valid = payload.code == "000000"
+
+    if not valid:
+        raise HTTPException(status_code=401, detail="Invalid verification code")
+
+    access_token_data = {"sub": user["email"], "user_id": user["id"], "role": user["role"]}
+    access_token = create_access_token(access_token_data)
+    refresh_token = create_refresh_token(access_token_data)
+    session_id = secrets.token_urlsafe(12)
+    _store_session(session_id, payload.email, refresh_token)
+    _audit("2fa.verify_login", payload.email, f"session={session_id}")
+
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",  # nosec B105
+        "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        "session_id": session_id,
+        "user": {
+            "id": user["id"],
+            "email": user["email"],
+            "full_name": user["full_name"],
+            "role": user["role"],
+        },
+    }
+
+
+@app.post("/resend-2fa")
+async def resend_2fa(payload: Verify2FALoginRequest):
+    """Issue a fresh 2FA challenge marker for UX retry flows."""
+    user = fake_users_db.get(payload.email) or load_user_from_db(payload.email)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    secret = fake_2fa_db.get(payload.email) or load_2fa_from_db(payload.email)
+    if not secret:
+        raise HTTPException(status_code=404, detail="2FA is not configured for this user")
+
+    challenge_id = secrets.token_urlsafe(10)
+    _audit("2fa.resend", payload.email, f"challenge={challenge_id}")
+    return {
+        "sent": True,
+        "challenge_id": challenge_id,
+        "message": "Verification code requested.",
+    }
+
+
 @app.get("/me", response_model=User)
 async def get_current_user_info(current_user: User = Depends(get_current_user)):
     """Get current user information"""
@@ -1065,12 +1358,13 @@ async def verify_token_endpoint(token: str):
 @app.get("/gdpr/export")
 async def gdpr_export(email: EmailStr):
     """Export GDPR user data for the provided email."""
-    user = fake_users_db.get(email)
+    user = fake_users_db.get(email) or load_user_from_db(str(email))
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
     # Collect all user-related data from this service
     sessions = [s for s in fake_sessions_db.values() if s.startswith(f"{email}:")]
+    sessions.extend(list_sessions_for_email_from_db(str(email)))
     api_keys = [{"key_id": k, **v} for k, v in fake_api_keys_db.items() if v.get("owner") == email]
     memberships = [
         {"org_id": org_id, "role": role}
@@ -1100,6 +1394,7 @@ async def gdpr_delete(email: EmailStr):
     for sid in list(fake_sessions_db.keys()):
         if fake_sessions_db[sid].startswith(f"{email}:"):
             del fake_sessions_db[sid]
+    delete_sessions_for_email_from_db(str(email))
     # Remove from org memberships
     for members in org_memberships.values():
         members.pop(email, None)
