@@ -1318,6 +1318,30 @@ async def list_findings(request: Request):
     return {"items": findings}
 
 
+@app.get("/api/findings/trending")
+@limiter.limit("120/minute")
+async def findings_trending(request: Request):
+    """Proxy daily findings trend analytics from scan service."""
+    headers = {}
+    for h in ["Authorization", "X-Org-Id", "X-Workspace-Id", "X-API-Key"]:
+        if request.headers.get(h):
+            headers[h] = request.headers.get(h)
+
+    params = dict(request.query_params)
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(
+                _build_service_url("scan", "/findings/trending"),
+                headers=headers,
+                params=params,
+                timeout=15.0,
+            )
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except httpx.HTTPError as e:
+            logger.error("Scan service findings trending error: %s", e)
+            raise HTTPException(status_code=503, detail="Scan service unavailable")
+
+
 @app.get("/api/scans/{scan_id}")
 @limiter.limit("60/minute")
 async def get_scan(request: Request, scan_id: str):
