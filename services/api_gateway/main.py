@@ -2268,10 +2268,17 @@ async def plugin_disable(request: Request, name: str):
 @limiter.limit("60/minute")
 async def plugin_audit(request: Request):
     params = dict(request.query_params)
+    principal, is_admin = await _resolve_authenticated_user(request)
     async with httpx.AsyncClient() as client:
         try:
             response = await client.get(
-                _build_service_url("plugins", "/plugins/audit"), params=params, timeout=5.0
+                _build_service_url("plugins", "/plugins/audit"),
+                params=params,
+                headers={
+                    "X-CosmicSec-Viewer": principal,
+                    "X-CosmicSec-Viewer-Admin": "true" if is_admin else "false",
+                },
+                timeout=5.0,
             )
             return JSONResponse(status_code=response.status_code, content=response.json())
         except httpx.HTTPError:
