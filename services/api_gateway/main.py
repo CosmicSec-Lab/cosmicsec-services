@@ -619,6 +619,7 @@ async def dashboard_overview(request: Request):
     active_agents = 0
     open_bugs = 0
     findings_last_7d = 0
+    scans_today = 0
     compliance_pct = 75
 
     async with httpx.AsyncClient() as client:
@@ -628,21 +629,66 @@ async def dashboard_overview(request: Request):
             if resp.status_code == 200:
                 data = resp.json()
                 total_scans = data.get("total_scans", 0)
-                critical_findings = data.get("critical_findings", 0)
-                findings_last_7d = data.get("findings_last_7d", 0)
+                severity_breakdown = data.get("severity_breakdown", {})
+                if isinstance(severity_breakdown, dict):
+                    critical_findings = int(severity_breakdown.get("critical", 0) or 0)
+        except httpx.HTTPError:
+            pass
+
+        # Findings trend (last N days)
+        try:
+            resp = await client.get(
+                _build_service_url("scan", "/findings/trending"),
+                params={"days": 7},
+                timeout=4.0,
+            )
+            if resp.status_code == 200:
+                payload = resp.json()
+                points = payload.get("points", []) if isinstance(payload, dict) else []
+                if isinstance(points, list):
+                    findings_last_7d = sum(
+                        int(v or 0)
+                        for p in points
+                        if isinstance(p, dict)
+                        for v in ((p.get("severity_breakdown") or {}).values() if isinstance(p.get("severity_breakdown"), dict) else [])
+                    )
+        except httpx.HTTPError:
+            pass
+
+        # Scan recency (today)
+        try:
+            resp = await client.get(
+                _build_service_url("scan", "/scans"),
+                params={"limit": 200, "offset": 0},
+                timeout=4.0,
+            )
+            if resp.status_code == 200:
+                rows = resp.json()
+                if isinstance(rows, list):
+                    today = datetime.now(tz=UTC).date()
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            continue
+                        created_at = row.get("created_at")
+                        if not isinstance(created_at, str):
+                            continue
+                        try:
+                            created_dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                        except ValueError:
+                            continue
+                        if created_dt.date() == today:
+                            scans_today += 1
         except httpx.HTTPError:
             pass
 
         # Agent sessions
-        try:
-            resp = await client.get(_build_service_url("scan", "/agents"), timeout=3.0)
-            if resp.status_code == 200:
-                data = resp.json()
-                active_agents = len(
-                    [a for a in data.get("agents", []) if a.get("status") == "online"]
-                )
-        except httpx.HTTPError:
-            pass
+        active_agents = len(
+            [
+                agent
+                for agent in _registered_agents.values()
+                if str(agent.get("status", "")).lower() == "connected"
+            ]
+        )
 
         # Bug bounty open count
         try:
@@ -669,7 +715,7 @@ async def dashboard_overview(request: Request):
         "active_agents": active_agents,
         "open_bugs": open_bugs,
         "security_score": score,
-        "scans_today": 0,
+        "scans_today": scans_today,
         "findings_last_7d": findings_last_7d,
         "compliance_pct": compliance_pct,
         "timestamp": time.time(),
