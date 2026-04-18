@@ -14,8 +14,9 @@ import logging
 import os
 import time
 from datetime import UTC, datetime
+from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -87,6 +88,53 @@ class DispatchTaskRequest(BaseModel):
     task: dict
 
 
+def _persist_agent_session(
+    *,
+    agent_id: str,
+    user_id: str | None,
+    status: str,
+    last_seen_ts: float,
+    manifest: dict[str, Any] | None = None,
+    ip_address: str | None = None,
+) -> None:
+    """Persist session state to DB when a validated user identity is available."""
+    if not user_id:
+        return
+
+    try:
+        from services.common.db import SessionLocal
+        from services.common.models import AgentSessionModel
+
+        db = SessionLocal()
+        try:
+            existing = db.query(AgentSessionModel).filter(AgentSessionModel.id == agent_id).first()
+            timestamp = datetime.fromtimestamp(last_seen_ts, tz=UTC)
+            if existing:
+                existing.user_id = user_id
+                existing.status = status
+                existing.last_seen_at = timestamp
+                if manifest is not None:
+                    existing.manifest = manifest
+                if ip_address is not None:
+                    existing.ip_address = ip_address
+            else:
+                db.add(
+                    AgentSessionModel(
+                        id=agent_id,
+                        user_id=user_id,
+                        manifest=manifest or {},
+                        status=status,
+                        last_seen_at=timestamp,
+                        ip_address=ip_address,
+                    )
+                )
+            db.commit()
+        finally:
+            db.close()
+    except Exception:
+        logger.debug("DB upsert for agent %s failed (non-critical)", agent_id, exc_info=True)
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -111,6 +159,72 @@ async def list_agents() -> JSONResponse:
         for aid, meta in _connections.items()
     ]
     return JSONResponse(content={"agents": agents, "total": len(agents)})
+
+
+@app.get("/relay/agents/history")
+async def list_agent_history(
+    status_filter: str | None = Query(default=None, alias="status"),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> JSONResponse:
+    """Return durable agent session history from DB with optional status filter."""
+    try:
+        from services.common.db import SessionLocal
+        from services.common.models import AgentSessionModel
+
+        db = SessionLocal()
+        try:
+            base_query = db.query(AgentSessionModel)
+            if status_filter:
+                base_query = base_query.filter(AgentSessionModel.status == status_filter)
+
+            total = base_query.count()
+            rows = (
+                base_query.order_by(AgentSessionModel.last_seen_at.desc())
+                .offset(offset)
+                .limit(limit)
+                .all()
+            )
+
+            items = [
+                {
+                    "agent_id": row.id,
+                    "user_id": row.user_id,
+                    "status": row.status,
+                    "manifest": row.manifest or {},
+                    "ip_address": row.ip_address,
+                    "last_seen_at": (
+                        row.last_seen_at.isoformat() if getattr(row, "last_seen_at", None) else None
+                    ),
+                    "created_at": (
+                        row.created_at.isoformat() if getattr(row, "created_at", None) else None
+                    ),
+                }
+                for row in rows
+            ]
+            return JSONResponse(
+                content={
+                    "items": items,
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset,
+                    "source": "database",
+                }
+            )
+        finally:
+            db.close()
+    except Exception:
+        logger.warning("Agent session history unavailable from DB", exc_info=True)
+        return JSONResponse(
+            status_code=503,
+            content={
+                "items": [],
+                "total": 0,
+                "limit": limit,
+                "offset": offset,
+                "source": "unavailable",
+            },
+        )
 
 
 @app.post("/relay/dispatch-task")
@@ -158,6 +272,7 @@ async def agent_ws(websocket: WebSocket, agent_id: str) -> None:
             token = auth_header[7:].strip()
 
     authenticated = False
+    authenticated_user_id: str | None = None
 
     # Try API key authentication — validate against the database
     if api_key and not authenticated:
@@ -177,6 +292,7 @@ async def agent_ws(websocket: WebSocket, agent_id: str) -> None:
                 )
                 if row is not None and hmac.compare_digest(row.key_hash or "", candidate_hash):
                     authenticated = True
+                    authenticated_user_id = row.user_id
             finally:
                 db.close()
         except Exception:
@@ -187,6 +303,25 @@ async def agent_ws(websocket: WebSocket, agent_id: str) -> None:
         claims = decode_token(token)
         if claims is not None:
             authenticated = True
+            claim_user_id = claims.get("user_id")
+            if isinstance(claim_user_id, str) and claim_user_id.strip():
+                authenticated_user_id = claim_user_id.strip()
+            elif isinstance(claims.get("sub"), str) and claims.get("sub", "").strip():
+                # Fallback: resolve user id from email subject claim.
+                subject_email = claims.get("sub", "").strip()
+                try:
+                    from services.common.db import SessionLocal
+                    from services.common.models import UserModel
+
+                    db = SessionLocal()
+                    try:
+                        user = db.query(UserModel).filter(UserModel.email == subject_email).first()
+                        if user and isinstance(user.id, str):
+                            authenticated_user_id = user.id
+                    finally:
+                        db.close()
+                except Exception:
+                    logger.debug("Failed resolving user_id from JWT sub", exc_info=True)
 
     if not authenticated:
         await websocket.close(code=4001)
@@ -200,32 +335,19 @@ async def agent_ws(websocket: WebSocket, agent_id: str) -> None:
         "connected_at": now,
         "last_seen_at": now,
         "manifest": {},
+        "user_id": authenticated_user_id,
     }
     logger.info("Agent %s connected via relay", safe_agent_id)
 
-    # Persist agent session to database (upsert)
-    try:
-        from services.common.db import SessionLocal
-        from services.common.models import AgentSessionModel
-
-        db = SessionLocal()
-        existing = db.query(AgentSessionModel).filter(AgentSessionModel.id == agent_id).first()
-        if existing:
-            existing.status = "connected"
-            existing.last_seen_at = datetime.fromtimestamp(now, tz=UTC)
-        else:
-            session = AgentSessionModel(
-                id=agent_id,
-                user_id=agent_id,  # fallback — real user_id from JWT when available
-                manifest={},
-                status="connected",
-                last_seen_at=datetime.fromtimestamp(now, tz=UTC),
-            )
-            db.add(session)
-        db.commit()
-        db.close()
-    except Exception:
-        logger.debug("DB upsert for agent %s failed (non-critical)", safe_agent_id, exc_info=True)
+    # Persist connection lifecycle in DB when user identity is known.
+    _persist_agent_session(
+        agent_id=agent_id,
+        user_id=authenticated_user_id,
+        status="connected",
+        last_seen_ts=now,
+        manifest={},
+        ip_address=websocket.client.host if websocket.client else None,
+    )
 
     heartbeat_task = asyncio.create_task(_heartbeat(websocket, agent_id))
 
@@ -251,8 +373,17 @@ async def agent_ws(websocket: WebSocket, agent_id: str) -> None:
             msg_type = msg.get("type", "")
 
             if msg_type == "manifest":
-                _connections[agent_id]["manifest"] = msg.get("payload", {})
+                manifest_payload = msg.get("payload", {})
+                if isinstance(manifest_payload, dict):
+                    _connections[agent_id]["manifest"] = manifest_payload
                 logger.info("Agent %s registered manifest", safe_agent_id)
+                _persist_agent_session(
+                    agent_id=agent_id,
+                    user_id=authenticated_user_id,
+                    status="connected",
+                    last_seen_ts=_connections[agent_id]["last_seen_at"],
+                    manifest=_connections[agent_id]["manifest"],
+                )
             elif msg_type == "finding":
                 logger.info(
                     "Agent %s submitted finding: %s",
@@ -275,21 +406,13 @@ async def agent_ws(websocket: WebSocket, agent_id: str) -> None:
     finally:
         heartbeat_task.cancel()
         _connections.pop(agent_id, None)
-        # Persist disconnection to database
-        try:
-            from services.common.db import SessionLocal
-            from services.common.models import AgentSessionModel
-
-            db = SessionLocal()
-            row = db.query(AgentSessionModel).filter(AgentSessionModel.id == agent_id).first()
-            if row:
-                row.status = "disconnected"
-            db.commit()
-            db.close()
-        except Exception:
-            logger.debug(
-                "DB status update for agent %s disconnect failed", safe_agent_id, exc_info=True
-            )
+        _persist_agent_session(
+            agent_id=agent_id,
+            user_id=authenticated_user_id,
+            status="disconnected",
+            last_seen_ts=time.time(),
+            manifest={},
+        )
 
 
 async def _heartbeat(websocket: WebSocket, agent_id: str) -> None:
