@@ -9,7 +9,7 @@ import logging
 import os
 import secrets
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any
 
@@ -30,6 +30,7 @@ from sqlalchemy import text
 from cosmicsec_platform.service_discovery import get_service_url
 from services.common.db import SessionLocal
 from services.common.egress import EgressOptions
+from services.common.models import FindingModel
 from services.common.observability import setup_observability
 
 try:
@@ -213,6 +214,23 @@ def _scans_today_for_org(org_id: str) -> int:
     )
 
 
+def _load_scan_from_cache_or_db(scan_id: str) -> dict[str, Any] | None:
+    """Fetch scan from in-memory cache first, then DB and rehydrate cache."""
+    cached = scans_db.get(scan_id)
+    if cached is not None:
+        return cached
+    try:
+        db = SessionLocal()
+        row = db_get_scan(db, scan_id)
+        db.close()
+        if row:
+            scans_db[scan_id] = row
+            return row
+    except Exception:
+        logger.warning("DB read failed for scan %s", scan_id, exc_info=True)
+    return None
+
+
 celery_app = None
 if Celery is not None:
     broker_url = os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0")
@@ -316,9 +334,9 @@ def _validate_ws_token(token: str | None) -> dict[str, Any] | None:
 
 async def perform_scan(scan_id: str, config: ScanConfig):
     """Background task to perform the actual scan"""
-    scan = scans_db.get(scan_id)
+    scan = _load_scan_from_cache_or_db(scan_id)
     if scan is None:
-        logger.error("Scan %s not found in cache", scan_id)
+        logger.error("Scan %s not found", scan_id)
         return
 
     try:
@@ -412,15 +430,21 @@ async def perform_scan(scan_id: str, config: ScanConfig):
             scan_id, {"scan_id": scan_id, "status": "completed", "progress": 100}
         )
 
-        # Count findings
-        scan_findings = [f for f in findings_db if f["scan_id"] == scan_id]
-        scan["findings_count"] = len(scan_findings)
-
-        # Severity breakdown
-        severity_breakdown: dict[str, int] = {}
-        for finding in scan_findings:
-            severity = finding["severity"]
-            severity_breakdown[severity] = severity_breakdown.get(severity, 0) + 1
+        # Count findings + severity from DB (fallback to in-memory cache)
+        try:
+            db = SessionLocal()
+            findings_count = count_findings(db, scan_id=scan_id)
+            severity_breakdown = get_severity_breakdown(db, scan_id=scan_id)
+            db.close()
+        except Exception:
+            logger.warning("DB count failed for scan %s", scan_id, exc_info=True)
+            scan_findings = [f for f in findings_db if f["scan_id"] == scan_id]
+            findings_count = len(scan_findings)
+            severity_breakdown: dict[str, int] = {}
+            for finding in scan_findings:
+                sev = finding["severity"]
+                severity_breakdown[sev] = severity_breakdown.get(sev, 0) + 1
+        scan["findings_count"] = findings_count
         scan["severity_breakdown"] = severity_breakdown
 
         # Persist final state to DB
@@ -433,7 +457,7 @@ async def perform_scan(scan_id: str, config: ScanConfig):
                     "status": "completed",
                     "progress": 100,
                     "completed_at": scan["completed_at"],
-                    "findings_count": scan["findings_count"],
+                    "findings_count": findings_count,
                     "severity_breakdown": severity_breakdown,
                 },
             )
@@ -449,7 +473,7 @@ async def perform_scan(scan_id: str, config: ScanConfig):
                         "scan_id": scan_id,
                         "target": config.target,
                         "status": scan["status"],
-                        "findings": scan_findings,
+                        "findings": [f for f in findings_db if f["scan_id"] == scan_id],
                         "severity_breakdown": severity_breakdown,
                         "updated_at": datetime.now(tz=UTC),
                     }
@@ -457,7 +481,7 @@ async def perform_scan(scan_id: str, config: ScanConfig):
                 upsert=True,
             )
 
-        logger.info(f"Scan {scan_id} completed successfully with {len(scan_findings)} findings")
+        logger.info(f"Scan {scan_id} completed successfully with {findings_count} findings")
 
     except Exception as e:
         logger.error(f"Scan {scan_id} failed: {str(e)}")
@@ -553,7 +577,8 @@ async def create_scan(config: ScanConfig, background_tasks: BackgroundTasks, req
 @app.post("/scans/{scan_id}/enqueue")
 async def enqueue_scan(scan_id: str):
     """Queue scan execution using Celery when available."""
-    if scan_id not in scans_db:
+    scan = _load_scan_from_cache_or_db(scan_id)
+    if scan is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scan not found")
 
     if celery_app is None:
@@ -561,7 +586,7 @@ async def enqueue_scan(scan_id: str):
 
     celery_app.send_task(
         "scan.perform",
-        kwargs={"scan_id": scan_id, "target": scans_db[scan_id]["target"]},
+        kwargs={"scan_id": scan_id, "target": scan["target"]},
     )
     return {"queued": True, "scan_id": scan_id}
 
@@ -569,18 +594,9 @@ async def enqueue_scan(scan_id: str):
 @app.get("/scans/{scan_id}", response_model=Scan)
 async def get_scan(scan_id: str):
     """Get scan details by ID — checks in-memory cache then database."""
-    if scan_id in scans_db:
-        return Scan(**scans_db[scan_id])
-
-    # Fallback to DB
-    try:
-        db = SessionLocal()
-        scan = db_get_scan(db, scan_id)
-        db.close()
-        if scan:
-            return Scan(**scan)
-    except Exception:
-        logger.warning("DB read failed for scan %s", scan_id, exc_info=True)
+    scan = _load_scan_from_cache_or_db(scan_id)
+    if scan:
+        return Scan(**scan)
 
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scan not found")
 
@@ -593,8 +609,7 @@ async def list_scans(status_filter: ScanStatus | None = None, limit: int = 10, o
         db = SessionLocal()
         scans = db_list_scans(db, status_filter=status_filter, limit=limit, offset=offset)
         db.close()
-        if scans:
-            return [Scan(**scan) for scan in scans]
+        return [Scan(**scan) for scan in scans]
     except Exception:
         logger.warning("DB list scans failed — falling back to in-memory", exc_info=True)
 
@@ -615,8 +630,7 @@ async def get_scan_findings(scan_id: str):
         db = SessionLocal()
         db_findings = list_findings_for_scan(db, scan_id)
         db.close()
-        if db_findings:
-            return [Finding(**f) for f in db_findings]
+        return [Finding(**f) for f in db_findings]
     except Exception:
         logger.warning("DB read findings failed for scan %s", scan_id, exc_info=True)
 
@@ -641,18 +655,20 @@ async def get_scan_findings(scan_id: str):
 async def delete_scan(scan_id: str):
     """Delete a scan and its findings from both DB and in-memory cache."""
     # Delete from DB
+    db_deleted = False
     try:
         db = SessionLocal()
-        db_delete_scan(db, scan_id)
+        db_deleted = db_delete_scan(db, scan_id)
         db.close()
     except Exception:
         logger.warning("DB delete failed for scan %s", scan_id, exc_info=True)
 
-    if scan_id not in scans_db:
+    in_memory_exists = scan_id in scans_db
+    if not db_deleted and not in_memory_exists:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scan not found")
 
     # Delete from in-memory cache
-    del scans_db[scan_id]
+    scans_db.pop(scan_id, None)
 
     global findings_db
     findings_db = [f for f in findings_db if f["scan_id"] != scan_id]
@@ -808,6 +824,109 @@ async def import_findings_batch(request: Request):
         db.close()
 
     return {"imported": imported, "scan_id": scan_id}
+
+
+@app.get("/findings")
+async def list_findings(
+    severity: str | None = None,
+    scan_id: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """List findings with optional severity/scan filters and pagination."""
+    try:
+        db = SessionLocal()
+        query = db.query(FindingModel)
+        if severity:
+            query = query.filter(FindingModel.severity == severity)
+        if scan_id:
+            query = query.filter(FindingModel.scan_id == scan_id)
+        total = query.count()
+        rows = (
+            query.order_by(FindingModel.created_at.desc())
+            .offset(offset)
+            .limit(limit)
+            .all()
+        )
+        db.close()
+        items = [
+            {
+                "id": r.id,
+                "scan_id": r.scan_id,
+                "title": r.title,
+                "severity": r.severity,
+                "description": r.description,
+                "tool": r.tool,
+                "target": r.target,
+                "cve_id": r.cve_id,
+                "cvss_score": r.cvss_score,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in rows
+        ]
+        return {
+            "items": items,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "filters": {"severity": severity, "scan_id": scan_id},
+        }
+    except Exception:
+        logger.warning("DB list findings failed", exc_info=True)
+        # Graceful fallback from in-memory cache for dev/test resilience
+        rows = findings_db
+        if severity:
+            rows = [r for r in rows if str(r.get("severity", "")).lower() == severity.lower()]
+        if scan_id:
+            rows = [r for r in rows if r.get("scan_id") == scan_id]
+        total = len(rows)
+        sliced = rows[offset : offset + limit]
+        return {
+            "items": sliced,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "filters": {"severity": severity, "scan_id": scan_id},
+        }
+
+
+@app.get("/findings/trending")
+async def findings_trending(days: int = 7) -> dict[str, Any]:
+    """Return daily severity trend for the latest N days."""
+    window_days = max(1, min(days, 90))
+    cutoff = datetime.now(tz=UTC) - timedelta(days=window_days)
+    series: dict[str, dict[str, int]] = {}
+
+    try:
+        db = SessionLocal()
+        rows = db.query(FindingModel).filter(FindingModel.created_at >= cutoff).all()
+        db.close()
+        for row in rows:
+            if not row.created_at:
+                continue
+            day_key = row.created_at.date().isoformat()
+            sev = str(row.severity or "info").lower()
+            day_bucket = series.setdefault(day_key, {})
+            day_bucket[sev] = day_bucket.get(sev, 0) + 1
+    except Exception:
+        logger.warning("DB trending query failed", exc_info=True)
+        for item in findings_db:
+            detected = item.get("detected_at")
+            if isinstance(detected, datetime):
+                if detected < cutoff:
+                    continue
+                day_key = detected.date().isoformat()
+            else:
+                day_key = datetime.now(tz=UTC).date().isoformat()
+            sev = str(item.get("severity", "info")).lower()
+            day_bucket = series.setdefault(day_key, {})
+            day_bucket[sev] = day_bucket.get(sev, 0) + 1
+
+    ordered_days = sorted(series.keys())
+    return {
+        "days": window_days,
+        "series": [{"date": d, "severity_breakdown": series[d]} for d in ordered_days],
+    }
 
 
 @app.get("/orgs/{org_id}/quotas")
