@@ -2932,6 +2932,17 @@ async def phase5_proxy(request: Request, path: str):
 _registered_agents: dict[str, dict] = {}
 # Active WebSocket connections keyed by agent_id
 _agent_ws_connections: dict[str, "WebSocket"] = {}
+# Agent task ledger keyed by agent_id
+_agent_tasks: dict[str, list[dict]] = {}
+
+
+class DispatchAgentTaskRequest(BaseModel):
+    """Dispatch payload for assigning a local execution task to an agent."""
+
+    tool: str
+    target: str = ""
+    args: list[str] = []
+    metadata: dict = {}
 
 
 @app.post("/api/agents/register")
@@ -3059,6 +3070,80 @@ async def list_agents(request: Request) -> JSONResponse:
     return JSONResponse(content={"agents": safe_agents, "total": len(safe_agents)})
 
 
+@app.post("/api/agents/{agent_id}/tasks")
+@limiter.limit("60/minute")
+async def dispatch_agent_task(agent_id: str, payload: DispatchAgentTaskRequest, request: Request):
+    """Dispatch a task to a connected agent and track lifecycle state."""
+    agent_id = _validate_uuid_param(agent_id, "agent_id")
+    principal, is_admin = await _resolve_authenticated_user(request)
+
+    agent = _registered_agents.get(agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    if not is_admin and agent.get("user_id") != principal:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    websocket = _agent_ws_connections.get(agent_id)
+    if websocket is None:
+        raise HTTPException(status_code=409, detail="Agent is not connected")
+
+    task_id = str(uuid.uuid4())
+    task_record = {
+        "task_id": task_id,
+        "agent_id": agent_id,
+        "tool": payload.tool,
+        "target": payload.target,
+        "args": payload.args,
+        "metadata": payload.metadata,
+        "status": "dispatched",
+        "progress": 0,
+        "created_at": time.time(),
+        "updated_at": time.time(),
+        "requested_by": principal,
+    }
+    _agent_tasks.setdefault(agent_id, []).append(task_record)
+
+    try:
+        await websocket.send_json(
+            {
+                "type": "task_assign",
+                "payload": {
+                    "task_id": task_id,
+                    "tool": payload.tool,
+                    "target": payload.target,
+                    "args": payload.args,
+                    "metadata": payload.metadata,
+                },
+            }
+        )
+    except Exception as exc:
+        task_record["status"] = "dispatch_failed"
+        task_record["updated_at"] = time.time()
+        logger.warning("Failed to dispatch task %s to agent %s: %s", task_id, agent_id, exc)
+        raise HTTPException(status_code=503, detail="Failed to dispatch task to agent")
+
+    return JSONResponse(content={"dispatched": True, "agent_id": agent_id, "task_id": task_id})
+
+
+@app.get("/api/agents/{agent_id}/tasks")
+@limiter.limit("120/minute")
+async def list_agent_tasks(agent_id: str, request: Request) -> JSONResponse:
+    """List recent task records for one agent."""
+    agent_id = _validate_uuid_param(agent_id, "agent_id")
+    principal, is_admin = await _resolve_authenticated_user(request)
+
+    agent = _registered_agents.get(agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    if not is_admin and agent.get("user_id") != principal:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    tasks = _agent_tasks.get(agent_id, [])
+    tasks_sorted = sorted(tasks, key=lambda t: float(t.get("created_at", 0)), reverse=True)
+    return JSONResponse(content={"agent_id": agent_id, "tasks": tasks_sorted[:100], "total": len(tasks)})
+
+
 @app.websocket("/ws/agent/{agent_id}")
 async def agent_websocket(websocket: WebSocket, agent_id: str) -> None:
     """WebSocket endpoint for a connected CLI agent.
@@ -3142,6 +3227,35 @@ async def agent_websocket(websocket: WebSocket, agent_id: str) -> None:
                     safe_agent_id,
                     _sanitize_log(msg.get("scan_id")),
                 )
+            elif msg_type == "task_ack":
+                task_id = str(msg.get("task_id", ""))
+                accepted = bool(msg.get("accepted", False))
+                for task in reversed(_agent_tasks.get(agent_id, [])):
+                    if task.get("task_id") == task_id:
+                        task["status"] = "accepted" if accepted else "rejected"
+                        task["updated_at"] = time.time()
+                        task["reason"] = msg.get("reason")
+                        break
+            elif msg_type == "task_progress":
+                task_id = str(msg.get("task_id", ""))
+                percent = int(msg.get("percent", 0))
+                for task in reversed(_agent_tasks.get(agent_id, [])):
+                    if task.get("task_id") == task_id:
+                        task["status"] = "running"
+                        task["progress"] = max(0, min(percent, 100))
+                        task["updated_at"] = time.time()
+                        task["message"] = msg.get("message")
+                        break
+            elif msg_type == "task_result":
+                task_id = str(msg.get("task_id", ""))
+                result = msg.get("result", {})
+                for task in reversed(_agent_tasks.get(agent_id, [])):
+                    if task.get("task_id") == task_id:
+                        task["status"] = "completed" if result.get("success") else "failed"
+                        task["progress"] = 100
+                        task["updated_at"] = time.time()
+                        task["result"] = result
+                        break
             else:
                 logger.debug("Agent %s unknown message type: %s", safe_agent_id, msg_type)
 
