@@ -282,6 +282,7 @@ fake_sessions_db = {}
 fake_password_reset_db: dict[str, dict[str, Any]] = {}
 fake_2fa_resend_tracker: dict[str, list[float]] = {}
 scan_defaults_db: dict[str, dict[str, Any]] = {}
+oauth_state_store: dict[str, dict[str, Any]] = {}
 audit_logs = []
 platform_config = {
     "maintenance_mode": "false",
@@ -290,6 +291,7 @@ platform_config = {
 }
 hardware_keys_db = {}
 sms_challenges_db = {}
+OAUTH_STATE_TTL_SECONDS = int(os.getenv("COSMICSEC_OAUTH_STATE_TTL_SECONDS", "600"))
 
 # Multi-tenant billing and retention (Phase 3)
 tenant_billing: dict[str, dict[str, Any]] = {}
@@ -449,6 +451,22 @@ def delete_session_from_db(session_id: str) -> None:
     except Exception:
         logger.warning("Failed to delete session %s from DB", sanitize_for_log(session_id))
         db.rollback()
+    finally:
+        db.close()
+
+
+def session_token_hash_from_db(session_id: str) -> str | None:
+    """Return persisted session token hash for a session id when available."""
+    db = _get_db_session()
+    if db is None:
+        return None
+    try:
+        row = db.query(SessionModel).filter(SessionModel.id == session_id).first()
+        if row is None:
+            return None
+        return str(row.token_hash or "")
+    except Exception:
+        return None
     finally:
         db.close()
 
@@ -869,6 +887,79 @@ def _store_session(session_id: str, email: str, refresh_token: str) -> None:
     save_session_to_db(session_id, email, refresh_token)
 
 
+def _session_matches_refresh_token(session_id: str, refresh_token: str) -> bool:
+    """Validate refresh-token/session binding across Redis, DB, and in-memory fallback."""
+    candidate_hash = _hash_api_key_token(refresh_token)
+
+    if redis_client is not None:
+        session_data = redis_client.get(f"session:{session_id}")
+        if session_data:
+            parts = session_data.split(":", 1)
+            if len(parts) == 2:
+                return hmac.compare_digest(parts[1], refresh_token)
+
+    memory_entry = fake_sessions_db.get(session_id)
+    if memory_entry:
+        parts = memory_entry.split(":", 1)
+        if len(parts) == 2 and hmac.compare_digest(parts[1], refresh_token):
+            return True
+
+    db_hash = session_token_hash_from_db(session_id)
+    if db_hash:
+        return hmac.compare_digest(db_hash, candidate_hash)
+
+    return False
+
+
+def _store_oauth_state(state: str, provider: str, request: Request) -> None:
+    """Store OAuth state with minimal request context for CSRF validation."""
+    now = datetime.now(tz=UTC)
+    expiry = now + timedelta(seconds=OAUTH_STATE_TTL_SECONDS)
+    oauth_state_store[state] = {
+        "provider": provider,
+        "client_ip": request.client.host if request.client else "",
+        "user_agent": request.headers.get("user-agent", ""),
+        "created_at": now.isoformat(),
+        "expires_at": expiry.isoformat(),
+    }
+
+    expired = []
+    for candidate, payload in oauth_state_store.items():
+        try:
+            item_expiry = datetime.fromisoformat(str(payload.get("expires_at")))
+            if item_expiry <= now:
+                expired.append(candidate)
+        except Exception:
+            expired.append(candidate)
+    for candidate in expired:
+        oauth_state_store.pop(candidate, None)
+
+
+def _consume_oauth_state(state: str, provider: str, request: Request) -> bool:
+    """Consume and validate a previously issued OAuth state value."""
+    stored = oauth_state_store.pop(state, None)
+    if not stored:
+        return False
+
+    stored_provider = str(stored.get("provider", "")).strip().lower()
+    if stored_provider != provider:
+        return False
+
+    try:
+        expires_at = datetime.fromisoformat(str(stored.get("expires_at")))
+        if expires_at <= datetime.now(tz=UTC):
+            return False
+    except Exception:
+        return False
+
+    expected_ip = str(stored.get("client_ip", ""))
+    current_ip = request.client.host if request.client else ""
+    if expected_ip and current_ip and expected_ip != current_ip:
+        return False
+
+    return True
+
+
 def _audit(action: str, actor: str, detail: str) -> None:
     _audit_entry(action, actor, detail, org_id=None)
 
@@ -1044,12 +1135,14 @@ def create_access_token(data: dict, expires_delta: timedelta | None = None) -> s
     return encoded_jwt
 
 
-def create_refresh_token(data: dict) -> str:
+def create_refresh_token(data: dict, session_id: str | None = None) -> str:
     """Create JWT refresh token"""
     to_encode = data.copy()
     expire = datetime.now(tz=UTC) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
 
     to_encode.update({"exp": expire, "iat": datetime.now(tz=UTC), "type": "refresh"})
+    if session_id:
+        to_encode["sid"] = session_id
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
@@ -1207,9 +1300,9 @@ async def login(user_data: UserLogin, request: Request):
     # Create tokens
     access_token_data = {"sub": user["email"], "user_id": user["id"], "role": user["role"]}
 
-    access_token = create_access_token(access_token_data)
-    refresh_token = create_refresh_token(access_token_data)
     session_id = secrets.token_urlsafe(12)
+    access_token = create_access_token(access_token_data)
+    refresh_token = create_refresh_token(access_token_data, session_id)
     _store_session(session_id, user_data.email, refresh_token)
     _audit("user.login", user_data.email, f"session={session_id}")
 
@@ -1235,6 +1328,19 @@ async def refresh(payload: RefreshRequest):
                 status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token type"
             )
 
+        session_id = str(token_payload.get("sid") or "").strip()
+        if not session_id:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Refresh token missing session context",
+            )
+
+        if not _session_matches_refresh_token(session_id, payload.refresh_token):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Refresh session is invalid or expired",
+            )
+
         access_token_data = {
             "sub": token_payload.get("sub"),
             "user_id": token_payload.get("user_id"),
@@ -1242,7 +1348,10 @@ async def refresh(payload: RefreshRequest):
         }
 
         new_access_token = create_access_token(access_token_data)
-        new_refresh_token = create_refresh_token(access_token_data)
+        new_refresh_token = create_refresh_token(access_token_data, session_id)
+        subject_email = str(token_payload.get("sub") or "").strip()
+        if subject_email:
+            _store_session(session_id, subject_email, new_refresh_token)
 
         return {
             "access_token": new_access_token,
@@ -1301,9 +1410,9 @@ async def verify_2fa_login(payload: Verify2FALoginRequest):
         raise HTTPException(status_code=401, detail="Invalid verification code")
 
     access_token_data = {"sub": user["email"], "user_id": user["id"], "role": user["role"]}
-    access_token = create_access_token(access_token_data)
-    refresh_token = create_refresh_token(access_token_data)
     session_id = secrets.token_urlsafe(12)
+    access_token = create_access_token(access_token_data)
+    refresh_token = create_refresh_token(access_token_data, session_id)
     _store_session(session_id, payload.email, refresh_token)
     _audit("2fa.verify_login", payload.email, f"session={session_id}")
 
@@ -1466,6 +1575,10 @@ def _oauth_provider_config(provider: str) -> dict[str, str]:
 
 def _ensure_oauth_user(email: str, full_name: str, provider: str) -> dict:
     user = fake_users_db.get(email)
+    if not user:
+        user = load_user_from_db(email)
+        if user:
+            fake_users_db[email] = user
     if user:
         return user
     user = {
@@ -1479,6 +1592,7 @@ def _ensure_oauth_user(email: str, full_name: str, provider: str) -> dict:
         "auth_provider": provider,
     }
     fake_users_db[email] = user
+    save_user_to_db(user)
     return user
 
 
@@ -1556,11 +1670,12 @@ async def _verify_oidc_id_token(
 
 
 @app.post("/oauth2/{provider}", response_model=OAuthStartResponse)
-async def oauth_start(provider: str):
+async def oauth_start(provider: str, request: Request):
     """Start OAuth2 login flow with provider-specific authorize URL."""
     provider = provider.lower()
     selected = _oauth_provider_config(provider)
     state = secrets.token_urlsafe(18)
+    _store_oauth_state(state, provider, request)
     params = {
         "client_id": selected["client_id"],
         "redirect_uri": selected["redirect_uri"],
@@ -1573,10 +1688,13 @@ async def oauth_start(provider: str):
 
 
 @app.get("/oauth2/{provider}/callback")
-async def oauth_callback(provider: str, code: str, state: str | None = None):
+async def oauth_callback(provider: str, request: Request, code: str, state: str | None = None):
     """Exchange provider auth code and issue CosmicSec platform tokens."""
     provider = provider.lower()
     selected = _oauth_provider_config(provider)
+
+    if not state or not _consume_oauth_state(state, provider, request):
+        raise HTTPException(status_code=400, detail="Invalid OAuth state")
 
     if not selected["client_id"] or not selected["client_secret"]:
         logger.warning(
@@ -1585,12 +1703,15 @@ async def oauth_callback(provider: str, code: str, state: str | None = None):
         )
         synthetic_email = f"{provider}_user@oauth.local"
         user = _ensure_oauth_user(synthetic_email, f"{provider.title()} User", provider)
+        session_id = secrets.token_urlsafe(12)
         access_token = create_access_token(
             {"sub": user["email"], "user_id": user["id"], "role": user["role"]}
         )
         refresh_token = create_refresh_token(
-            {"sub": user["email"], "user_id": user["id"], "role": user["role"]}
+            {"sub": user["email"], "user_id": user["id"], "role": user["role"]},
+            session_id,
         )
+        _store_session(session_id, user["email"], refresh_token)
         return {
             "provider": provider,
             "state": state,
@@ -1598,6 +1719,7 @@ async def oauth_callback(provider: str, code: str, state: str | None = None):
             "refresh_token": refresh_token,
             "token_type": "bearer",  # nosec B105
             "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+            "session_id": session_id,
             "user": {"email": user["email"], "full_name": user["full_name"]},
             "mode": "degraded-local-fallback",
         }
@@ -1669,12 +1791,15 @@ async def oauth_callback(provider: str, code: str, state: str | None = None):
             email = f"{provider}_{secrets.token_hex(4)}@oauth.local"
         user = _ensure_oauth_user(email, full_name or email.split("@")[0], provider)
 
+    session_id = secrets.token_urlsafe(12)
     access_token = create_access_token(
         {"sub": user["email"], "user_id": user["id"], "role": user["role"]}
     )
     refresh_token = create_refresh_token(
-        {"sub": user["email"], "user_id": user["id"], "role": user["role"]}
+        {"sub": user["email"], "user_id": user["id"], "role": user["role"]},
+        session_id,
     )
+    _store_session(session_id, user["email"], refresh_token)
     _audit("oauth.login", user["email"], f"provider={provider}")
     return {
         "provider": provider,
@@ -1683,6 +1808,7 @@ async def oauth_callback(provider: str, code: str, state: str | None = None):
         "refresh_token": refresh_token,
         "token_type": "bearer",  # nosec B105
         "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        "session_id": session_id,
         "user": {"email": user["email"], "full_name": user["full_name"]},
     }
 
