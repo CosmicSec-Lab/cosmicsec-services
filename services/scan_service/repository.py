@@ -14,6 +14,7 @@ from collections import OrderedDict
 from datetime import UTC, datetime
 from typing import Any
 
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from services.common.models import FindingModel, ScanModel
@@ -232,36 +233,133 @@ def create_finding(db: Session, finding_data: dict[str, Any]) -> dict[str, Any]:
     """Insert a finding into the database."""
     finding_id = finding_data.get("id") or f"find-{uuid.uuid4().hex[:12]}"
 
-    row = FindingModel(
-        id=finding_id,
-        scan_id=finding_data.get("scan_id"),
-        user_id=finding_data.get("user_id"),
-        title=finding_data["title"],
-        severity=finding_data.get("severity", "info"),
-        description=finding_data.get("description"),
-        evidence=finding_data.get("evidence"),
-        tool=finding_data.get("category") or finding_data.get("tool"),
-        target=finding_data.get("target"),
-        cve_id=finding_data.get("cve_id"),
-        cvss_score=finding_data.get("cvss_score"),
-        source=finding_data.get("source", "web_scan"),
-        extra={"recommendation": finding_data.get("recommendation", "")},
-    )
-    db.add(row)
-    db.commit()
-    db.refresh(row)
-    return _finding_to_dict(row)
+    try:
+        row = FindingModel(
+            id=finding_id,
+            scan_id=finding_data.get("scan_id"),
+            user_id=finding_data.get("user_id"),
+            title=finding_data["title"],
+            severity=finding_data.get("severity", "info"),
+            description=finding_data.get("description"),
+            evidence=finding_data.get("evidence"),
+            tool=finding_data.get("category") or finding_data.get("tool"),
+            target=finding_data.get("target"),
+            cve_id=finding_data.get("cve_id"),
+            cvss_score=finding_data.get("cvss_score"),
+            source=finding_data.get("source", "web_scan"),
+            extra={"recommendation": finding_data.get("recommendation", "")},
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return _finding_to_dict(row)
+    except Exception:
+        # Backward-compatible fallback for deployments where findings.user_id is absent.
+        db.rollback()
+        logger.warning("Falling back to raw SQL insert for finding %s", finding_id, exc_info=True)
+
+        created_at = finding_data.get("detected_at") or datetime.now(tz=UTC)
+        payload_extra = {"recommendation": finding_data.get("recommendation", "")}
+        db.execute(
+            text(
+                """
+                INSERT INTO findings (
+                    id, scan_id, title, severity, description, evidence,
+                    tool, target, cve_id, cvss_score, source, extra, created_at, updated_at
+                ) VALUES (
+                    :id, :scan_id, :title, :severity, :description, :evidence,
+                    :tool, :target, :cve_id, :cvss_score, :source, :extra, :created_at, :updated_at
+                )
+                """
+            ),
+            {
+                "id": finding_id,
+                "scan_id": finding_data.get("scan_id"),
+                "title": finding_data["title"],
+                "severity": finding_data.get("severity", "info"),
+                "description": finding_data.get("description"),
+                "evidence": finding_data.get("evidence"),
+                "tool": finding_data.get("category") or finding_data.get("tool"),
+                "target": finding_data.get("target"),
+                "cve_id": finding_data.get("cve_id"),
+                "cvss_score": finding_data.get("cvss_score"),
+                "source": finding_data.get("source", "web_scan"),
+                "extra": payload_extra,
+                "created_at": created_at,
+                "updated_at": datetime.now(tz=UTC),
+            },
+        )
+        db.commit()
+        return {
+            "id": finding_id,
+            "scan_id": finding_data.get("scan_id"),
+            "title": finding_data["title"],
+            "description": finding_data.get("description"),
+            "severity": finding_data.get("severity", "info"),
+            "cvss_score": finding_data.get("cvss_score"),
+            "category": finding_data.get("category") or finding_data.get("tool") or "general",
+            "tool": finding_data.get("tool") or finding_data.get("category"),
+            "target": finding_data.get("target"),
+            "cve_id": finding_data.get("cve_id"),
+            "evidence": finding_data.get("evidence"),
+            "recommendation": finding_data.get("recommendation", ""),
+            "detected_at": created_at,
+            "created_at": created_at,
+        }
 
 
 def list_findings_for_scan(db: Session, scan_id: str) -> list[dict[str, Any]]:
     """Retrieve all findings belonging to a scan."""
-    rows = (
-        db.query(FindingModel)
-        .filter(FindingModel.scan_id == scan_id)
-        .order_by(FindingModel.created_at.desc())
-        .all()
-    )
-    return [_finding_to_dict(r) for r in rows]
+    try:
+        rows = (
+            db.query(FindingModel)
+            .filter(FindingModel.scan_id == scan_id)
+            .order_by(FindingModel.created_at.desc())
+            .all()
+        )
+        return [_finding_to_dict(r) for r in rows]
+    except Exception:
+        # Backward-compatible fallback for deployments where ORM metadata is ahead of schema.
+        db.rollback()
+        logger.warning("Falling back to raw SQL list for scan %s", scan_id, exc_info=True)
+        rows = db.execute(
+            text(
+                """
+                SELECT id, scan_id, title, description, severity, cvss_score,
+                       tool, target, cve_id, evidence, extra, created_at
+                FROM findings
+                WHERE scan_id = :scan_id
+                ORDER BY created_at DESC
+                """
+            ),
+            {"scan_id": scan_id},
+        ).all()
+
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            recommendation = ""
+            extra = row[10]
+            if isinstance(extra, dict):
+                recommendation = str(extra.get("recommendation", ""))
+            result.append(
+                {
+                    "id": row[0],
+                    "scan_id": row[1],
+                    "title": row[2],
+                    "description": row[3],
+                    "severity": row[4],
+                    "cvss_score": row[5],
+                    "category": row[6] or "general",
+                    "tool": row[6],
+                    "target": row[7],
+                    "cve_id": row[8],
+                    "evidence": row[9],
+                    "recommendation": recommendation,
+                    "detected_at": row[11],
+                    "created_at": row[11],
+                }
+            )
+        return result
 
 
 def count_findings(db: Session, scan_id: str | None = None) -> int:

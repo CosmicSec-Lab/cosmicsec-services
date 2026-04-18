@@ -18,6 +18,7 @@ import os
 import re
 from typing import Any
 
+from services.common.egress import EgressOptions, create_async_client
 from services.common.security_utils import sanitize_for_log, validate_outbound_url
 
 logger = logging.getLogger(__name__)
@@ -290,7 +291,7 @@ _TAG_PRIORITY: dict[str, int] = {
 # ---------------------------------------------------------------------------
 
 
-async def fingerprint_target(url: str) -> dict[str, Any]:
+async def fingerprint_target(url: str, egress_options: EgressOptions | None = None) -> dict[str, Any]:
     """
     Probe a target URL to identify its technology stack.
 
@@ -316,11 +317,15 @@ async def fingerprint_target(url: str) -> dict[str, Any]:
     risk_multiplier = 1.0
 
     try:
-        async with httpx.AsyncClient(  # type: ignore[attr-defined]
+        client, _ = create_async_client(
+            "scan-service",
+            target_url=safe_url,
+            options=egress_options,
             timeout=10,
             follow_redirects=True,
             verify=_tls_verify_enabled(),
-        ) as client:
+        )
+        async with client:
             resp = await client.get(safe_url)
             headers = {k.lower(): v.lower() for k, v in resp.headers.items()}
             body_snip = resp.text[:15000].lower()
@@ -462,6 +467,7 @@ def build_scan_plan(
 async def smart_scan(
     url: str,
     previously_run: list[str] | None = None,
+    egress_options: EgressOptions | None = None,
 ) -> dict[str, Any]:
     """
     Full smart scan: fingerprint the target then generate a prioritised scan plan.
@@ -473,7 +479,7 @@ async def smart_scan(
     Returns:
         Combined fingerprint + scan plan dict.
     """
-    fp = await fingerprint_target(url)
+    fp = await fingerprint_target(url, egress_options=egress_options)
     plan = build_scan_plan(fp, previously_run)
     return {
         "url": url,

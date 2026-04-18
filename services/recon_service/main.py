@@ -21,6 +21,7 @@ from urllib.parse import quote, urlparse
 import httpx
 from fastapi import FastAPI
 from pydantic import BaseModel
+from services.common.egress import EgressOptions, EgressStrategyError, create_async_client
 
 try:
     import redis as _redis_module
@@ -64,6 +65,12 @@ app = FastAPI(title="CosmicSec Recon Service", version="1.0.0")
 
 class ReconRequest(BaseModel):
     target: str
+    use_proxy_pool: bool = False
+    proxy_url: str | None = None
+    rotate_identity: bool = False
+    client_profile: str | None = None
+    use_tor: bool = False
+    tor_mode: str | None = None
 
 
 _SAFE_HOST_RE = re.compile(r"^[a-z0-9.-]+$", re.IGNORECASE)
@@ -232,9 +239,37 @@ async def run_recon(payload: ReconRequest) -> dict:
             "reason": "target must be a valid hostname or domain",
             "timestamp": datetime.now(tz=UTC).isoformat(),
         }
+
     dns = _dns_recon(target)
 
-    async with httpx.AsyncClient() as client:
+    try:
+        client, network = create_async_client(
+            "recon-service",
+            target_url=f"http://{target}",
+            options=EgressOptions(
+                use_proxy_pool=payload.use_proxy_pool,
+                proxy_url=payload.proxy_url,
+                rotate_identity=payload.rotate_identity,
+                client_profile=payload.client_profile,
+                use_tor=payload.use_tor,
+                tor_mode=payload.tor_mode if payload.tor_mode in {"enabled", "disabled", "auto"} else None,
+            ),
+            timeout=10.0,
+        )
+    except EgressStrategyError as exc:
+        return {
+            "status": "rejected",
+            "reason": str(exc),
+            "timestamp": datetime.now(tz=UTC).isoformat(),
+        }
+    except Exception:
+        return {
+            "status": "rejected",
+            "reason": "Unable to initialize outbound client for selected network strategy",
+            "timestamp": datetime.now(tz=UTC).isoformat(),
+        }
+
+    async with client:
         shodan = await _shodan_lookup(client, target)
         virustotal = await _virustotal_lookup(client, target)
         crtsh = await _crtsh_lookup(client, target)
@@ -248,12 +283,23 @@ async def run_recon(payload: ReconRequest) -> dict:
         "virustotal": virustotal,
         "crtsh": crtsh,
         "rdap": rdap,
+        "network_profile": {
+            "profile": network.get("profile"),
+            "proxy_enabled": bool(network.get("proxy_url")),
+            "tor_enabled": bool(network.get("tor_enabled")),
+            "tor_mode": network.get("tor_mode"),
+            "rotating_identity": bool(network.get("rotating_identity")),
+        },
         "findings": [
             {
                 "source": "dns",
                 "summary": f"Resolved addresses for {target}: {', '.join(dns['ips']) if dns['ips'] else 'none'}",
             },
             {"source": "osint", "summary": f"External intelligence checks completed for {target}"},
+            {
+                "source": "network-strategy",
+                "summary": "Applied configured proxy / identity strategy for outbound recon requests.",
+            },
             {
                 "source": "legacy-merge",
                 "summary": "Merged legacy CT-log and WHOIS-style domain intelligence into hybrid recon flow.",

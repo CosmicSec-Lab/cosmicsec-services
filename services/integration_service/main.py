@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from services.common.db import SessionLocal, get_db
+from services.common.egress import create_async_client
 from services.common.models import IntegrationConfigModel, IntegrationEventModel
 from services.common.security_utils import sanitize_for_log, validate_outbound_url
 
@@ -96,7 +97,12 @@ async def _forward_post(url: str | None, payload: dict[str, Any]) -> bool:
     if not safe_url:
         logger.warning("Blocked outbound webhook URL: %s", sanitize_for_log(url))
         return False
-    async with httpx.AsyncClient() as client:
+    client, _ = create_async_client(
+        "integration-service",
+        target_url=safe_url,
+        timeout=5.0,
+    )
+    async with client:
         try:
             await client.post(safe_url, json=payload, timeout=5.0)
             return True

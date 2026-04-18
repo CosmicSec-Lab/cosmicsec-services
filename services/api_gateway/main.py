@@ -485,6 +485,17 @@ async def health_check():
     }
 
 
+@app.get("/metrics")
+async def metrics() -> PlainTextResponse:
+    """Minimal Prometheus-style metrics endpoint to avoid probe 404 noise."""
+    body = (
+        "# HELP cosmicsec_api_gateway_up API gateway health status\n"
+        "# TYPE cosmicsec_api_gateway_up gauge\n"
+        "cosmicsec_api_gateway_up 1\n"
+    )
+    return PlainTextResponse(content=body, media_type="text/plain; version=0.0.4")
+
+
 @app.get("/api/status")
 @limiter.limit("100/minute")
 async def api_status(request: Request):
@@ -791,6 +802,7 @@ async def global_search(request: Request, q: str, limit: int = 10):
     return {"scans": scans, "findings": findings, "agents": agents, "reports": reports}
 
 
+@app.post("/api/auth/register")
 async def register(request: Request):
     """Proxy registration request to auth service"""
     data = await request.json()
@@ -1149,6 +1161,30 @@ async def create_scan(request: Request):
     )
 
 
+@app.get("/api/scans")
+@limiter.limit("120/minute")
+async def list_scans(request: Request):
+    """List scans for the current user/org workspace context."""
+    query_params = dict(request.query_params)
+    headers = {}
+    for h in ["Authorization", "X-Org-Id", "X-Workspace-Id", "X-API-Key"]:
+        if request.headers.get(h):
+            headers[h] = request.headers.get(h)
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(
+                _build_service_url("scan", "/scans"),
+                params=query_params,
+                headers=headers,
+                timeout=15.0,
+            )
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except httpx.HTTPError as e:
+            logger.error("Scan service list error: %s", e)
+            raise HTTPException(status_code=503, detail="Scan service unavailable")
+
+
 @app.post("/api/findings/import")
 @limiter.limit("20/minute")
 async def import_findings(request: Request):
@@ -1172,6 +1208,68 @@ async def import_findings(request: Request):
             raise HTTPException(status_code=503, detail="Scan service unavailable")
 
 
+@app.get("/api/findings")
+@limiter.limit("120/minute")
+async def list_findings(request: Request):
+    """Aggregate findings across recent scans for dashboard and timeline views."""
+    params = dict(request.query_params)
+    try:
+        limit = int(params.get("limit", "50"))
+    except ValueError:
+        limit = 50
+    limit = max(1, min(limit, 200))
+
+    headers = {}
+    for h in ["Authorization", "X-Org-Id", "X-Workspace-Id", "X-API-Key"]:
+        if request.headers.get(h):
+            headers[h] = request.headers.get(h)
+
+    findings = []
+    async with httpx.AsyncClient() as client:
+        try:
+            scans_resp = await client.get(
+                _build_service_url("scan", "/scans"),
+                params={"limit": min(limit, 50)},
+                headers=headers,
+                timeout=10.0,
+            )
+            if scans_resp.status_code != 200:
+                return {"items": []}
+
+            scans_data = scans_resp.json()
+            scans = scans_data if isinstance(scans_data, list) else scans_data.get("items", [])
+
+            for scan in scans:
+                scan_id = str(scan.get("id") or "").strip()
+                if not scan_id:
+                    continue
+                try:
+                    f_resp = await client.get(
+                        _build_service_url("scan", f"/scans/{scan_id}/findings"),
+                        headers=headers,
+                        timeout=10.0,
+                    )
+                    if f_resp.status_code != 200:
+                        continue
+                    scan_findings = f_resp.json()
+                    if not isinstance(scan_findings, list):
+                        continue
+                    for finding in scan_findings:
+                        if not isinstance(finding, dict):
+                            continue
+                        normalized = dict(finding)
+                        normalized.setdefault("scan_id", scan_id)
+                        findings.append(normalized)
+                        if len(findings) >= limit:
+                            return {"items": findings}
+                except httpx.HTTPError:
+                    continue
+        except httpx.HTTPError:
+            return {"items": []}
+
+    return {"items": findings}
+
+
 @app.get("/api/scans/{scan_id}")
 @limiter.limit("60/minute")
 async def get_scan(request: Request, scan_id: str):
@@ -1185,6 +1283,28 @@ async def get_scan(request: Request, scan_id: str):
         timeout=10.0,
         route_key="scan.get",
     )
+
+
+@app.get("/api/scans/{scan_id}/findings")
+@limiter.limit("120/minute")
+async def get_scan_findings(request: Request, scan_id: str):
+    """Retrieve findings for a specific scan."""
+    headers = {}
+    for h in ["Authorization", "X-Org-Id", "X-Workspace-Id", "X-API-Key"]:
+        if request.headers.get(h):
+            headers[h] = request.headers.get(h)
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(
+                _build_service_url("scan", f"/scans/{scan_id}/findings"),
+                headers=headers,
+                timeout=15.0,
+            )
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except httpx.HTTPError as e:
+            logger.error("Scan service findings error for %s: %s", _sanitize_log(scan_id), e)
+            raise HTTPException(status_code=503, detail="Scan service unavailable")
 
 
 @app.get("/api/info")

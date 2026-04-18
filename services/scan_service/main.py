@@ -23,11 +23,13 @@ from fastapi import (
     WebSocketDisconnect,
     status,
 )
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
 from cosmicsec_platform.service_discovery import get_service_url
 from services.common.db import SessionLocal
+from services.common.egress import EgressOptions
 from services.common.observability import setup_observability
 
 try:
@@ -123,6 +125,28 @@ class ScanConfig(BaseModel):
     depth: int = Field(default=1, ge=1, le=5, description="Scan depth (1-5)")
     timeout: int = Field(default=300, ge=60, le=3600, description="Timeout in seconds")
     options: dict | None = Field(default={}, description="Additional scan options")
+
+
+def _normalize_tor_mode(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    mode = value.strip().lower()
+    if mode in {"enabled", "disabled", "auto"}:
+        return mode
+    return None
+
+
+def _egress_options_from_payload(payload: dict[str, Any] | None) -> EgressOptions | None:
+    source = payload or {}
+    tor_mode = _normalize_tor_mode(source.get("tor_mode"))
+    return EgressOptions(
+        use_proxy_pool=bool(source.get("use_proxy_pool", False)),
+        proxy_url=source.get("proxy_url"),
+        rotate_identity=bool(source.get("rotate_identity", False)),
+        client_profile=source.get("client_profile"),
+        use_tor=bool(source.get("use_tor", False)),
+        tor_mode=tor_mode,
+    )
 
 
 class Scan(BaseModel):
@@ -456,6 +480,17 @@ async def perform_scan(scan_id: str, config: ScanConfig):
 async def health_check():
     """Health check endpoint"""
     return {"status": "healthy", "service": "scan", "timestamp": datetime.now(tz=UTC).isoformat()}
+
+
+@app.get("/metrics")
+async def metrics() -> PlainTextResponse:
+    """Minimal Prometheus-compatible metrics endpoint."""
+    body = (
+        "# HELP cosmicsec_scan_service_up Scan service health status\n"
+        "# TYPE cosmicsec_scan_service_up gauge\n"
+        "cosmicsec_scan_service_up 1\n"
+    )
+    return PlainTextResponse(content=body, media_type="text/plain; version=0.0.4")
 
 
 @app.post("/scans", response_model=Scan)
@@ -843,6 +878,12 @@ class FuzzRequest(BaseModel):
         default=150, ge=10, le=500, description="Maximum HTTP requests to send"
     )
     timeout: int = Field(default=8, ge=2, le=30, description="Per-request timeout seconds")
+    use_proxy_pool: bool = False
+    proxy_url: str | None = None
+    rotate_identity: bool = False
+    client_profile: str | None = None
+    use_tor: bool = False
+    tor_mode: str | None = None
 
 
 class ContainerScanRequest(BaseModel):
@@ -857,6 +898,12 @@ class SmartScanRequest(BaseModel):
     previously_run: list[str] | None = Field(
         default=None, description="Scan types already executed"
     )
+    use_proxy_pool: bool = False
+    proxy_url: str | None = None
+    rotate_identity: bool = False
+    client_profile: str | None = None
+    use_tor: bool = False
+    tor_mode: str | None = None
 
 
 class CloudScanRequest(BaseModel):
@@ -989,7 +1036,12 @@ async def cancel_monitor_job(job_id: str) -> dict:
 
 @app.post("/scans/fuzz")
 async def fuzz_api(payload: FuzzRequest) -> dict:
-    fuzzer = APIFuzzer(timeout=payload.timeout, max_requests=payload.max_requests)
+    egress_options = _egress_options_from_payload(payload.model_dump())
+    fuzzer = APIFuzzer(
+        timeout=payload.timeout,
+        max_requests=payload.max_requests,
+        egress_options=egress_options,
+    )
     return await fuzzer.fuzz(
         base_url=payload.base_url,
         openapi_spec=payload.openapi_spec,
@@ -1004,7 +1056,12 @@ async def scan_container(payload: ContainerScanRequest) -> dict:
 
 @app.post("/scans/smart-plan")
 async def smart_scan_plan(payload: SmartScanRequest) -> dict:
-    return await smart_scan(payload.url, previously_run=payload.previously_run)
+    egress_options = _egress_options_from_payload(payload.model_dump())
+    return await smart_scan(
+        payload.url,
+        previously_run=payload.previously_run,
+        egress_options=egress_options,
+    )
 
 
 @app.post("/scans/cloud")

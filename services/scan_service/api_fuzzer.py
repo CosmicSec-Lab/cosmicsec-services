@@ -19,6 +19,7 @@ from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
+from services.common.egress import EgressOptions, create_async_client
 from services.common.security_utils import sanitize_for_log, validate_outbound_url
 
 logger = logging.getLogger(__name__)
@@ -251,9 +252,15 @@ class APIFuzzer:
         result = await fuzzer.fuzz("https://api.example.com", attack_types=["sqli", "xss"])
     """
 
-    def __init__(self, timeout: int = 8, max_requests: int = 150):
+    def __init__(
+        self,
+        timeout: int = 8,
+        max_requests: int = 150,
+        egress_options: EgressOptions | None = None,
+    ):
         self.timeout = timeout
         self.max_requests = max_requests
+        self.egress_options = egress_options
         self._request_count = 0
 
     async def fuzz(
@@ -300,11 +307,15 @@ class APIFuzzer:
         if not _HTTPX_AVAILABLE:
             findings = self._simulate(base_url, selected)
         else:
-            async with httpx.AsyncClient(  # type: ignore[attr-defined]
+            client, _ = create_async_client(
+                "scan-service",
+                target_url=safe_base_url,
+                options=self.egress_options,
                 timeout=self.timeout,
                 follow_redirects=True,
                 verify=_tls_verify_enabled(),
-            ) as client:
+            )
+            async with client:
                 for ep in endpoints:
                     if self._request_count >= self.max_requests:
                         break

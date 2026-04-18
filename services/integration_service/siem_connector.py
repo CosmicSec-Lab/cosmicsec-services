@@ -11,6 +11,8 @@ from typing import Any
 
 import httpx
 
+from services.common.egress import create_async_client
+
 logger = logging.getLogger(__name__)
 
 
@@ -41,7 +43,12 @@ async def send_to_splunk(events: list[dict[str, Any]], hec_url: str, hec_token: 
     )
     headers = {"Authorization": f"Splunk {hec_token}", "Content-Type": "application/json"}
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        client, _ = create_async_client(
+            "integration-service",
+            target_url=hec_url,
+            timeout=10,
+        )
+        async with client:
             resp = await client.post(hec_url, content=payload, headers=headers)
             resp.raise_for_status()
         return True
@@ -60,7 +67,12 @@ async def send_to_elastic_siem(
         bulk_body += json.dumps({**ev, "@timestamp": ev.get("created_at", "")}) + "\n"
     headers = {"Authorization": f"ApiKey {api_key}", "Content-Type": "application/x-ndjson"}
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        client, _ = create_async_client(
+            "integration-service",
+            target_url=elastic_url,
+            timeout=10,
+        )
+        async with client:
             resp = await client.post(f"{elastic_url}/_bulk", content=bulk_body, headers=headers)
             resp.raise_for_status()
         return True

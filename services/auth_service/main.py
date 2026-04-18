@@ -18,7 +18,7 @@ from urllib.parse import urlencode
 import bcrypt as bcrypt_lib
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -40,6 +40,7 @@ except ImportError:  # pragma: no cover - optional dependency at runtime
     casbin = None
 
 try:
+    from sqlalchemy import text
     from sqlalchemy.orm import Session as SASession
 
     from services.common.db import SessionLocal
@@ -356,16 +357,22 @@ def load_api_key_from_db(key_id: str) -> dict[str, Any] | None:
     if db is None:
         return None
     try:
-        row = db.query(APIKeyModel).filter(APIKeyModel.id == key_id).first()
+        row = db.execute(
+            text(
+                "SELECT user_id, key_hash, created_at "
+                "FROM api_keys WHERE id = :id LIMIT 1"
+            ),
+            {"id": key_id},
+        ).first()
         if row is None:
             return None
         return {
-            "owner": row.user_id,
-            "key_hash": row.key_hash,
-            "created_at": row.created_at.isoformat() if row.created_at else "",
+            "owner": row[0],
+            "key_hash": row[1],
+            "created_at": row[2].isoformat() if row[2] else "",
         }
     except Exception:
-        logger.exception("Failed to load API key %s from DB", sanitize_for_log(key_id))
+        logger.warning("Failed to load API key %s from DB", sanitize_for_log(key_id))
         return None
     finally:
         db.close()
@@ -377,17 +384,22 @@ def load_all_api_keys_from_db() -> dict[str, dict[str, Any]]:
     if db is None:
         return {}
     try:
-        rows = db.query(APIKeyModel).filter(APIKeyModel.is_active.is_(True)).all()
+        rows = db.execute(
+            text(
+                "SELECT id, user_id, key_hash, created_at "
+                "FROM api_keys WHERE is_active IS true"
+            )
+        ).all()
         return {
-            row.id: {
-                "owner": row.user_id,
-                "key_hash": row.key_hash,
-                "created_at": row.created_at.isoformat() if row.created_at else "",
+            row[0]: {
+                "owner": row[1],
+                "key_hash": row[2],
+                "created_at": row[3].isoformat() if row[3] else "",
             }
             for row in rows
         }
     except Exception:
-        logger.exception("Failed to bulk-load API keys from DB")
+        logger.warning("Failed to bulk-load API keys from DB")
         return {}
     finally:
         db.close()
@@ -399,20 +411,22 @@ def list_api_keys_for_owner_from_db(owner_email: str) -> list[dict[str, Any]]:
     if db is None:
         return []
     try:
-        rows = (
-            db.query(APIKeyModel)
-            .filter(APIKeyModel.user_id == owner_email, APIKeyModel.is_active.is_(True))
-            .all()
-        )
+        rows = db.execute(
+            text(
+                "SELECT id, created_at FROM api_keys "
+                "WHERE user_id = :owner AND is_active IS true"
+            ),
+            {"owner": owner_email},
+        ).all()
         return [
             {
-                "key_id": row.id,
-                "created_at": row.created_at.isoformat() if row.created_at else "",
+                "key_id": row[0],
+                "created_at": row[1].isoformat() if row[1] else "",
             }
             for row in rows
         ]
     except Exception:
-        logger.exception("Failed to list API keys for %s", sanitize_for_log(owner_email))
+        logger.warning("Failed to list API keys for %s", sanitize_for_log(owner_email))
         return []
     finally:
         db.close()
@@ -424,19 +438,33 @@ def find_api_key_by_hash_from_db(candidate_hash: str) -> tuple[str, str] | None:
     if db is None:
         return None
     try:
-        row = (
-            db.query(APIKeyModel)
-            .filter(APIKeyModel.key_hash == candidate_hash, APIKeyModel.is_active.is_(True))
-            .first()
-        )
+        row = db.execute(
+            text(
+                "SELECT id, user_id FROM api_keys "
+                "WHERE key_hash = :candidate_hash AND is_active IS true LIMIT 1"
+            ),
+            {"candidate_hash": candidate_hash},
+        ).first()
         if row is None:
             return None
-        return row.id, row.user_id
+        return row[0], row[1]
     except Exception:
-        logger.exception("Failed API-key hash lookup from DB")
+        logger.warning("Failed API-key hash lookup from DB")
         return None
     finally:
         db.close()
+
+
+def _db_column_exists(db: SASession, table_name: str, column_name: str) -> bool:
+    """Return True when a column exists in the active database schema search path."""
+    row = db.execute(
+        text(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_name = :table_name AND column_name = :column_name LIMIT 1"
+        ),
+        {"table_name": table_name, "column_name": column_name},
+    ).first()
+    return row is not None
 
 
 def save_2fa_to_db(email: str, secret: str) -> None:
@@ -445,11 +473,20 @@ def save_2fa_to_db(email: str, secret: str) -> None:
     if db is None:
         return
     try:
+        if not (
+            _db_column_exists(db, "users", "totp_secret")
+            and _db_column_exists(db, "users", "totp_enabled")
+        ):
+            return
         encrypted = encrypt_2fa_secret(secret)
-        user = db.query(UserModel).filter(UserModel.email == email).first()
-        if user:
-            user.totp_secret = encrypted
-            user.totp_enabled = True
+        result = db.execute(
+            text(
+                "UPDATE users SET totp_secret = :secret, totp_enabled = true "
+                "WHERE email = :email"
+            ),
+            {"secret": encrypted, "email": email},
+        )
+        if result.rowcount and result.rowcount > 0:
             db.commit()
         else:
             logger.warning("save_2fa_to_db: no user row for %s", sanitize_for_log(email))
@@ -466,9 +503,14 @@ def load_2fa_from_db(email: str) -> str | None:
     if db is None:
         return None
     try:
-        user = db.query(UserModel).filter(UserModel.email == email).first()
-        if user and user.totp_secret:
-            return decrypt_2fa_secret(user.totp_secret)
+        if not _db_column_exists(db, "users", "totp_secret"):
+            return None
+        row = db.execute(
+            text("SELECT totp_secret FROM users WHERE email = :email LIMIT 1"),
+            {"email": email},
+        ).first()
+        if row and row[0]:
+            return decrypt_2fa_secret(row[0])
         return None
     except Exception:
         logger.exception("Failed to load 2FA secret for %s", sanitize_for_log(email))
@@ -484,21 +526,27 @@ def load_all_2fa_from_db() -> dict[str, str]:
         return {}
     result: dict[str, str] = {}
     try:
-        rows = (
-            db.query(UserModel)
-            .filter(UserModel.totp_enabled.is_(True), UserModel.totp_secret.isnot(None))
-            .all()
-        )
+        if not (
+            _db_column_exists(db, "users", "totp_secret")
+            and _db_column_exists(db, "users", "totp_enabled")
+        ):
+            return {}
+        rows = db.execute(
+            text(
+                "SELECT email, totp_secret FROM users "
+                "WHERE totp_enabled IS true AND totp_secret IS NOT NULL"
+            )
+        ).all()
         for row in rows:
             try:
-                result[row.email] = decrypt_2fa_secret(row.totp_secret)
+                result[row[0]] = decrypt_2fa_secret(row[1])
             except Exception:
                 logger.warning(
-                    "Skipping undecryptable 2FA secret for %s", sanitize_for_log(row.email)
+                    "Skipping undecryptable 2FA secret for %s", sanitize_for_log(str(row[0]))
                 )
         return result
     except Exception:
-        logger.exception("Failed to bulk-load 2FA secrets from DB")
+        logger.warning("Failed to bulk-load 2FA secrets from DB")
         return {}
     finally:
         db.close()
@@ -510,10 +558,16 @@ def disable_2fa_in_db(email: str) -> None:
     if db is None:
         return
     try:
-        user = db.query(UserModel).filter(UserModel.email == email).first()
-        if user:
-            user.totp_enabled = False
-            user.totp_secret = None
+        if not (
+            _db_column_exists(db, "users", "totp_secret")
+            and _db_column_exists(db, "users", "totp_enabled")
+        ):
+            return
+        result = db.execute(
+            text("UPDATE users SET totp_enabled = false, totp_secret = NULL WHERE email = :email"),
+            {"email": email},
+        )
+        if result.rowcount and result.rowcount > 0:
             db.commit()
     except Exception:
         logger.exception("Failed to disable 2FA for %s", sanitize_for_log(email))
@@ -851,6 +905,17 @@ def require_permission(action: str):
 async def health_check():
     """Health check endpoint"""
     return {"status": "healthy", "service": "auth", "timestamp": datetime.now(tz=UTC).isoformat()}
+
+
+@app.get("/metrics")
+async def metrics() -> PlainTextResponse:
+    """Minimal Prometheus-style metrics endpoint to avoid probe 404 noise."""
+    body = (
+        "# HELP cosmicsec_auth_service_up Auth service health status\n"
+        "# TYPE cosmicsec_auth_service_up gauge\n"
+        "cosmicsec_auth_service_up 1\n"
+    )
+    return PlainTextResponse(content=body, media_type="text/plain; version=0.0.4")
 
 
 @app.post("/register", response_model=dict)
