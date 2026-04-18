@@ -3206,7 +3206,9 @@ async def list_agent_tasks(agent_id: str, request: Request) -> JSONResponse:
 
     tasks = _agent_tasks.get(agent_id, [])
     tasks_sorted = sorted(tasks, key=lambda t: float(t.get("created_at", 0)), reverse=True)
-    return JSONResponse(content={"agent_id": agent_id, "tasks": tasks_sorted[:100], "total": len(tasks)})
+    return JSONResponse(
+        content={"agent_id": agent_id, "tasks": tasks_sorted[:100], "total": len(tasks)}
+    )
 
 
 @app.websocket("/ws/agent/{agent_id}")
