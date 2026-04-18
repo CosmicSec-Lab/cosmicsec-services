@@ -2204,11 +2204,19 @@ async def plugin_detail(request: Request, name: str):
 async def plugin_run(request: Request, name: str):
     name = _validate_plugin_name(name)
     data = await request.json()
+    principal, is_admin = await _resolve_authenticated_user(request)
     async with httpx.AsyncClient() as client:
         try:
+            data = dict(data)
+            data.setdefault("user", principal)
+            data.setdefault("config", {})
             response = await client.post(
                 _build_service_url("plugins", f"/plugins/{name}/run"),
                 json=data,
+                headers={
+                    "X-CosmicSec-Actor": principal,
+                    "X-CosmicSec-Actor-Role": "admin" if is_admin else "operator",
+                },
                 timeout=30.0,
             )
             return JSONResponse(status_code=response.status_code, content=response.json())
@@ -2220,10 +2228,16 @@ async def plugin_run(request: Request, name: str):
 @limiter.limit("20/minute")
 async def plugin_enable(request: Request, name: str):
     name = _validate_plugin_name(name)
+    principal, is_admin = await _resolve_authenticated_user(request)
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(
-                _build_service_url("plugins", f"/plugins/{name}/enable"), timeout=5.0
+                _build_service_url("plugins", f"/plugins/{name}/enable"),
+                headers={
+                    "X-CosmicSec-Actor": principal,
+                    "X-CosmicSec-Actor-Role": "admin" if is_admin else "operator",
+                },
+                timeout=5.0,
             )
             return JSONResponse(status_code=response.status_code, content=response.json())
         except httpx.HTTPError:
@@ -2234,10 +2248,16 @@ async def plugin_enable(request: Request, name: str):
 @limiter.limit("20/minute")
 async def plugin_disable(request: Request, name: str):
     name = _validate_plugin_name(name)
+    principal, is_admin = await _resolve_authenticated_user(request)
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(
-                _build_service_url("plugins", f"/plugins/{name}/disable"), timeout=5.0
+                _build_service_url("plugins", f"/plugins/{name}/disable"),
+                headers={
+                    "X-CosmicSec-Actor": principal,
+                    "X-CosmicSec-Actor-Role": "admin" if is_admin else "operator",
+                },
+                timeout=5.0,
             )
             return JSONResponse(status_code=response.status_code, content=response.json())
         except httpx.HTTPError:
