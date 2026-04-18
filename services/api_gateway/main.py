@@ -11,7 +11,7 @@ import re
 import time
 import urllib.parse
 import uuid
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
@@ -3143,6 +3143,145 @@ class DispatchAgentTaskRequest(BaseModel):
     metadata: dict = {}
 
 
+def _persist_agent_task_create(task_record: dict) -> None:
+    """Persist an agent task row, tolerating DB outages with in-memory fallback."""
+    try:
+        from services.common.db import SessionLocal
+        from services.common.models import AgentTaskModel
+
+        db = SessionLocal()
+        try:
+            row = AgentTaskModel(
+                id=str(task_record.get("task_id")),
+                agent_id=str(task_record.get("agent_id")),
+                requested_by=task_record.get("requested_by"),
+                tool=str(task_record.get("tool", "")),
+                target=str(task_record.get("target", "")),
+                args=task_record.get("args") if isinstance(task_record.get("args"), list) else [],
+                metadata=task_record.get("metadata")
+                if isinstance(task_record.get("metadata"), dict)
+                else {},
+                status=str(task_record.get("status", "dispatched")),
+                progress=int(task_record.get("progress", 0)),
+                created_at=datetime.fromtimestamp(float(task_record.get("created_at", time.time())), tz=UTC),
+                updated_at=datetime.fromtimestamp(float(task_record.get("updated_at", time.time())), tz=UTC),
+            )
+            db.add(row)
+            db.commit()
+        finally:
+            db.close()
+    except Exception:
+        logger.debug("Agent task create persistence failed (falling back to memory)", exc_info=True)
+
+
+def _persist_agent_task_update(agent_id: str, task_id: str, **updates: object) -> None:
+    """Apply status/progress/result updates to a persisted task row if available."""
+    try:
+        from services.common.db import SessionLocal
+        from services.common.models import AgentTaskModel
+
+        db = SessionLocal()
+        try:
+            row = (
+                db.query(AgentTaskModel)
+                .filter(AgentTaskModel.id == task_id, AgentTaskModel.agent_id == agent_id)
+                .first()
+            )
+            if row is None:
+                return
+            if "status" in updates and updates["status"] is not None:
+                row.status = str(updates["status"])
+            if "progress" in updates and updates["progress"] is not None:
+                row.progress = int(updates["progress"])
+            if "message" in updates:
+                row.message = str(updates["message"]) if updates["message"] is not None else None
+            if "reason" in updates:
+                row.reason = str(updates["reason"]) if updates["reason"] is not None else None
+            if "result" in updates:
+                row.result = updates["result"] if isinstance(updates["result"], dict) else None
+            row.updated_at = datetime.now(tz=UTC)
+            db.commit()
+        finally:
+            db.close()
+    except Exception:
+        logger.debug("Agent task update persistence failed (memory state remains authoritative)", exc_info=True)
+
+
+def _list_agent_tasks_from_db(
+    agent_id: str,
+    *,
+    status_filter: str | None,
+    limit: int,
+    offset: int,
+) -> dict | None:
+    """Return paginated task data from DB, or ``None`` when DB cannot be queried."""
+    try:
+        from services.common.db import SessionLocal
+        from services.common.models import AgentTaskModel
+
+        db = SessionLocal()
+        try:
+            base_query = db.query(AgentTaskModel).filter(AgentTaskModel.agent_id == agent_id)
+            if status_filter:
+                base_query = base_query.filter(AgentTaskModel.status == status_filter)
+
+            total = int(base_query.count())
+            rows = (
+                base_query.order_by(AgentTaskModel.created_at.desc())
+                .offset(offset)
+                .limit(limit)
+                .all()
+            )
+
+            all_status_rows = (
+                db.query(AgentTaskModel.status, AgentTaskModel.id)
+                .filter(AgentTaskModel.agent_id == agent_id)
+                .all()
+            )
+            status_counts: dict[str, int] = {}
+            for status_value, _ in all_status_rows:
+                key = str(status_value or "unknown")
+                status_counts[key] = status_counts.get(key, 0) + 1
+
+            tasks = []
+            for row in rows:
+                created_at = row.created_at.timestamp() if row.created_at else time.time()
+                updated_at = row.updated_at.timestamp() if row.updated_at else created_at
+                tasks.append(
+                    {
+                        "task_id": row.id,
+                        "agent_id": row.agent_id,
+                        "tool": row.tool,
+                        "target": row.target or "",
+                        "args": row.args if isinstance(row.args, list) else [],
+                        "metadata": row.metadata if isinstance(row.metadata, dict) else {},
+                        "status": row.status,
+                        "progress": int(row.progress or 0),
+                        "created_at": created_at,
+                        "updated_at": updated_at,
+                        "requested_by": row.requested_by,
+                        "message": row.message,
+                        "reason": row.reason,
+                        "result": row.result if isinstance(row.result, dict) else None,
+                    }
+                )
+
+            return {
+                "tasks": tasks,
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+                "has_more": offset + len(tasks) < total,
+                "status_counts": status_counts,
+                "source": "database",
+            }
+        finally:
+            db.close()
+    except Exception:
+        logger.debug("Agent task list DB query failed; using in-memory fallback", exc_info=True)
+        return None
+
+
 @app.post("/api/agents/register")
 @limiter.limit("30/minute")
 async def register_agent(request: Request) -> JSONResponse:
@@ -3301,6 +3440,7 @@ async def dispatch_agent_task(agent_id: str, payload: DispatchAgentTaskRequest, 
         "requested_by": principal,
     }
     _agent_tasks.setdefault(agent_id, []).append(task_record)
+    _persist_agent_task_create(task_record)
 
     try:
         await websocket.send_json(
@@ -3318,6 +3458,7 @@ async def dispatch_agent_task(agent_id: str, payload: DispatchAgentTaskRequest, 
     except Exception as exc:
         task_record["status"] = "dispatch_failed"
         task_record["updated_at"] = time.time()
+        _persist_agent_task_update(agent_id, task_id, status="dispatch_failed")
         logger.warning("Failed to dispatch task %s to agent %s: %s", task_id, agent_id, exc)
         raise HTTPException(status_code=503, detail="Failed to dispatch task to agent")
 
@@ -3343,9 +3484,6 @@ async def list_agent_tasks(
     if not is_admin and agent.get("user_id") != principal:
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    tasks = _agent_tasks.get(agent_id, [])
-    tasks_sorted = sorted(tasks, key=lambda t: float(t.get("created_at", 0)), reverse=True)
-
     allowed_statuses = {
         "dispatched",
         "accepted",
@@ -3355,14 +3493,40 @@ async def list_agent_tasks(
         "failed",
         "dispatch_failed",
     }
-    if status_filter:
-        normalized = status_filter.strip().lower()
-        if normalized not in allowed_statuses:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid status filter. Allowed: {', '.join(sorted(allowed_statuses))}",
-            )
-        tasks_sorted = [t for t in tasks_sorted if str(t.get("status", "")).lower() == normalized]
+    normalized_status_filter = status_filter.strip().lower() if status_filter else None
+    if normalized_status_filter and normalized_status_filter not in allowed_statuses:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid status filter. Allowed: {', '.join(sorted(allowed_statuses))}",
+        )
+
+    db_result = _list_agent_tasks_from_db(
+        agent_id,
+        status_filter=normalized_status_filter,
+        limit=limit,
+        offset=offset,
+    )
+    if db_result is not None:
+        return JSONResponse(
+            content={
+                "agent_id": agent_id,
+                "tasks": db_result["tasks"],
+                "total": db_result["total"],
+                "limit": db_result["limit"],
+                "offset": db_result["offset"],
+                "has_more": db_result["has_more"],
+                "status_counts": db_result["status_counts"],
+                "source": db_result["source"],
+            }
+        )
+
+    tasks = _agent_tasks.get(agent_id, [])
+    tasks_sorted = sorted(tasks, key=lambda t: float(t.get("created_at", 0)), reverse=True)
+
+    if normalized_status_filter:
+        tasks_sorted = [
+            t for t in tasks_sorted if str(t.get("status", "")).lower() == normalized_status_filter
+        ]
 
     total = len(tasks_sorted)
     paged_tasks = tasks_sorted[offset : offset + limit]
@@ -3381,6 +3545,7 @@ async def list_agent_tasks(
             "offset": offset,
             "has_more": offset + len(paged_tasks) < total,
             "status_counts": status_counts,
+            "source": "memory_fallback",
         }
     )
 
@@ -3476,6 +3641,12 @@ async def agent_websocket(websocket: WebSocket, agent_id: str) -> None:
                         task["status"] = "accepted" if accepted else "rejected"
                         task["updated_at"] = time.time()
                         task["reason"] = msg.get("reason")
+                        _persist_agent_task_update(
+                            agent_id,
+                            task_id,
+                            status=task["status"],
+                            reason=task.get("reason"),
+                        )
                         break
             elif msg_type == "task_progress":
                 task_id = str(msg.get("task_id", ""))
@@ -3486,6 +3657,13 @@ async def agent_websocket(websocket: WebSocket, agent_id: str) -> None:
                         task["progress"] = max(0, min(percent, 100))
                         task["updated_at"] = time.time()
                         task["message"] = msg.get("message")
+                        _persist_agent_task_update(
+                            agent_id,
+                            task_id,
+                            status="running",
+                            progress=task["progress"],
+                            message=task.get("message"),
+                        )
                         break
             elif msg_type == "task_result":
                 task_id = str(msg.get("task_id", ""))
@@ -3496,6 +3674,13 @@ async def agent_websocket(websocket: WebSocket, agent_id: str) -> None:
                         task["progress"] = 100
                         task["updated_at"] = time.time()
                         task["result"] = result
+                        _persist_agent_task_update(
+                            agent_id,
+                            task_id,
+                            status=task["status"],
+                            progress=100,
+                            result=result,
+                        )
                         break
             else:
                 logger.debug("Agent %s unknown message type: %s", safe_agent_id, msg_type)
