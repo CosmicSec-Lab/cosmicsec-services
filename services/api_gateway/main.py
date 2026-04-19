@@ -185,6 +185,41 @@ async def _resolve_authenticated_user(request: Request) -> tuple[str, bool]:
     return str(principal), me.get("role") == "admin"
 
 
+async def _resolve_websocket_user(websocket: WebSocket) -> tuple[str, bool] | None:
+    """Validate bearer token from query/header for websocket endpoints.
+
+    Returns ``(principal, is_admin)`` on success, otherwise ``None``.
+    """
+    token = websocket.query_params.get("token")
+    if not token:
+        auth_header = websocket.headers.get("authorization", "")
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header.split(" ", 1)[1].strip()
+
+    if not token:
+        return None
+
+    try:
+        async with httpx.AsyncClient() as client:
+            verify_resp = await client.get(
+                _build_service_url("auth", "/me"),
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=5.0,
+            )
+    except httpx.HTTPError:
+        return None
+
+    if verify_resp.status_code != 200:
+        return None
+
+    me = verify_resp.json()
+    principal = me.get("email") or me.get("user_id") or me.get("id")
+    if not principal:
+        return None
+
+    return str(principal), me.get("role") == "admin"
+
+
 # Search tuning constants
 _SEARCH_SCAN_FETCH_MULTIPLIER = 10
 _SEARCH_FINDING_SCAN_CANDIDATES = 10
@@ -1791,6 +1826,10 @@ async def ai_nl_query(request: Request):
     )
     data.setdefault("source", inferred_source)
     data.setdefault("preferred_model", "phi3:mini")
+    data.setdefault(
+        "preferred_provider",
+        (os.environ.get("COSMICSEC_DEFAULT_LLM_PROVIDER") or "ollama").strip().lower(),
+    )
 
     async with httpx.AsyncClient() as client:
         last_exc: Exception | None = None
@@ -1841,6 +1880,10 @@ async def ai_nl_query_stream(request: Request):
     )
     data.setdefault("source", inferred_source)
     data.setdefault("preferred_model", "phi3:mini")
+    data.setdefault(
+        "preferred_provider",
+        (os.environ.get("COSMICSEC_DEFAULT_LLM_PROVIDER") or "ollama").strip().lower(),
+    )
 
     async def _proxy_stream() -> object:
         async with httpx.AsyncClient() as client:
@@ -2434,24 +2477,291 @@ async def set_org_quotas(request: Request, org_id: str):
 
 @app.websocket("/ws/dashboard")
 async def dashboard_stream(websocket: WebSocket):
+    auth_context = await _resolve_websocket_user(websocket)
+    if auth_context is None:
+        await websocket.close(code=4001)
+        return
+
+    principal, is_admin = auth_context
     await websocket.accept()
+
+    def _tools_in_manifest(manifest: dict) -> list[str]:
+        raw_tools = manifest.get("tools", []) if isinstance(manifest, dict) else []
+        if not isinstance(raw_tools, list):
+            return []
+        normalized: list[str] = []
+        for item in raw_tools:
+            if isinstance(item, str):
+                name = item.strip().lower()
+            elif isinstance(item, dict):
+                candidate = item.get("name") or item.get("binary")
+                name = str(candidate).strip().lower() if candidate else ""
+            else:
+                name = ""
+            if name:
+                normalized.append(name)
+        return normalized
+
+    async def _fetch_overview_snapshot() -> dict:
+        total_scans = 0
+        critical_findings = 0
+        open_bugs = 0
+
+        async with httpx.AsyncClient() as client:
+            try:
+                stats_resp = await client.get(_build_service_url("scan", "/stats"), timeout=3.0)
+                if stats_resp.status_code == 200:
+                    data = stats_resp.json()
+                    total_scans = int(data.get("total_scans", 0) or 0)
+                    severity_breakdown = data.get("severity_breakdown", {})
+                    if isinstance(severity_breakdown, dict):
+                        critical_findings = int(severity_breakdown.get("critical", 0) or 0)
+            except httpx.HTTPError:
+                pass
+
+            try:
+                bug_resp = await client.get(
+                    _build_service_url("bugbounty", "/submissions?status=open&limit=100"),
+                    timeout=3.0,
+                )
+                if bug_resp.status_code == 200:
+                    payload = bug_resp.json()
+                    open_bugs = len(payload.get("items", []))
+            except httpx.HTTPError:
+                pass
+
+        return {
+            "total_scans": total_scans,
+            "critical_findings": critical_findings,
+            "open_bugs": open_bugs,
+        }
+
+    def _runtime_summary() -> tuple[int, int, list[dict]]:
+        now = time.time()
+        running_tasks = 0
+        recent_completed = 0
+        tool_stats: dict[str, dict[str, float | int]] = {}
+
+        for task_rows in _agent_tasks.values():
+            for task in task_rows:
+                tool = str(task.get("tool") or "unknown").strip().lower() or "unknown"
+                stats = tool_stats.setdefault(
+                    tool,
+                    {
+                        "running": 0,
+                        "completed_24h": 0,
+                        "failed_24h": 0,
+                        "progress_total": 0,
+                        "progress_count": 0,
+                        "duration_total": 0.0,
+                        "duration_count": 0,
+                    },
+                )
+
+                status_value = str(task.get("status") or "").lower()
+                if status_value == "running":
+                    running_tasks += 1
+                    stats["running"] = int(stats["running"]) + 1
+
+                updated_at = float(task.get("updated_at") or task.get("created_at") or now)
+                within_24h = now - updated_at <= 24 * 60 * 60
+
+                if status_value == "completed" and within_24h:
+                    recent_completed += 1
+                    stats["completed_24h"] = int(stats["completed_24h"]) + 1
+                if status_value in {"failed", "dispatch_failed", "rejected"} and within_24h:
+                    stats["failed_24h"] = int(stats["failed_24h"]) + 1
+
+                progress = int(task.get("progress", 0) or 0)
+                stats["progress_total"] = int(stats["progress_total"]) + max(0, min(progress, 100))
+                stats["progress_count"] = int(stats["progress_count"]) + 1
+
+                if status_value in {"completed", "failed"}:
+                    created_at = float(task.get("created_at") or updated_at)
+                    duration = max(0.0, updated_at - created_at)
+                    stats["duration_total"] = float(stats["duration_total"]) + duration
+                    stats["duration_count"] = int(stats["duration_count"]) + 1
+
+        top_tools = sorted(
+            tool_stats.items(),
+            key=lambda item: (
+                int(item[1]["running"]),
+                int(item[1]["completed_24h"]),
+                int(item[1]["progress_total"]),
+            ),
+            reverse=True,
+        )[:6]
+
+        tool_runtime = []
+        for tool, stats in top_tools:
+            progress_count = int(stats["progress_count"]) or 1
+            duration_count = int(stats["duration_count"]) or 1
+            tool_runtime.append(
+                {
+                    "tool": tool,
+                    "running": int(stats["running"]),
+                    "completed_24h": int(stats["completed_24h"]),
+                    "failed_24h": int(stats["failed_24h"]),
+                    "average_progress": round(int(stats["progress_total"]) / progress_count, 1),
+                    "average_duration_seconds": round(float(stats["duration_total"]) / duration_count, 1)
+                    if int(stats["duration_count"]) > 0
+                    else None,
+                }
+            )
+
+        return running_tasks, recent_completed, tool_runtime
+
     try:
         while True:
-            payload = {
-                "timestamp": time.time(),
-                "system_health": "healthy",
-                "active_scans": 0,
-                "user_activity": "normal",
-                "resource_utilization": {
-                    "cpu": 22,
-                    "memory": 48,
-                    "network": 31,
-                },
-            }
-            await websocket.send_json(payload)
-            await asyncio.sleep(2)
+            overview = await _fetch_overview_snapshot()
+            running_tasks, recent_completed, tool_runtime = _runtime_summary()
+
+            visible_agents = [
+                agent
+                for agent in _registered_agents.values()
+                if is_admin or agent.get("user_id") == principal
+            ]
+            connected_agents = len(
+                [
+                    agent
+                    for agent in visible_agents
+                    if str(agent.get("status", "")).lower() == "connected"
+                ]
+            )
+
+            discovered_tools = sorted(
+                {
+                    tool
+                    for agent in visible_agents
+                    for tool in _tools_in_manifest(agent.get("manifest", {}))
+                }
+            )
+
+            await websocket.send_json(
+                {
+                    "timestamp": time.time(),
+                    "system_health": "healthy",
+                    "active_scans": overview["total_scans"],
+                    "connected_agents": connected_agents,
+                    "critical_findings": overview["critical_findings"],
+                    "open_bugs": overview["open_bugs"],
+                    "task_runtime": {
+                        "running": running_tasks,
+                        "completed_24h": recent_completed,
+                        "tools": tool_runtime,
+                    },
+                    "tool_inventory": {
+                        "count": len(discovered_tools),
+                        "items": discovered_tools[:20],
+                    },
+                }
+            )
+            await asyncio.sleep(5)
     except WebSocketDisconnect:
-        logger.info("Dashboard websocket disconnected")
+        logger.info("Dashboard websocket disconnected for %s", _sanitize_log(principal))
+
+
+@app.get("/api/tools/registry")
+@limiter.limit("60/minute")
+async def unified_tool_registry(request: Request) -> JSONResponse:
+    """Return a unified view of server tools and connected CLI agent tools."""
+    principal, is_admin = await _resolve_authenticated_user(request)
+
+    server_tools = [
+        {"name": "nmap", "category": "pentest", "source": "server"},
+        {"name": "nikto", "category": "pentest", "source": "server"},
+        {"name": "nuclei", "category": "pentest", "source": "server"},
+        {"name": "sqlmap", "category": "pentest", "source": "server"},
+        {"name": "gobuster", "category": "recon", "source": "server"},
+        {"name": "whois", "category": "recon", "source": "server"},
+        {"name": "dns", "category": "recon", "source": "server"},
+        {"name": "rdap", "category": "recon", "source": "server"},
+        {"name": "timeline", "category": "soc", "source": "server"},
+        {"name": "alerts", "category": "soc", "source": "server"},
+        {"name": "bugbounty", "category": "bounty", "source": "server"},
+    ]
+
+    visible_agents = [
+        agent
+        for agent in _registered_agents.values()
+        if is_admin or agent.get("user_id") == principal
+    ]
+
+    agent_tool_map: dict[str, dict] = {}
+    for agent in visible_agents:
+        manifest = agent.get("manifest") if isinstance(agent.get("manifest"), dict) else {}
+        raw_tools = manifest.get("tools", []) if isinstance(manifest, dict) else []
+        if not isinstance(raw_tools, list):
+            continue
+        for tool in raw_tools:
+            if isinstance(tool, str):
+                name = tool.strip().lower()
+                category = "cli"
+            elif isinstance(tool, dict):
+                name = str(tool.get("name") or tool.get("binary") or "").strip().lower()
+                category = str(tool.get("category") or "cli").strip().lower() or "cli"
+            else:
+                name = ""
+                category = "cli"
+            if not name:
+                continue
+            item = agent_tool_map.setdefault(
+                name,
+                {
+                    "name": name,
+                    "category": category,
+                    "source": "agent",
+                    "agent_count": 0,
+                    "connected_agent_count": 0,
+                },
+            )
+            item["agent_count"] = int(item["agent_count"]) + 1
+            if str(agent.get("status", "")).lower() == "connected":
+                item["connected_agent_count"] = int(item["connected_agent_count"]) + 1
+
+    server_name_set = {item["name"] for item in server_tools}
+    unified_map: dict[str, dict] = {
+        item["name"]: {
+            "name": item["name"],
+            "category": item["category"],
+            "server_available": True,
+            "agent_available": False,
+            "agent_count": 0,
+            "connected_agent_count": 0,
+        }
+        for item in server_tools
+    }
+
+    for tool_name, agent_item in agent_tool_map.items():
+        existing = unified_map.get(tool_name)
+        if existing is None:
+            unified_map[tool_name] = {
+                "name": tool_name,
+                "category": agent_item.get("category", "cli"),
+                "server_available": tool_name in server_name_set,
+                "agent_available": True,
+                "agent_count": int(agent_item.get("agent_count", 0)),
+                "connected_agent_count": int(agent_item.get("connected_agent_count", 0)),
+            }
+        else:
+            existing["agent_available"] = True
+            existing["agent_count"] = int(agent_item.get("agent_count", 0))
+            existing["connected_agent_count"] = int(agent_item.get("connected_agent_count", 0))
+
+    unified_tools = sorted(unified_map.values(), key=lambda item: item["name"])
+
+    return JSONResponse(
+        content={
+            "server_tools": server_tools,
+            "agent_tools": sorted(agent_tool_map.values(), key=lambda item: item["name"]),
+            "unified_tools": unified_tools,
+            "agents_visible": len(visible_agents),
+            "connected_agents": len(
+                [a for a in visible_agents if str(a.get("status", "")).lower() == "connected"]
+            ),
+            "timestamp": time.time(),
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
