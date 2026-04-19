@@ -4,10 +4,12 @@ Main entry point for all API requests with routing, authentication, and rate lim
 """
 
 import asyncio
+import ipaddress
 import json
 import logging
 import os
 import re
+import socket
 import time
 import urllib.parse
 import uuid
@@ -57,6 +59,10 @@ _RE_ALPHANUMERIC_ID = re.compile(r"^[A-Za-z0-9_\-]{1,128}$")
 _RE_EMAIL = re.compile(r"^[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9.\-]{1,253}\.[A-Za-z]{2,}$")
 _RE_PLUGIN_NAME = re.compile(r"^[A-Za-z0-9_\-]{1,128}$")
 _RE_ORG_SLUG = re.compile(r"^[a-z0-9\-]{2,64}$")
+_RE_DOMAIN = re.compile(
+    r"^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$"
+)
+_RE_CVE_ID = re.compile(r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE)
 _RE_UUID = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
 )
@@ -120,6 +126,46 @@ def _sanitize_log(value: object, max_len: int = 200) -> str:
     # Strip log-injection control characters
     text = text.replace("\n", "\\n").replace("\r", "\\r").replace("\x00", "")
     return text[:max_len]
+
+
+def _is_private_or_loopback_host(value: str) -> bool:
+    """Return True when value is an IP in blocked guest ranges."""
+    try:
+        ip = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return any(
+        [
+            ip.is_private,
+            ip.is_loopback,
+            ip.is_link_local,
+            ip.is_multicast,
+            ip.is_reserved,
+            ip.is_unspecified,
+        ]
+    )
+
+
+def _validate_guest_domain(domain: str) -> str:
+    normalized = (domain or "").strip().lower().rstrip(".")
+    if not normalized or not _RE_DOMAIN.match(normalized):
+        raise HTTPException(status_code=400, detail="Invalid domain")
+    if _is_private_or_loopback_host(normalized):
+        raise HTTPException(status_code=403, detail="Guest sandbox denied target")
+    return normalized
+
+
+def _truncate_guest_payload(payload: object, max_bytes: int = 50 * 1024) -> object:
+    """Ensure guest endpoint responses stay below size limits."""
+    encoded = json.dumps(payload, default=str).encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return payload
+    preview = encoded[: max_bytes - 64].decode("utf-8", errors="ignore")
+    return {
+        "truncated": True,
+        "max_bytes": max_bytes,
+        "preview": preview,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2018,8 +2064,127 @@ async def runtime_mode(request: Request):
         "resolved_mode": resolved,
         "default_mode": hybrid_router.default_mode.value,
         "rollout": hybrid_router.get_rollout_config(),
-        "supported_modes": ["dynamic", "hybrid", "static", "demo", "emergency"],
+        "supported_modes": ["dynamic", "hybrid", "static", "demo", "emergency", "local_web"],
     }
+
+
+@app.get("/api/guest/health")
+@limiter.limit("5/minute", key_func=get_remote_address)
+async def guest_health(request: Request):
+    """Public, read-only guest health check with strict rate limiting."""
+    _ = request
+    return {
+        "status": "ok",
+        "service": "api_gateway",
+        "user_type": "guest",
+        "timestamp": time.time(),
+    }
+
+
+@app.get("/api/guest/dns")
+@limiter.limit("5/minute", key_func=get_remote_address)
+async def guest_dns_lookup(request: Request, domain: str = Query(..., min_length=1, max_length=253)):
+    """Public, read-only DNS lookup endpoint with private-range safeguards."""
+    _ = request
+    normalized = _validate_guest_domain(domain)
+
+    try:
+        infos = socket.getaddrinfo(normalized, None, proto=socket.IPPROTO_TCP)
+        addresses = sorted({entry[4][0] for entry in infos if entry and entry[4]})
+    except socket.gaierror:
+        raise HTTPException(status_code=404, detail="Domain resolution failed")
+
+    if not addresses:
+        raise HTTPException(status_code=404, detail="No DNS records found")
+    if any(_is_private_or_loopback_host(addr) for addr in addresses):
+        raise HTTPException(status_code=403, detail="Guest sandbox denied target")
+
+    return {
+        "domain": normalized,
+        "addresses": addresses,
+        "count": len(addresses),
+        "user_type": "guest",
+    }
+
+
+@app.get("/api/guest/whois")
+@limiter.limit("5/minute", key_func=get_remote_address)
+async def guest_whois_lookup(
+    request: Request, domain: str = Query(..., min_length=1, max_length=253)
+):
+    """Public, read-only RDAP lookup for guest mode."""
+    _ = request
+    normalized = _validate_guest_domain(domain)
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(f"https://rdap.org/domain/{normalized}", timeout=8.0)
+    except httpx.HTTPError:
+        raise HTTPException(status_code=503, detail="WHOIS lookup unavailable")
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail="WHOIS lookup failed")
+
+    data = resp.json()
+    payload = {
+        "domain": normalized,
+        "handle": data.get("handle"),
+        "ldhName": data.get("ldhName"),
+        "status": data.get("status", []),
+        "events": data.get("events", [])[:5],
+        "nameservers": [
+            ns.get("ldhName")
+            for ns in data.get("nameservers", [])
+            if isinstance(ns, dict) and ns.get("ldhName")
+        ][:10],
+        "user_type": "guest",
+    }
+    return _truncate_guest_payload(payload)
+
+
+@app.get("/api/guest/cve")
+@limiter.limit("5/minute", key_func=get_remote_address)
+async def guest_cve_lookup(request: Request, id: str = Query(..., min_length=9, max_length=32)):
+    """Public CVE lookup endpoint for guest mode."""
+    _ = request
+    cve_id = (id or "").strip().upper()
+    if not _RE_CVE_ID.match(cve_id):
+        raise HTTPException(status_code=400, detail="Invalid CVE ID")
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                "https://services.nvd.nist.gov/rest/json/cves/2.0",
+                params={"cveId": cve_id},
+                timeout=10.0,
+            )
+    except httpx.HTTPError:
+        raise HTTPException(status_code=503, detail="CVE lookup unavailable")
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail="CVE lookup failed")
+
+    data = resp.json()
+    items = data.get("vulnerabilities", []) if isinstance(data, dict) else []
+    record = items[0].get("cve", {}) if items and isinstance(items[0], dict) else {}
+    descriptions = record.get("descriptions", []) if isinstance(record, dict) else []
+    summary = next(
+        (
+            item.get("value")
+            for item in descriptions
+            if isinstance(item, dict) and item.get("lang") == "en"
+        ),
+        None,
+    )
+
+    payload = {
+        "cve_id": cve_id,
+        "published": record.get("published"),
+        "lastModified": record.get("lastModified"),
+        "summary": summary,
+        "user_type": "guest",
+    }
+    return _truncate_guest_payload(payload)
 
 
 @app.get("/api/runtime/metrics")
