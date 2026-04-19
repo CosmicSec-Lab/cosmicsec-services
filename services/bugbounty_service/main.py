@@ -452,6 +452,86 @@ def submission_status_breakdown(db: Session = Depends(get_db)) -> dict:
     return {"breakdown": breakdown, "total": len(all_subs)}
 
 
+@app.get("/dashboard/overview")
+def dashboard_overview(db: Session = Depends(get_db)) -> dict:
+    """Return a compact professional dashboard snapshot for the bug bounty UI."""
+
+    def _status_breakdown(submissions: list[BugBountySubmissionModel | dict[str, Any]]) -> dict[str, int]:
+        breakdown = dict.fromkeys(sorted(_ALLOWED_STATUS), 0)
+        for item in submissions:
+            status = item.status if hasattr(item, "status") else str(item.get("status", "")).lower()
+            if status in breakdown:
+                breakdown[status] = breakdown.get(status, 0) + 1
+        return breakdown
+
+    def _recent_activities(limit: int = 8) -> list[dict[str, Any]]:
+        try:
+            rows = (
+                db.query(BugBountyActivityModel)
+                .order_by(BugBountyActivityModel.created_at.desc())
+                .limit(limit)
+                .all()
+            )
+            return [
+                {
+                    "event": row.activity_type,
+                    "program_id": row.program_id,
+                    "submission_id": row.submission_id,
+                    "actor": row.actor,
+                    "detail": row.detail,
+                    "metadata": row.extra_metadata,
+                    "created_at": row.created_at.isoformat() if row.created_at else None,
+                }
+                for row in rows
+            ]
+        except SQLAlchemyError:
+            db.rollback()
+            return list(reversed(_memory_activities[-limit:]))
+
+    try:
+        programs = db.query(BugBountyProgramModel).all()
+        submissions = db.query(BugBountySubmissionModel).all()
+        threads = db.query(BugBountyThreadModel).all()
+        activities = _recent_activities()
+        paid = [item for item in submissions if item.status == "paid"]
+        total_paid = sum(item.reward_amount for item in paid)
+        pending_review = len([item for item in submissions if item.status in {"submitted", "triaged"}])
+        avg_payout = (total_paid / len(paid)) if paid else 0
+        return {
+            "programs": len(programs),
+            "submissions": len(submissions),
+            "threads": len(threads),
+            "pending_review": pending_review,
+            "paid_submissions": len(paid),
+            "total_paid": total_paid,
+            "average_payout": round(avg_payout, 2),
+            "status_breakdown": _status_breakdown(submissions),
+            "recent_activities": activities,
+            "updated_at": datetime.now(UTC).isoformat(),
+        }
+    except SQLAlchemyError:
+        db.rollback()
+        programs = list(_memory_programs.values())
+        submissions = list(_memory_submissions.values())
+        threads = list(_memory_threads.values())
+        paid = [item for item in submissions if item.get("status") == "paid"]
+        total_paid = sum(int(item.get("reward_amount") or 0) for item in paid)
+        pending_review = len([item for item in submissions if item.get("status") in {"submitted", "triaged"}])
+        avg_payout = (total_paid / len(paid)) if paid else 0
+        return {
+            "programs": len(programs),
+            "submissions": len(submissions),
+            "threads": len(threads),
+            "pending_review": pending_review,
+            "paid_submissions": len(paid),
+            "total_paid": total_paid,
+            "average_payout": round(avg_payout, 2),
+            "status_breakdown": _status_breakdown(submissions),
+            "recent_activities": list(reversed(_memory_activities[-8:])),
+            "updated_at": datetime.now(UTC).isoformat(),
+        }
+
+
 @app.get("/timeline")
 def timeline(program_id: str | None = None, db: Session = Depends(get_db)) -> dict:
     events = []
