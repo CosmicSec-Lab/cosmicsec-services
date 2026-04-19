@@ -2083,7 +2083,9 @@ async def guest_health(request: Request):
 
 @app.get("/api/guest/dns")
 @limiter.limit("5/minute", key_func=get_remote_address)
-async def guest_dns_lookup(request: Request, domain: str = Query(..., min_length=1, max_length=253)):
+async def guest_dns_lookup(
+    request: Request, domain: str = Query(..., min_length=1, max_length=253)
+):
     """Public, read-only DNS lookup endpoint with private-range safeguards."""
     _ = request
     normalized = _validate_guest_domain(domain)
@@ -2768,7 +2770,9 @@ async def dashboard_stream(websocket: WebSocket):
                     "completed_24h": int(stats["completed_24h"]),
                     "failed_24h": int(stats["failed_24h"]),
                     "average_progress": round(int(stats["progress_total"]) / progress_count, 1),
-                    "average_duration_seconds": round(float(stats["duration_total"]) / duration_count, 1)
+                    "average_duration_seconds": round(
+                        float(stats["duration_total"]) / duration_count, 1
+                    )
                     if int(stats["duration_count"]) > 0
                     else None,
                 }
@@ -3963,7 +3967,9 @@ def _list_agent_tasks_from_db(
                         "tool": row.tool,
                         "target": row.target or "",
                         "args": row.args if isinstance(row.args, list) else [],
-                        "metadata": row.task_metadata if isinstance(row.task_metadata, dict) else {},
+                        "metadata": row.task_metadata
+                        if isinstance(row.task_metadata, dict)
+                        else {},
                         "status": row.status,
                         "progress": int(row.progress or 0),
                         "created_at": created_at,

@@ -22,8 +22,8 @@ from fastapi import Depends, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
 
 from services.common.db import get_db
 from services.common.jwt_utils import decode_token
@@ -393,9 +393,7 @@ async def post_message(
         db.add(msg_row)
         db.commit()
         message_ts = (
-            msg_row.created_at.isoformat()
-            if msg_row.created_at
-            else datetime.now(UTC).isoformat()
+            msg_row.created_at.isoformat() if msg_row.created_at else datetime.now(UTC).isoformat()
         )
     except SQLAlchemyError:
         db.rollback()

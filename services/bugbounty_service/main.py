@@ -456,7 +456,9 @@ def submission_status_breakdown(db: Session = Depends(get_db)) -> dict:
 def dashboard_overview(db: Session = Depends(get_db)) -> dict:
     """Return a compact professional dashboard snapshot for the bug bounty UI."""
 
-    def _status_breakdown(submissions: list[BugBountySubmissionModel | dict[str, Any]]) -> dict[str, int]:
+    def _status_breakdown(
+        submissions: list[BugBountySubmissionModel | dict[str, Any]],
+    ) -> dict[str, int]:
         breakdown = dict.fromkeys(sorted(_ALLOWED_STATUS), 0)
         for item in submissions:
             status = item.status if hasattr(item, "status") else str(item.get("status", "")).lower()
@@ -495,7 +497,9 @@ def dashboard_overview(db: Session = Depends(get_db)) -> dict:
         activities = _recent_activities()
         paid = [item for item in submissions if item.status == "paid"]
         total_paid = sum(item.reward_amount for item in paid)
-        pending_review = len([item for item in submissions if item.status in {"submitted", "triaged"}])
+        pending_review = len(
+            [item for item in submissions if item.status in {"submitted", "triaged"}]
+        )
         avg_payout = (total_paid / len(paid)) if paid else 0
         return {
             "programs": len(programs),
@@ -516,7 +520,9 @@ def dashboard_overview(db: Session = Depends(get_db)) -> dict:
         threads = list(_memory_threads.values())
         paid = [item for item in submissions if item.get("status") == "paid"]
         total_paid = sum(int(item.get("reward_amount") or 0) for item in paid)
-        pending_review = len([item for item in submissions if item.get("status") in {"submitted", "triaged"}])
+        pending_review = len(
+            [item for item in submissions if item.get("status") in {"submitted", "triaged"}]
+        )
         avg_payout = (total_paid / len(paid)) if paid else 0
         return {
             "programs": len(programs),
@@ -640,7 +646,9 @@ def collaboration_threads_list(
         if program_id:
             query = query.filter(BugBountyThreadModel.program_id == program_id)
         total = query.count()
-        items = query.order_by(BugBountyThreadModel.created_at.desc()).offset(offset).limit(limit).all()
+        items = (
+            query.order_by(BugBountyThreadModel.created_at.desc()).offset(offset).limit(limit).all()
+        )
         payload_items = [_thread_to_dict(item) for item in items]
     except SQLAlchemyError:
         db.rollback()

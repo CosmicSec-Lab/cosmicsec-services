@@ -56,6 +56,7 @@ async def handle_db_errors(_request, _exc: SQLAlchemyError):
     logger.warning("Organization service database unavailable; returning 503")
     return JSONResponse(status_code=503, content={"detail": "Database unavailable"})
 
+
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
