@@ -6,6 +6,7 @@ to protect against brute-force login attacks.
 """
 
 import logging
+import os
 import threading
 import time
 
@@ -38,15 +39,25 @@ class LoginRateLimiter:
     # ------------------------------------------------------------------
     def _connect_redis(self) -> None:
         try:
-            import os
-
             import redis.asyncio as aioredis
 
-            self._redis = aioredis.Redis(
-                host=os.getenv("REDIS_HOST", "redis"),
-                port=int(os.getenv("REDIS_PORT", "6379")),
-                decode_responses=True,
-            )
+            redis_url = os.getenv("REDIS_URL", "").strip()
+            if redis_url:
+                self._redis = aioredis.from_url(
+                    redis_url,
+                    decode_responses=True,
+                    socket_connect_timeout=1,
+                    socket_timeout=1,
+                )
+            else:
+                self._redis = aioredis.Redis(
+                    host=os.getenv("REDIS_HOST", "redis"),
+                    port=int(os.getenv("REDIS_PORT", "6379")),
+                    password=os.getenv("REDIS_PASSWORD"),
+                    decode_responses=True,
+                    socket_connect_timeout=1,
+                    socket_timeout=1,
+                )
         except Exception:
             self._redis = None
             logger.warning(

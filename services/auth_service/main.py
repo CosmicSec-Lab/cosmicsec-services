@@ -109,6 +109,7 @@ class Token(BaseModel):
     refresh_token: str
     token_type: str = "bearer"
     expires_in: int
+    user: dict[str, Any] | None = None
 
 
 class TokenData(BaseModel):
@@ -417,7 +418,7 @@ def load_all_users_from_db() -> dict[str, dict[str, Any]]:
             for row in rows
         }
     except Exception:
-        logger.warning("Failed to bulk-load users from DB")
+        logger.debug("Failed to bulk-load users from DB", exc_info=True)
         return {}
     finally:
         db.close()
@@ -883,11 +884,23 @@ org_sso_configs: dict[str, dict[str, Any]] = {}  # org_id -> SSO config
 redis_client = None
 if redis is not None:
     try:
-        redis_client = redis.Redis(
-            host=os.getenv("REDIS_HOST", "redis"),
-            port=int(os.getenv("REDIS_PORT", "6379")),
-            decode_responses=True,
-        )
+        redis_url = os.getenv("REDIS_URL", "").strip()
+        if redis_url:
+            redis_client = redis.Redis.from_url(
+                redis_url,
+                decode_responses=True,
+                socket_connect_timeout=1,
+                socket_timeout=1,
+            )
+        else:
+            redis_client = redis.Redis(
+                host=os.getenv("REDIS_HOST", "redis"),
+                port=int(os.getenv("REDIS_PORT", "6379")),
+                password=os.getenv("REDIS_PASSWORD"),
+                decode_responses=True,
+                socket_connect_timeout=1,
+                socket_timeout=1,
+            )
         redis_client.ping()
     except Exception:
         redis_client = None
@@ -1326,6 +1339,13 @@ async def login(user_data: UserLogin, request: Request):
         "token_type": "bearer",  # nosec B105
         "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         "session_id": session_id,
+        "user": {
+            "id": user["id"],
+            "email": user["email"],
+            "full_name": user["full_name"],
+            "role": user["role"],
+            "is_active": bool(user.get("is_active", True)),
+        },
     }
 
 
