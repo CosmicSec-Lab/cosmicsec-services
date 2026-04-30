@@ -13,4 +13,4 @@ jobs:
           # Note: To use this across an organization, you MUST create a Personal Access Token (PAT)
           # with 'project' and 'repo' scopes, and save it as an Organization Secret named 'ORG_PROJECT_PAT'.
           github-token: ${{ secrets.ORG_PROJECT_PAT || secrets.GITHUB_TOKEN }}
-          project-url: https://github.com/orgs/CosmicSec-Lab/projects/1
+          project-url: https://github.com/orgs/CosmicSec-Lab/projects/2
