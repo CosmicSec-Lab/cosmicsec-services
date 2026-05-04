@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import secrets
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -42,15 +43,22 @@ except ImportError:  # pragma: no cover - optional dependency at runtime
 try:
     from sqlalchemy import text
     from sqlalchemy.orm import Session as SASession
-
-from services.common.db import SessionLocal
-from services.common.models import APIKeyModel, SessionModel, UserModel
-from services.common.rate_limiter import is_rate_limited
-from services.common.token_blacklist import blacklist_token, is_token_blacklisted
-
+    from services.common.db import SessionLocal
+    from services.common.models import APIKeyModel, SessionModel, UserModel
+    from services.common.rate_limiter import is_rate_limited
+    from services.common.token_blacklist import blacklist_token, is_token_blacklisted
     _HAS_DB = True
 except ImportError:  # pragma: no cover - optional dependency at runtime
-    _HAS_DB = False
+    _HAS_DB = False  # type: ignore[misc]
+    SASession = None  # type: ignore[misc]
+    SessionLocal = None  # type: ignore[misc]
+    UserModel = None  # type: ignore[misc]
+    SessionModel = None  # type: ignore[misc]
+    APIKeyModel = None  # type: ignore[misc]
+    text = None  # type: ignore[misc]
+    is_rate_limited = None  # type: ignore[misc]
+    blacklist_token = None  # type: ignore[misc]
+    is_token_blacklisted = None  # type: ignore[misc]
 
 from services.auth_service.encryption import decrypt_2fa_secret, encrypt_2fa_secret
 from services.auth_service.rate_limiter import IP_WINDOW_SECONDS, LoginRateLimiter
@@ -65,8 +73,6 @@ from services.auth_service.rbac_engine import (
     list_roles,
 )
 from services.common.security_utils import sanitize_for_log
-from .encryption import decrypt_2fa_secret, encrypt_2fa_secret
-from .rate_limiter import RateLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +93,15 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__ident=
 
 # OAuth2 scheme
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+
+# FastAPI application
+app = FastAPI(
+    title="CosmicSec Authentication Service",
+    description="Handles user authentication, JWT tokens, OAuth2, and session management",
+    version="0.1.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+)
 
 
 # Data models

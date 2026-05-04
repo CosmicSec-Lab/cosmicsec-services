@@ -1,0 +1,81 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cosmicsec-services"
+version = "0.1.0"
+description = "CosmicSec Platform Services — authentication, scanning, recon, and more"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi==0.115.12",
+    "uvicorn[standard]==0.34.2",
+    "pydantic==2.11.3",
+    "pydantic-settings==2.8.1",
+    "python-multipart==0.0.20",
+    "python-jose[cryptography]==3.4.0",
+    "passlib[bcrypt]==1.7.4",
+    "bcrypt==4.3.0",
+    "cryptography==44.0.2",
+    "pyotp==2.9.0",
+    "casbin==1.38.0",
+    "email-validator==2.2.0",
+    "sqlalchemy==2.0.40",
+    "psycopg2-binary==2.9.10",
+    "alembic==1.15.2",
+    "pymongo==4.12.0",
+    "redis==5.2.1",
+    "nats-py==2.10.0",
+    "httpx==0.28.1",
+    "aiosmtplib==4.0.0",
+    "asyncssh==2.20.0",
+    "celery==5.4.0",
+    "apscheduler==3.11.0",
+    "jinja2==3.1.6",
+    "reportlab==4.3.1",
+    "python-docx==1.1.2",
+    "sentry-sdk[fastapi]==2.25.1",
+    "opentelemetry-api==1.31.1",
+    "opentelemetry-sdk==1.31.1",
+    "opentelemetry-instrumentation-fastapi==0.52b1",
+    "opentelemetry-exporter-otlp==1.31.1",
+    "prometheus-client==0.21.1",
+    "structlog==25.2.0",
+    "typer==0.15.2",
+    "rich==14.0.0",
+    "pyyaml==6.0.2",
+    "python-dateutil==2.9.0.post0",
+    "tenacity==9.1.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.3.5",
+    "pytest-asyncio==0.25.3",
+    "pytest-cov==6.1.1",
+    "ruff==0.9.10",
+    "mypy==1.15.0",
+    "pre-commit==4.2.0",
+    "factory-boy==3.3.3",
+    "faker==37.1.0",
+    "respx==0.22.0",
+    "freezegun==1.5.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.13"
+warn_return_any = true
+warn_unused_configs = true

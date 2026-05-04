@@ -1,0 +1,22 @@
+# ── Testing ─────────────────────────────────────────────────────
+pytest==8.3.5
+pytest-asyncio==0.25.3
+pytest-cov==6.1.1
+httpx==0.28.1
+factory-boy==3.3.3
+faker==37.1.0
+respx==0.22.0
+freezegun==1.5.1
+
+# ── Linting & Formatting ───────────────────────────────────────
+ruff==0.9.10
+mypy==1.15.0
+pre-commit==4.2.0
+
+# ── Type stubs ─────────────────────────────────────────────────
+types-redis==4.6.0.20241004
+types-python-jose==3.4.0.20241218
+types-passlib==1.7.7.20241221
+types-pyyaml==6.0.12.20241230
+types-cryptography==3.3.23.2
+types-requests==2.32.0.20250306

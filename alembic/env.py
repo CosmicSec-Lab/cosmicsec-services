@@ -3,16 +3,23 @@
 from __future__ import annotations
 
 import os
+import sys
 from logging.config import fileConfig
+from pathlib import Path
 
 from alembic import context
 from sqlalchemy import engine_from_config, pool
+
+root = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(root))
 
 config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-target_metadata = None
+from services.common.db import Base  # noqa: E402
+
+target_metadata = Base.metadata
 
 
 def run_migrations_offline() -> None:

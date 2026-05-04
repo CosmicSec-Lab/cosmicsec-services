@@ -1,0 +1,354 @@
+services:
+  # ── Infrastructure ───────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: cosmicsec
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-devpass}
+      POSTGRES_DB: cosmicsec
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cosmicsec"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  mongodb:
+    image: mongo:7
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: cosmicsec
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:-devpass}
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  nats:
+    image: nats:2-alpine
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    command: ["--js"]
+
+  # ── Core Services ────────────────────────────────────────────────
+  auth:
+    build:
+      context: .
+      dockerfile: services/auth_service/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+psycopg2://cosmicsec:${POSTGRES_PASSWORD:-devpass}@postgres:5432/cosmicsec
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-dev-secret-key-change-in-production}
+      DEPLOYMENT_ENV: docker
+    ports:
+      - "8001:8001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 25s
+
+  scan:
+    build:
+      context: .
+      dockerfile: services/scan_service/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+psycopg2://cosmicsec:${POSTGRES_PASSWORD:-devpass}@postgres:5432/cosmicsec
+      REDIS_URL: redis://redis:6379/0
+      NATS_URL: nats://nats:4222
+      DEPLOYMENT_ENV: docker
+    ports:
+      - "8002:8002"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 25s
+
+  recon:
+    build:
+      context: .
+      dockerfile: services/recon_service/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+psycopg2://cosmicsec:${POSTGRES_PASSWORD:-devpass}@postgres:5432/cosmicsec
+      REDIS_URL: redis://redis:6379/0
+      DEPLOYMENT_ENV: docker
+    ports:
+      - "8003:8003"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 25s
+
+  report:
+    build:
+      context: .
+      dockerfile: services/report_service/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+psycopg2://cosmicsec:${POSTGRES_PASSWORD:-devpass}@postgres:5432/cosmicsec
+      DEPLOYMENT_ENV: docker
+    ports:
+      - "8005:8005"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8005/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 25s
+
+  collab:
+    build:
+      context: .
+      dockerfile: services/collab_service/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+psycopg2://cosmicsec:${POSTGRES_PASSWORD:-devpass}@postgres:5432/cosmicsec
+      REDIS_URL: redis://redis:6379/0
+      DEPLOYMENT_ENV: docker
+    ports:
+      - "8006:8006"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8006/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 25s
+
+  notification:
+    build:
+      context: .
+      dockerfile: services/notification_service/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+psycopg2://cosmicsec:${POSTGRES_PASSWORD:-devpass}@postgres:5432/cosmicsec
+      REDIS_URL: redis://redis:6379/0
+      NATS_URL: nats://nats:4222
+      DEPLOYMENT_ENV: docker
+    ports:
+      - "8012:8012"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8012/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 25s
+
+  egress:
+    build:
+      context: .
+      dockerfile: services/egress_service/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+psycopg2://cosmicsec:${POSTGRES_PASSWORD:-devpass}@postgres:5432/cosmicsec
+      DEPLOYMENT_ENV: docker
+    ports:
+      - "8016:8016"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8016/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 25s
+
+  integration:
+    build:
+      context: .
+      dockerfile: services/integration_service/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+psycopg2://cosmicsec:${POSTGRES_PASSWORD:-devpass}@postgres:5432/cosmicsec
+      MONGODB_URL: mongodb://cosmicsec:${MONGO_PASSWORD:-devpass}@mongodb:27017
+      DEPLOYMENT_ENV: docker
+    ports:
+      - "8020:8020"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8020/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 25s
+
+  bugbounty:
+    build:
+      context: .
+      dockerfile: services/bugbounty_service/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+psycopg2://cosmicsec:${POSTGRES_PASSWORD:-devpass}@postgres:5432/cosmicsec
+      DEPLOYMENT_ENV: docker
+    ports:
+      - "8025:8025"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8025/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 25s
+
+  compliance:
+    build:
+      context: .
+      dockerfile: services/compliance_service/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+psycopg2://cosmicsec:${POSTGRES_PASSWORD:-devpass}@postgres:5432/cosmicsec
+      DEPLOYMENT_ENV: docker
+    ports:
+      - "8030:8030"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8030/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 25s
+
+  org:
+    build:
+      context: .
+      dockerfile: services/org_service/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+psycopg2://cosmicsec:${POSTGRES_PASSWORD:-devpass}@postgres:5432/cosmicsec
+      DEPLOYMENT_ENV: docker
+    ports:
+      - "8035:8035"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8035/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 25s
+
+  soc:
+    build:
+      context: .
+      dockerfile: services/professional_soc_service/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+psycopg2://cosmicsec:${POSTGRES_PASSWORD:-devpass}@postgres:5432/cosmicsec
+      DEPLOYMENT_ENV: docker
+    ports:
+      - "8040:8040"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8040/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 25s
+
+  agent-relay:
+    build:
+      context: .
+      dockerfile: services/agent_relay/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+psycopg2://cosmicsec:${POSTGRES_PASSWORD:-devpass}@postgres:5432/cosmicsec
+      REDIS_URL: redis://redis:6379/0
+      DEPLOYMENT_ENV: docker
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 25s
+
+  # ── Rust Ingest Engine ───────────────────────────────────────────
+  ingest:
+    build:
+      context: ./ingest
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgresql+psycopg2://cosmicsec:${POSTGRES_PASSWORD:-devpass}@postgres:5432/cosmicsec
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8099:8099"
+      - "50051:50051"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8099/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  postgres_data:
+  redis_data:
+  mongo_data:
