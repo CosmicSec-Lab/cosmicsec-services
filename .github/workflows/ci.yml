@@ -1,0 +1,148 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  PYTHON_VERSION: "3.13"
+  RUST_VERSION: "1.78"
+
+jobs:
+  lint:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install ruff
+        run: pip install ruff
+      - name: Run ruff linter
+        run: ruff check services/
+      - name: Run ruff formatter
+        run: ruff format --check services/
+
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: cosmicsec
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_DB: cosmicsec_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install dependencies
+        run: pip install -r requirements/runtime.txt -r requirements/dev.txt
+      - name: Run tests
+        env:
+          DATABASE_URL: postgresql+psycopg://cosmicsec:testpass@localhost:5432/cosmicsec_test
+          REDIS_HOST: localhost
+          REDIS_PORT: 6379
+          JWT_SECRET_KEY: test-secret-key-for-ci
+        run: pytest tests/ -v --tb=short --cov=services --cov-report=xml
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.xml
+          fail_ci_if_error: false
+
+  build:
+    name: Build Docker Images
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    if: github.event_name == 'push'
+    strategy:
+      matrix:
+        service:
+          - auth_service
+          - scan_service
+          - recon_service
+          - report_service
+          - collab_service
+          - notification_service
+          - egress_service
+          - integration_service
+          - bugbounty_service
+          - compliance_service
+          - org_service
+          - professional_soc_service
+          - agent_relay
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build service image
+        run: |
+          docker build \
+            -t cosmicsec/${{ matrix.service }}:${{ github.sha }} \
+            -t cosmicsec/${{ matrix.service }}:latest \
+            -f services/${{ matrix.service }}/Dockerfile .
+
+  rust-check:
+    name: Rust Ingest Engine
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ingest/target
+          key: rust-ingest-${{ hashFiles('ingest/Cargo.lock') }}
+      - name: Install proto tools
+        run: cargo install protobuf-codegen
+      - name: Generate proto stubs
+        working-directory: ingest
+        run: cargo build --lib
+      - name: Clippy
+        working-directory: ingest
+        run: cargo clippy -- -D warnings
+      - name: Tests
+        working-directory: ingest
+        run: cargo test
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-results.sarif
+      - name: Upload Trivy results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif

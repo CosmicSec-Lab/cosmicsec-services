@@ -43,8 +43,10 @@ try:
     from sqlalchemy import text
     from sqlalchemy.orm import Session as SASession
 
-    from services.common.db import SessionLocal
-    from services.common.models import APIKeyModel, SessionModel, UserModel
+from services.common.db import SessionLocal
+from services.common.models import APIKeyModel, SessionModel, UserModel
+from services.common.rate_limiter import is_rate_limited
+from services.common.token_blacklist import blacklist_token, is_token_blacklisted
 
     _HAS_DB = True
 except ImportError:  # pragma: no cover - optional dependency at runtime
@@ -63,26 +65,22 @@ from services.auth_service.rbac_engine import (
     list_roles,
 )
 from services.common.security_utils import sanitize_for_log
+from .encryption import decrypt_2fa_secret, encrypt_2fa_secret
+from .rate_limiter import RateLimiter
 
-app = FastAPI(
-    title="CosmicSec Auth Service",
-    description="Authentication and authorization service for GuardAxisSphere",
-    version="1.0.0",
-)
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Security configuration
-SECRET_KEY = os.getenv("JWT_SECRET_KEY", secrets.token_urlsafe(32))
+SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+if not SECRET_KEY:
+    raise RuntimeError(
+        "JWT_SECRET_KEY environment variable is required. "
+        "Generate one with: python -c 'import secrets; print(secrets.token_urlsafe(48))'"
+    )
 API_KEY_HASH_SECRET = os.getenv("API_KEY_HASH_SECRET", SECRET_KEY)
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60
-REFRESH_TOKEN_EXPIRE_DAYS = 30
-ALLOW_INSECURE_2FA_FALLBACK = os.getenv(
-    "COSMICSEC_ALLOW_INSECURE_2FA_FALLBACK", "false"
-).strip().lower() in {"1", "true", "yes", "on"}
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("JWT_ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
+REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("JWT_REFRESH_TOKEN_EXPIRE_DAYS", "30"))
 
 # Password hashing with bcrypt 4.0+ compatibility
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__ident="2b")
@@ -1085,7 +1083,15 @@ def _session_exists(session_id: str) -> bool:
 
 
 def _enforce_permission(role: str, action: str) -> bool:
-    return action in {"read", "write", "delete", "manage"}
+    role_permissions = {
+        "viewer": {"read"},
+        "user": {"read", "write"},
+        "analyst": {"read", "write"},
+        "admin": {"read", "write", "delete", "manage"},
+        "owner": {"read", "write", "delete", "manage"},
+    }
+    allowed = role_permissions.get(role, set())
+    return action in allowed
 
 
 def _build_casbin_enforcer():
@@ -1173,9 +1179,16 @@ def create_refresh_token(data: dict, session_id: str | None = None) -> str:
 
 
 def verify_token(token: str) -> TokenData:
-    """Verify and decode JWT token"""
+    """Verify and decode JWT token with blacklist check."""
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        jti = payload.get("jti")
+        if jti and is_token_blacklisted(jti):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token has been revoked",
+            )
+
         email: str = payload.get("sub")
         user_id: str = payload.get("user_id")
         role: str = payload.get("role")
@@ -1248,8 +1261,17 @@ async def metrics() -> PlainTextResponse:
 
 
 @app.post("/register", response_model=dict)
-async def register(user_data: UserCreate):
-    """Register a new user"""
+async def register(user_data: UserCreate, request: Request):
+    """Register a new user with rate limiting."""
+    client_ip = request.client.host if request.client else "unknown"
+    rl_key = f"register:{client_ip}"
+    limited, rl_info = is_rate_limited(rl_key, max_requests=5, window_seconds=300)
+    if limited:
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content={"detail": f"Too many registration attempts. Retry after {rl_info['retry_after']}s."},
+            headers={"Retry-After": str(rl_info["retry_after"])},
+        )
     # Check if user already exists
     existing_user = fake_users_db.get(user_data.email) or load_user_from_db(user_data.email)
     if existing_user:
@@ -1399,11 +1421,21 @@ async def refresh(payload: RefreshRequest):
 
 
 @app.post("/forgot-password")
-async def forgot_password(payload: ForgotPasswordRequest):
+async def forgot_password(payload: ForgotPasswordRequest, request: Request):
     """Generate a password reset challenge token for known users.
 
     Always returns a generic success response to avoid account enumeration.
+    Rate limited to prevent abuse.
     """
+    client_ip = request.client.host if request.client else "unknown"
+    rl_key = f"forgot:{client_ip}"
+    limited, rl_info = is_rate_limited(rl_key, max_requests=3, window_seconds=300)
+    if limited:
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content={"detail": f"Too many reset requests. Retry after {rl_info['retry_after']}s."},
+            headers={"Retry-After": str(rl_info["retry_after"])},
+        )
     user = fake_users_db.get(payload.email) or load_user_from_db(payload.email)
     if user:
         reset_token = secrets.token_urlsafe(24)
@@ -1419,8 +1451,17 @@ async def forgot_password(payload: ForgotPasswordRequest):
 
 
 @app.post("/verify-2fa")
-async def verify_2fa_login(payload: Verify2FALoginRequest):
+async def verify_2fa_login(payload: Verify2FALoginRequest, request: Request):
     """Verify a 2FA code and issue access/refresh tokens for login completion."""
+    client_ip = request.client.host if request.client else "unknown"
+    rl_key = f"2fa:{payload.email}"
+    limited, rl_info = is_rate_limited(rl_key, max_requests=5, window_seconds=120)
+    if limited:
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content={"detail": f"Too many 2FA attempts. Retry after {rl_info['retry_after']}s."},
+            headers={"Retry-After": str(rl_info["retry_after"])},
+        )
     user = fake_users_db.get(payload.email) or load_user_from_db(payload.email)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -1436,7 +1477,7 @@ async def verify_2fa_login(payload: Verify2FALoginRequest):
     if pyotp is not None:
         valid = pyotp.TOTP(secret).verify(payload.code)
     else:
-        valid = ALLOW_INSECURE_2FA_FALLBACK and payload.code == "000000"
+        raise HTTPException(status_code=503, detail="2FA service unavailable — pyotp not installed")
 
     if not valid:
         raise HTTPException(status_code=401, detail="Invalid verification code")
@@ -1491,9 +1532,24 @@ async def get_current_user_info(current_user: User = Depends(get_current_user)):
 
 
 @app.post("/logout")
-async def logout(current_user: User = Depends(get_current_user)):
-    """Logout user (invalidate token)"""
-    # In production, add token to blacklist in Redis
+async def logout(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    """Logout user and blacklist the token."""
+    auth_header = request.headers.get("authorization", "")
+    token = auth_header.removeprefix("Bearer ").strip()
+    if token:
+        try:
+            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+            jti = payload.get("jti")
+            exp = payload.get("exp", 0)
+            ttl = max(int(exp) - int(time.time()), 60)
+            if jti:
+                blacklist_token(jti, ttl_seconds=ttl)
+        except JWTError:
+            pass
+
     logger.info("User logged out: %s", sanitize_for_log(current_user.email))
     _audit("user.logout", current_user.email, "logout requested")
     return {"message": "Successfully logged out"}
@@ -1886,7 +1942,7 @@ async def verify_2fa(payload: TwoFactorVerifyRequest):
     if pyotp is not None:
         valid = pyotp.TOTP(secret).verify(payload.code)
     else:
-        valid = ALLOW_INSECURE_2FA_FALLBACK and payload.code == "000000"
+        raise HTTPException(status_code=503, detail="2FA service unavailable — pyotp not installed")
 
     return {"verified": bool(valid)}
 
@@ -2632,20 +2688,6 @@ async def store_secret(
     return {"org_id": org_id, "stored": True, "name": payload.name, "engine": payload.engine}
 
 
-def _field_encrypt(raw: str) -> str:
-    key = hashlib.sha256(SECRET_KEY.encode("utf-8")).digest()
-    data = raw.encode("utf-8")
-    ciphertext = bytes(b ^ key[i % len(key)] for i, b in enumerate(data))
-    return base64.b64encode(ciphertext).decode("utf-8")
-
-
-def _field_decrypt(raw: str) -> str:
-    key = hashlib.sha256(SECRET_KEY.encode("utf-8")).digest()
-    data = base64.b64decode(raw.encode("utf-8"))
-    plaintext = bytes(b ^ key[i % len(key)] for i, b in enumerate(data))
-    return plaintext.decode("utf-8")
-
-
 @app.post("/orgs/{org_id}/security/field-encryption/encrypt")
 async def encrypt_field_value(
     org_id: str,
@@ -2654,7 +2696,7 @@ async def encrypt_field_value(
 ):
     _ensure_org_exists(org_id)
     _require_org_admin(org_id, current_user.email)
-    encrypted = _field_encrypt(payload.value)
+    encrypted = encrypt_2fa_secret(payload.value)
     _audit_org("org.security.field.encrypt", current_user.email, org_id, "field encrypted")
     return {"org_id": org_id, "encrypted_value": encrypted}
 
@@ -2667,7 +2709,7 @@ async def decrypt_field_value(
 ):
     _ensure_org_exists(org_id)
     _require_org_admin(org_id, current_user.email)
-    decrypted = _field_decrypt(payload.value)
+    decrypted = decrypt_2fa_secret(payload.value)
     _audit_org("org.security.field.decrypt", current_user.email, org_id, "field decrypted")
     return {"org_id": org_id, "decrypted_value": decrypted}
 

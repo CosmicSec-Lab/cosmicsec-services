@@ -1,0 +1,61 @@
+# CosmicSec Services — Shared Runtime Dependencies
+# Used by all Python microservice Docker builds.
+# Keep this file in sync with service imports.
+
+# ── Web framework ──────────────────────────────────────────────
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+pydantic==2.11.3
+pydantic-settings==2.8.1
+python-multipart==0.0.20
+
+# ── Auth & Security ───────────────────────────────────────────
+python-jose[cryptography]==3.4.0
+passlib[bcrypt]==1.7.4
+bcrypt==4.3.0
+cryptography==44.0.2
+pyotp==2.9.0
+casbin==1.38.0
+email-validator==2.2.0
+
+# ── Database ──────────────────────────────────────────────────
+sqlalchemy==2.0.40
+psycopg2-binary==2.9.10
+alembic==1.15.2
+pymongo==4.12.0
+
+# ── Cache & Messaging ─────────────────────────────────────────
+redis==5.2.1
+nats-py==2.10.0
+
+# ── HTTP & Networking ─────────────────────────────────────────
+httpx==0.28.1
+aiosmtplib==4.0.0
+asyncssh==2.20.0
+
+# ── Task Queue ────────────────────────────────────────────────
+celery==5.4.0
+apscheduler==3.11.0
+
+# ── Templates & Reports ───────────────────────────────────────
+jinja2==3.1.6
+reportlab==4.3.1
+python-docx==1.1.2
+
+# ── Observability ─────────────────────────────────────────────
+sentry-sdk[fastapi]==2.25.1
+opentelemetry-api==1.31.1
+opentelemetry-sdk==1.31.1
+opentelemetry-instrumentation-fastapi==0.52b1
+opentelemetry-exporter-otlp==1.31.1
+prometheus-client==0.21.1
+structlog==25.2.0
+
+# ── CLI & Admin ───────────────────────────────────────────────
+typer==0.15.2
+rich==14.0.0
+
+# ── Utilities ─────────────────────────────────────────────────
+pyyaml==6.0.2
+python-dateutil==2.9.0.post0
+tenacity==9.1.2

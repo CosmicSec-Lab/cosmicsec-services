@@ -9,21 +9,22 @@ Cache TTLs:
   RDAP/WHOIS:        6 hours
 """
 
+import asyncio
 import contextlib
 import hashlib
 import json
 import os
 import re
 import socket
-from asyncio import gather
 from datetime import UTC, datetime
 from urllib.parse import quote, urlparse
 
 import httpx
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from pydantic import BaseModel
 from starlette.responses import PlainTextResponse
 
+from services.common.auth_middleware import get_current_active_user
 from services.common.egress import EgressOptions, EgressStrategyError, create_async_client
 
 try:
@@ -90,7 +91,7 @@ def _normalize_target(target: str) -> str:
     return value
 
 
-def _dns_recon(target: str) -> dict:
+async def _dns_recon(target: str) -> dict:
     cache_key = _cache_key("dns", target)
     cached = _cache_get(cache_key)
     if cached is not None:
@@ -98,7 +99,7 @@ def _dns_recon(target: str) -> dict:
 
     result: dict = {"target": target, "ips": [], "errors": []}
     try:
-        _, _, ips = socket.gethostbyname_ex(target)
+        _, _, ips = await asyncio.to_thread(socket.gethostbyname_ex, target)
         result["ips"] = sorted(set(ips))
     except OSError as exc:
         result["errors"].append(str(exc))
@@ -228,7 +229,9 @@ def metrics() -> PlainTextResponse:
 
 
 @app.get("/cache/stats")
-def cache_stats() -> dict:
+def cache_stats(
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     """Return cache health and (if Redis available) info."""
     if not _CACHE_ENABLED or _sync_redis is None:
         return {"enabled": False, "reason": "Redis unavailable"}
@@ -244,7 +247,10 @@ def cache_stats() -> dict:
 
 
 @app.post("/recon")
-async def run_recon(payload: ReconRequest) -> dict:
+async def run_recon(
+    payload: ReconRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     target = _normalize_target(payload.target)
     if target == "invalid-target":
         return {
@@ -253,7 +259,7 @@ async def run_recon(payload: ReconRequest) -> dict:
             "timestamp": datetime.now(tz=UTC).isoformat(),
         }
 
-    dns = _dns_recon(target)
+    dns = await _dns_recon(target)
 
     try:
         client, network = create_async_client(
@@ -285,7 +291,7 @@ async def run_recon(payload: ReconRequest) -> dict:
         }
 
     async with client:
-        shodan, virustotal, crtsh, rdap = await gather(
+        shodan, virustotal, crtsh, rdap = await asyncio.gather(
             _shodan_lookup(client, target),
             _virustotal_lookup(client, target),
             _crtsh_lookup(client, target),

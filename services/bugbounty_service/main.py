@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from services.common.auth_middleware import get_current_active_user
 from services.common.db import get_db
 from services.common.models import (
     BugBountyActivityModel,
@@ -94,12 +95,16 @@ def health() -> dict:
 
 
 @app.get("/platforms")
-def list_platforms() -> dict:
+def list_platforms(_user: dict = Depends(get_current_active_user)) -> dict:
     return {"platforms": platforms, "total": len(platforms)}
 
 
 @app.post("/programs", status_code=201)
-def create_program(payload: ProgramCreate, db: Session = Depends(get_db)) -> dict:
+def create_program(
+    payload: ProgramCreate,
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     if payload.platform.lower() not in platforms:
         raise HTTPException(status_code=400, detail="Unsupported bug bounty platform")
     program_id = f"bbp-{uuid.uuid4().hex[:8]}"
@@ -148,7 +153,11 @@ def create_program(payload: ProgramCreate, db: Session = Depends(get_db)) -> dic
 
 
 @app.get("/programs")
-def list_programs(platform: str | None = None, db: Session = Depends(get_db)) -> dict:
+def list_programs(
+    platform: str | None = None,
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     try:
         query = db.query(BugBountyProgramModel)
         if platform:
@@ -164,7 +173,11 @@ def list_programs(platform: str | None = None, db: Session = Depends(get_db)) ->
 
 
 @app.post("/recon/auto")
-def automated_recon(payload: ReconRequest, db: Session = Depends(get_db)) -> dict:
+def automated_recon(
+    payload: ReconRequest,
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     try:
         program = (
             db.query(BugBountyProgramModel)
@@ -186,13 +199,19 @@ def automated_recon(payload: ReconRequest, db: Session = Depends(get_db)) -> dic
 
 
 @app.post("/findings/prioritize")
-def prioritize_findings(payload: PrioritizationRequest) -> dict:
+def prioritize_findings(
+    payload: PrioritizationRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     ranked = sorted(payload.findings, key=lambda x: int(x.get("score", 0)), reverse=True)
     return {"ranked_findings": ranked, "total": len(ranked)}
 
 
 @app.post("/poc/build")
-def build_poc_template(finding: dict) -> dict:
+def build_poc_template(
+    finding: dict,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     title = finding.get("title", "vulnerability")
     return {
         "title": title,
@@ -201,7 +220,11 @@ def build_poc_template(finding: dict) -> dict:
 
 
 @app.post("/submissions", status_code=201)
-def create_submission(payload: SubmissionCreate, db: Session = Depends(get_db)) -> dict:
+def create_submission(
+    payload: SubmissionCreate,
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     try:
         program = (
             db.query(BugBountyProgramModel)
@@ -269,7 +292,11 @@ def create_submission(payload: SubmissionCreate, db: Session = Depends(get_db)) 
 
 
 @app.post("/submissions/{submission_id}/submit")
-def submit_submission(submission_id: str, db: Session = Depends(get_db)) -> dict:
+def submit_submission(
+    submission_id: str,
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     try:
         entry = (
             db.query(BugBountySubmissionModel)
@@ -323,6 +350,7 @@ def list_submissions(
     limit: int = Query(default=25, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_active_user),
 ) -> dict:
     query = db.query(BugBountySubmissionModel)
 
@@ -354,7 +382,11 @@ def list_submissions(
 
 
 @app.get("/submissions/{submission_id}")
-def get_submission(submission_id: str, db: Session = Depends(get_db)) -> dict:
+def get_submission(
+    submission_id: str,
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     entry = (
         db.query(BugBountySubmissionModel)
         .filter(BugBountySubmissionModel.id == submission_id)
@@ -370,6 +402,7 @@ def update_submission_status(
     submission_id: str,
     payload: SubmissionStatusUpdate,
     db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_active_user),
 ) -> dict:
     entry = (
         db.query(BugBountySubmissionModel)
@@ -417,7 +450,10 @@ def update_submission_status(
 
 
 @app.get("/dashboard/earnings")
-def earnings_dashboard(db: Session = Depends(get_db)) -> dict:
+def earnings_dashboard(
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     try:
         all_subs = db.query(BugBountySubmissionModel).all()
         paid = [s for s in all_subs if s.status == "paid"]
@@ -444,7 +480,10 @@ def earnings_dashboard(db: Session = Depends(get_db)) -> dict:
 
 
 @app.get("/dashboard/status-breakdown")
-def submission_status_breakdown(db: Session = Depends(get_db)) -> dict:
+def submission_status_breakdown(
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     all_subs = db.query(BugBountySubmissionModel).all()
     breakdown = dict.fromkeys(sorted(_ALLOWED_STATUS), 0)
     for sub in all_subs:
@@ -453,7 +492,10 @@ def submission_status_breakdown(db: Session = Depends(get_db)) -> dict:
 
 
 @app.get("/dashboard/overview")
-def dashboard_overview(db: Session = Depends(get_db)) -> dict:
+def dashboard_overview(
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     """Return a compact professional dashboard snapshot for the bug bounty UI."""
 
     def _status_breakdown(
@@ -539,7 +581,11 @@ def dashboard_overview(db: Session = Depends(get_db)) -> dict:
 
 
 @app.get("/timeline")
-def timeline(program_id: str | None = None, db: Session = Depends(get_db)) -> dict:
+def timeline(
+    program_id: str | None = None,
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     events = []
     programs_q = db.query(BugBountyProgramModel)
     if program_id:
@@ -584,7 +630,11 @@ def timeline(program_id: str | None = None, db: Session = Depends(get_db)) -> di
 
 
 @app.post("/collaboration/share")
-def collaboration_share(payload: CollaborationShare, db: Session = Depends(get_db)) -> dict:
+def collaboration_share(
+    payload: CollaborationShare,
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     try:
         program = (
             db.query(BugBountyProgramModel)
@@ -640,6 +690,7 @@ def collaboration_threads_list(
     limit: int = Query(default=25, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_active_user),
 ) -> dict:
     try:
         query = db.query(BugBountyThreadModel)
@@ -667,7 +718,9 @@ def collaboration_threads_list(
 
 
 @app.get("/reports/templates")
-def list_report_templates() -> dict:
+def list_report_templates(
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     return {"templates": report_templates, "total": len(report_templates)}
 
 

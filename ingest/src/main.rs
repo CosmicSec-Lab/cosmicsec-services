@@ -1,5 +1,6 @@
 mod config;
 mod db;
+mod grpc;
 mod metrics;
 mod normalizer;
 mod parsers;
@@ -22,10 +23,10 @@ use tracing_subscriber::EnvFilter;
 
 /// Shared application state passed to every Axum handler.
 #[derive(Clone)]
-struct AppState {
-    metrics: Arc<Metrics>,
-    start_time: std::time::Instant,
-    version: &'static str,
+pub struct AppState {
+    pub metrics: Arc<Metrics>,
+    pub start_time: std::time::Instant,
+    pub version: &'static str,
 }
 
 #[tokio::main]
@@ -100,7 +101,7 @@ async fn main() -> Result<()> {
     }
 
     // ---------------------------------------------------------------------------
-    // HTTP health / metrics server
+    // HTTP health / metrics server (runs alongside gRPC)
     // ---------------------------------------------------------------------------
     let state = AppState {
         metrics: metrics.clone(),
@@ -108,17 +109,44 @@ async fn main() -> Result<()> {
         version: env!("CARGO_PKG_VERSION"),
     };
 
+    let http_state = state.clone();
     let router = Router::new()
         .route("/health", get(health_handler))
         .route("/metrics", get(metrics_handler))
         .route("/ready", get(ready_handler))
-        .with_state(state);
+        .with_state(http_state);
 
-    let addr = format!("0.0.0.0:{}", cfg.http_port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    info!(addr = %addr, "HTTP health server listening");
+    let http_addr = format!("0.0.0.0:{}", cfg.http_port);
+    let http_listener = tokio::net::TcpListener::bind(&http_addr).await?;
+    info!(addr = %http_addr, "HTTP health server listening");
 
-    axum::serve(listener, router).await?;
+    // ---------------------------------------------------------------------------
+    // gRPC ingest server
+    // ---------------------------------------------------------------------------
+    let grpc_writer = db::DbWriter::new(
+        PgPoolOptions::new()
+            .max_connections(cfg.worker_concurrency as u32)
+            .connect(&cfg.database_url)
+            .await?,
+        cfg.db_batch_size,
+    );
+
+    let grpc_state = state.clone();
+    let grpc_addr = format!("0.0.0.0:{}", cfg.grpc_port);
+    let grpc_server = grpc::build_grpc_server(grpc_writer, grpc_state);
+    info!(addr = %grpc_addr, "gRPC ingest server listening");
+
+    // ---------------------------------------------------------------------------
+    // Run both servers concurrently
+    // ---------------------------------------------------------------------------
+    tokio::select! {
+        result = axum::serve(http_listener, router) => {
+            result?;
+        }
+        result = grpc_server.serve(grpc_addr.parse()?) => {
+            result?;
+        }
+    }
 
     Ok(())
 }

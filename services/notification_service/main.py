@@ -24,9 +24,11 @@ from typing import Any
 import asyncssh
 import httpx
 import redis
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
+
+from services.common.auth_middleware import get_current_active_user
 
 from services.common.security_utils import sanitize_for_log, validate_outbound_url
 
@@ -568,7 +570,7 @@ def _dispatch(config: dict, event: NotificationEvent) -> None:
         raise
 
 
-def _dispatch_with_retry(config: dict, event: NotificationEvent) -> None:
+async def _dispatch_with_retry(config: dict, event: NotificationEvent) -> None:
     cfg = config.get("config", {})
     max_retries = int(cfg.get("max_retries", 0))
     base_delay_ms = int(cfg.get("base_delay_ms", 200))
@@ -592,7 +594,8 @@ def _dispatch_with_retry(config: dict, event: NotificationEvent) -> None:
                 raise
 
             delay_ms = base_delay_ms * (2**attempt) + random.randint(0, max(0, jitter_ms))
-            time.sleep(delay_ms / 1000)
+            delay_sec = min(delay_ms / 1000, 30)  # Cap at 30s to avoid excessive waits
+            await asyncio.sleep(delay_sec)
             attempt += 1
 
 
@@ -625,7 +628,7 @@ def _percentile(values: list[int], pct: float) -> int:
     if not values:
         return 0
     sorted_vals = sorted(values)
-    k = int((len(sorted_vals) - 1) * pct)
+    k = max(0, min(int((len(sorted_vals) - 1) * pct), len(sorted_vals) - 1))
     return sorted_vals[k]
 
 
@@ -644,12 +647,17 @@ def health() -> dict:
 
 
 @app.get("/notify/channels")
-def list_supported_channels() -> dict[str, Any]:
+def list_supported_channels(
+    _user: dict = Depends(get_current_active_user),
+) -> dict[str, Any]:
     return {"channels": _CHANNELS}
 
 
 @app.post("/notify/config/validate")
-def validate_config(payload: ValidateConfigRequest) -> dict[str, Any]:
+def validate_config(
+    payload: ValidateConfigRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict[str, Any]:
     _validate_channel_config(payload.channel, payload.config)
     return {
         "valid": True,
@@ -659,13 +667,18 @@ def validate_config(payload: ValidateConfigRequest) -> dict[str, Any]:
 
 
 @app.post("/notify/policies")
-def create_policy(policy: PolicyProfile) -> PolicyProfile:
+def create_policy(
+    policy: PolicyProfile,
+    _user: dict = Depends(get_current_active_user),
+) -> PolicyProfile:
     _policies[policy.id] = policy.model_dump(mode="json")
     return policy
 
 
 @app.get("/notify/policies")
-def list_policies() -> dict[str, Any]:
+def list_policies(
+    _user: dict = Depends(get_current_active_user),
+) -> dict[str, Any]:
     return {"items": list(_policies.values())}
 
 
@@ -686,7 +699,10 @@ def metrics() -> str:
 
 
 @app.post("/notify/config", response_model=NotificationConfig)
-def create_config(cfg: NotificationConfig) -> NotificationConfig:
+def create_config(
+    cfg: NotificationConfig,
+    _user: dict = Depends(get_current_active_user),
+) -> NotificationConfig:
     """Save a notification channel configuration."""
     _validate_channel_config(cfg.channel, cfg.config)
     _configs.append(cfg.model_dump(mode="json"))
@@ -695,13 +711,18 @@ def create_config(cfg: NotificationConfig) -> NotificationConfig:
 
 
 @app.get("/notify/configs", response_model=list[NotificationConfig])
-def list_configs() -> list[dict]:
+def list_configs(
+    _user: dict = Depends(get_current_active_user),
+) -> list[dict]:
     """List all stored notification configurations."""
     return _configs
 
 
 @app.delete("/notify/configs/{config_id}")
-def delete_config(config_id: str) -> dict:
+def delete_config(
+    config_id: str,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     """Delete a notification configuration by id."""
     global _configs
     before = len(_configs)
@@ -713,7 +734,10 @@ def delete_config(config_id: str) -> dict:
 
 
 @app.post("/notify/configs/{config_id}/enable")
-def enable_config(config_id: str) -> dict[str, Any]:
+def enable_config(
+    config_id: str,
+    _user: dict = Depends(get_current_active_user),
+) -> dict[str, Any]:
     for config in _configs:
         if config["id"] == config_id:
             config["enabled"] = True
@@ -722,7 +746,10 @@ def enable_config(config_id: str) -> dict[str, Any]:
 
 
 @app.post("/notify/configs/{config_id}/disable")
-def disable_config(config_id: str) -> dict[str, Any]:
+def disable_config(
+    config_id: str,
+    _user: dict = Depends(get_current_active_user),
+) -> dict[str, Any]:
     for config in _configs:
         if config["id"] == config_id:
             config["enabled"] = False
@@ -731,7 +758,10 @@ def disable_config(config_id: str) -> dict[str, Any]:
 
 
 @app.post("/notify/send")
-def send_notification(event: NotificationEvent) -> dict:
+def send_notification(
+    event: NotificationEvent,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     """Send a notification event to all matching channel configs."""
     errors: list[dict[str, str]] = []
     sent: list[dict[str, str]] = []
@@ -784,7 +814,10 @@ def send_notification(event: NotificationEvent) -> dict:
 
 
 @app.post("/notify/send/batch")
-def send_batch_notifications(payload: BatchNotificationRequest) -> dict[str, Any]:
+def send_batch_notifications(
+    payload: BatchNotificationRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict[str, Any]:
     if not payload.events:
         raise HTTPException(status_code=422, detail="events list cannot be empty")
 
@@ -807,7 +840,10 @@ def send_batch_notifications(payload: BatchNotificationRequest) -> dict[str, Any
 
 
 @app.get("/notify/delivery/history")
-def get_delivery_history(limit: int = 100) -> dict[str, Any]:
+def get_delivery_history(
+    limit: int = 100,
+    _user: dict = Depends(get_current_active_user),
+) -> dict[str, Any]:
     safe_limit = max(1, min(limit, 500))
     return {
         "count": min(safe_limit, len(_delivery_history)),
@@ -816,7 +852,9 @@ def get_delivery_history(limit: int = 100) -> dict[str, Any]:
 
 
 @app.get("/notify/analytics")
-def get_delivery_analytics() -> dict[str, Any]:
+def get_delivery_analytics(
+    _user: dict = Depends(get_current_active_user),
+) -> dict[str, Any]:
     if not _delivery_history:
         return {
             "total": 0,
@@ -860,7 +898,10 @@ def get_delivery_analytics() -> dict[str, Any]:
 
 
 @app.post("/notify/test")
-def test_notification(req: TestNotificationRequest) -> dict:
+def test_notification(
+    req: TestNotificationRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     """Send a test message to a specific config."""
     config = next((c for c in _configs if c["id"] == req.config_id), None)
     if not config:

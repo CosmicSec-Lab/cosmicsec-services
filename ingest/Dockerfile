@@ -17,6 +17,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Cache dependency download layer
 COPY Cargo.toml ./
+COPY build.rs ./
+RUN mkdir -p proto && echo 'syntax = "proto3"; package ingest; service IngestService {}' > proto/ingest.proto
 RUN mkdir src && echo "fn main() {}" > src/main.rs
 RUN cargo build --release && rm -rf src
 
@@ -41,7 +43,7 @@ WORKDIR /app
 COPY --from=builder /app/target/release/cosmicsec-ingest /app/cosmicsec-ingest
 
 # Create non-root user
-RUN useradd --system --no-create-home --shell /usr/sbin/nologin ingest
+RUN useradd --system --no-create-home --shell /usr/sbin/nologing ingest
 USER ingest
 
 EXPOSE 8099 50051

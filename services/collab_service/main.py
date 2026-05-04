@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from services.common.auth_middleware import get_current_active_user
 from services.common.db import get_db
 from services.common.jwt_utils import decode_token
 from services.common.models import CollabMessageModel, CollabReportSectionModel
@@ -318,7 +319,9 @@ async def health_check() -> dict:
 
 
 @app.get("/rooms")
-async def list_rooms() -> dict:
+async def list_rooms(
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     return {
         "rooms": [
             {
@@ -332,7 +335,12 @@ async def list_rooms() -> dict:
 
 
 @app.get("/rooms/{room_id}/messages")
-async def get_messages(room_id: str, limit: int = 50, db: Session = Depends(get_db)) -> dict:
+async def get_messages(
+    room_id: str,
+    limit: int = 50,
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     try:
         messages = (
             db.query(CollabMessageModel)
@@ -349,7 +357,10 @@ async def get_messages(room_id: str, limit: int = 50, db: Session = Depends(get_
 
 
 @app.get("/rooms/{room_id}/presence")
-async def get_presence(room_id: str) -> dict:
+async def get_presence(
+    room_id: str,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     room = _get_or_create_room(room_id)
     return {
         "room_id": room_id,
@@ -359,14 +370,20 @@ async def get_presence(room_id: str) -> dict:
 
 
 @app.get("/rooms/{room_id}/scan-state")
-async def get_scan_state(room_id: str) -> dict:
+async def get_scan_state(
+    room_id: str,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     room = _get_or_create_room(room_id)
     return {"room_id": room_id, "scan_state": room.scan_state}
 
 
 @app.post("/rooms/{room_id}/messages")
 async def post_message(
-    room_id: str, payload: SendMessageRequest, db: Session = Depends(get_db)
+    room_id: str,
+    payload: SendMessageRequest,
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_active_user),
 ) -> dict:
     """POST a message into a room (for non-WebSocket clients). Persisted to DB."""
     # Keep pytest runs deterministic across repeated executions on shared local DBs.
@@ -426,60 +443,10 @@ async def post_message(
 
 
 @app.post("/rooms/{room_id}/scan-state")
-async def update_scan_state(room_id: str, payload: ScanStateUpdate) -> dict:
-    room = _get_or_create_room(room_id)
-    state = {
-        "status": payload.status,
-        "progress": payload.progress,
-        "findings_count": payload.findings_count,
-    }
-    room.scan_state = state
-    await room.broadcast(
-        {
-            "type": "scan_update",
-            "room": room_id,
-            "state": state,
-            "updated_by": payload.updated_by,
-            "ts": datetime.now(UTC).isoformat(),
-        }
-    )
-    return {"room_id": room_id, "state": state}
-
-
-@app.get("/activity-feed")
-async def activity_feed(limit: int = 20, db: Session = Depends(get_db)) -> dict:
-    """Global activity feed — latest messages across all rooms."""
-    try:
-        messages = (
-            db.query(CollabMessageModel)
-            .order_by(CollabMessageModel.created_at.desc())
-            .limit(limit)
-            .all()
-        )
-        feed = [_msg_to_dict(m) for m in messages]
-        total = len(messages)
-    except SQLAlchemyError:
-        logger.warning("Collab DB unavailable for activity feed; using in-memory fallback")
-        flattened: list[dict[str, Any]] = []
-        for room_messages in _fallback_messages.values():
-            flattened.extend(room_messages)
-        flattened.sort(key=lambda m: str(m.get("ts", "")), reverse=True)
-        feed = flattened[:limit]
-        total = len(feed)
-    return {
-        "feed": feed,
-        "total_events": total,
-    }
-
-
-# ==========================================================================
-# Phase 2 — Collaborative Report Editing (persisted to DB)
-# ==========================================================================
-
-
-@app.post("/rooms/{room_id}/reports", status_code=201)
-async def create_report_section(
-    room_id: str, payload: ReportSection, db: Session = Depends(get_db)
+async def post_scan_state(
+    room_id: str,
+    payload: ScanStateUpdateRequest,
+    _user: dict = Depends(get_current_active_user),
 ) -> dict:
     section_id = payload.section_id or uuid.uuid4().hex
     section_row = CollabReportSectionModel(
@@ -518,7 +485,10 @@ async def create_report_section(
 
 @app.get("/rooms/{room_id}/reports")
 async def list_report_sections(
-    room_id: str, section_type: str | None = None, db: Session = Depends(get_db)
+    room_id: str,
+    section_type: str | None = None,
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_active_user),
 ) -> dict:
     query = db.query(CollabReportSectionModel).filter(CollabReportSectionModel.room_id == room_id)
     if section_type:
@@ -532,7 +502,12 @@ async def list_report_sections(
 
 
 @app.get("/rooms/{room_id}/reports/{section_id}")
-async def get_report_section(room_id: str, section_id: str, db: Session = Depends(get_db)) -> dict:
+async def get_report_section(
+    room_id: str,
+    section_id: str,
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     section = (
         db.query(CollabReportSectionModel)
         .filter(
@@ -550,7 +525,11 @@ async def get_report_section(room_id: str, section_id: str, db: Session = Depend
 
 @app.put("/rooms/{room_id}/reports/{section_id}")
 async def update_report_section(
-    room_id: str, section_id: str, payload: ReportSectionUpdate, db: Session = Depends(get_db)
+    room_id: str,
+    section_id: str,
+    payload: ReportSectionUpdate,
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_active_user),
 ) -> dict:
     from fastapi import HTTPException
 
@@ -603,7 +582,11 @@ async def update_report_section(
 
 @app.delete("/rooms/{room_id}/reports/{section_id}")
 async def delete_report_section(
-    room_id: str, section_id: str, editor: str = "api", db: Session = Depends(get_db)
+    room_id: str,
+    section_id: str,
+    editor: str = "api",
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_active_user),
 ) -> dict:
     from fastapi import HTTPException
 
@@ -635,7 +618,12 @@ async def delete_report_section(
 
 
 @app.get("/rooms/{room_id}/reports/{section_id}/history")
-async def get_section_history(room_id: str, section_id: str, db: Session = Depends(get_db)) -> dict:
+async def get_section_history(
+    room_id: str,
+    section_id: str,
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     from fastapi import HTTPException
 
     section = (

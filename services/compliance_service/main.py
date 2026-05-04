@@ -21,9 +21,11 @@ import os
 import uuid
 from datetime import UTC, datetime
 
-from fastapi import FastAPI, HTTPException, Path
+from fastapi import Depends, FastAPI, HTTPException, Path
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+
+from services.common.auth_middleware import get_current_active_user
 
 logger = logging.getLogger(__name__)
 
@@ -249,7 +251,7 @@ async def health():
 
 
 @app.get("/api/compliance/controls")
-async def list_controls():
+async def list_controls(_user: dict = Depends(get_current_active_user)):
     """List all compliance controls across all frameworks."""
     all_controls = {}
     for fw_id, fw in FRAMEWORKS.items():
@@ -265,6 +267,7 @@ async def list_controls():
 async def assess_framework(
     framework: str = Path(..., pattern=r"^(soc2|pci_dss|hipaa|iso27001)$"),
     payload: AssessmentRequest = AssessmentRequest(),
+    _user: dict = Depends(get_current_active_user),
 ):
     """
     Run a compliance assessment for the specified framework.
@@ -332,6 +335,7 @@ async def assess_framework(
 @app.get("/api/compliance/report/{framework}")
 async def get_compliance_report(
     framework: str = Path(..., pattern=r"^(soc2|pci_dss|hipaa|iso27001)$"),
+    _user: dict = Depends(get_current_active_user),
 ):
     """Get a placeholder compliance report for the framework."""
     fw = FRAMEWORKS.get(framework)

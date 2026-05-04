@@ -11,6 +11,7 @@ from fastapi import Depends, FastAPI
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from services.common.auth_middleware import get_current_active_user
 from services.common.db import get_db
 from services.common.models import (
     Phase5AlertModel,
@@ -156,7 +157,11 @@ def health() -> dict:
 
 
 @app.post("/soc/alerts/ingest")
-def soc_alert_ingest(payload: AlertIngest, db: Session = Depends(get_db)) -> dict:
+def soc_alert_ingest(
+    payload: AlertIngest,
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     score = {"critical": 95, "high": 80, "medium": 60, "low": 35}.get(payload.severity.lower(), 40)
     alert = Phase5AlertModel(
         source=payload.source,
@@ -179,7 +184,10 @@ def soc_alert_ingest(payload: AlertIngest, db: Session = Depends(get_db)) -> dic
 
 
 @app.get("/soc/alerts/dashboard")
-def soc_alert_dashboard(db: Session = Depends(get_db)) -> dict:
+def soc_alert_dashboard(
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     all_alerts = db.query(Phase5AlertModel).all()
     total = len(all_alerts)
     open_critical = sum(1 for a in all_alerts if a.severity.lower() == "critical")
@@ -195,7 +203,11 @@ def soc_alert_dashboard(db: Session = Depends(get_db)) -> dict:
 
 
 @app.post("/soc/incidents")
-def soc_incident_create(payload: IncidentCreate, db: Session = Depends(get_db)) -> dict:
+def soc_incident_create(
+    payload: IncidentCreate,
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     incident_id = f"inc-{uuid.uuid4().hex[:8]}"
     timeline = [{"step": "created", "at": datetime.now(UTC).isoformat()}]
     incident = Phase5IncidentModel(
@@ -220,20 +232,30 @@ def soc_incident_create(payload: IncidentCreate, db: Session = Depends(get_db)) 
 
 
 @app.get("/soc/incidents/{incident_id}/timeline")
-def soc_incident_timeline(incident_id: str, db: Session = Depends(get_db)) -> dict:
+def soc_incident_timeline(
+    incident_id: str,
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     incident = db.query(Phase5IncidentModel).filter(Phase5IncidentModel.id == incident_id).first()
     timeline = incident.timeline if incident else []
     return {"incident_id": incident_id, "timeline": timeline}
 
 
 @app.post("/soc/threat-hunt/query")
-def soc_threat_hunt(payload: HuntQuery) -> dict:
+def soc_threat_hunt(
+    payload: HuntQuery,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     simulated_hits = [{"match": payload.hypothesis, "query": payload.query, "confidence": 0.82}]
     return {"datasource": payload.datasource, "hits": simulated_hits, "behavioral_analytics": True}
 
 
 @app.post("/soc/soar/playbook/run")
-def soc_run_playbook(payload: PlaybookRun) -> dict:
+def soc_run_playbook(
+    payload: PlaybookRun,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     return {
         "playbook": payload.playbook,
         "target": payload.target,
@@ -244,7 +266,10 @@ def soc_run_playbook(payload: PlaybookRun) -> dict:
 
 
 @app.post("/soc/shifts/handoff")
-def soc_shift_handoff(payload: ShiftHandoff) -> dict:
+def soc_shift_handoff(
+    payload: ShiftHandoff,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     return {
         "status": "recorded",
         "handoff": payload.model_dump(),
@@ -253,12 +278,17 @@ def soc_shift_handoff(payload: ShiftHandoff) -> dict:
 
 
 @app.get("/soc/metrics")
-def soc_metrics() -> dict:
+def soc_metrics(
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     return {"mttd_minutes": 14, "mttr_minutes": 42, "alert_fatigue_index": 0.27}
 
 
 @app.post("/devsecops/sast/analyze")
-def devsecops_sast(payload: SastRequest) -> dict:
+def devsecops_sast(
+    payload: SastRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     findings = [
         {
             "type": "sql_injection_pattern",
@@ -280,7 +310,10 @@ def devsecops_sast(payload: SastRequest) -> dict:
 
 
 @app.post("/devsecops/dependencies/scan")
-def devsecops_dependency_scan(payload: DependencyScanRequest) -> dict:
+def devsecops_dependency_scan(
+    payload: DependencyScanRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     vulnerable = [
         d
         for d in payload.dependencies
@@ -294,7 +327,10 @@ def devsecops_dependency_scan(payload: DependencyScanRequest) -> dict:
 
 
 @app.post("/devsecops/cicd/gate")
-def devsecops_cicd_gate(payload: CIGateRequest) -> dict:
+def devsecops_cicd_gate(
+    payload: CIGateRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     blocked = any(
         str(f.get("severity", "")).lower() in {"critical", "high"} for f in payload.findings
     )
@@ -302,7 +338,10 @@ def devsecops_cicd_gate(payload: CIGateRequest) -> dict:
 
 
 @app.post("/devsecops/ide/highlight")
-def devsecops_ide_highlight(payload: IDEHighlightRequest) -> dict:
+def devsecops_ide_highlight(
+    payload: IDEHighlightRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     hits = []
     if "eval(" in payload.content:
         hits.append({"line_hint": "contains eval()", "severity": "high"})
@@ -312,7 +351,10 @@ def devsecops_ide_highlight(payload: IDEHighlightRequest) -> dict:
 
 
 @app.post("/devsecops/lint/run")
-def devsecops_lint_run(payload: IDEHighlightRequest) -> dict:
+def devsecops_lint_run(
+    payload: IDEHighlightRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     return {
         "file_path": payload.file_path,
         "rules_checked": ["python.security.sql", "js.security.xss", "generic.secret.patterns"],
@@ -321,7 +363,10 @@ def devsecops_lint_run(payload: IDEHighlightRequest) -> dict:
 
 
 @app.post("/devsecops/api/test")
-def devsecops_api_test(payload: APISecurityTestRequest) -> dict:
+def devsecops_api_test(
+    payload: APISecurityTestRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     return {
         "spec_url": payload.spec_url,
         "target": payload.target,
@@ -335,7 +380,9 @@ def devsecops_api_test(payload: APISecurityTestRequest) -> dict:
 
 
 @app.get("/grc/frameworks")
-def grc_frameworks() -> dict:
+def grc_frameworks(
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     return {
         "frameworks": [
             "SOC2",
@@ -351,7 +398,10 @@ def grc_frameworks() -> dict:
 
 
 @app.post("/grc/risk/assess")
-def grc_risk_assess(payload: RiskAssessmentRequest) -> dict:
+def grc_risk_assess(
+    payload: RiskAssessmentRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     score = round((payload.likelihood * payload.impact * (1 - payload.controls_score)) * 100, 2)
     return {
         "asset": payload.asset,
@@ -361,7 +411,11 @@ def grc_risk_assess(payload: RiskAssessmentRequest) -> dict:
 
 
 @app.post("/grc/policies")
-def grc_policy_create(payload: PolicyCreate, db: Session = Depends(get_db)) -> dict:
+def grc_policy_create(
+    payload: PolicyCreate,
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     policy_id = f"pol-{uuid.uuid4().hex[:8]}"
     record = Phase5PolicyModel(
         id=policy_id,
@@ -384,7 +438,10 @@ def grc_policy_create(payload: PolicyCreate, db: Session = Depends(get_db)) -> d
 
 
 @app.get("/grc/policies")
-def grc_policy_list(db: Session = Depends(get_db)) -> dict:
+def grc_policy_list(
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     items = db.query(Phase5PolicyModel).all()
     result = [
         {
@@ -400,7 +457,10 @@ def grc_policy_list(db: Session = Depends(get_db)) -> dict:
 
 
 @app.get("/grc/audit/evidence")
-def grc_audit_evidence(db: Session = Depends(get_db)) -> dict:
+def grc_audit_evidence(
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     alert_count = db.query(Phase5AlertModel).count()
     incident_count = db.query(Phase5IncidentModel).count()
     return {
@@ -411,7 +471,10 @@ def grc_audit_evidence(db: Session = Depends(get_db)) -> dict:
 
 
 @app.post("/grc/third-party/assess")
-def grc_vendor_assess(payload: VendorAssessment) -> dict:
+def grc_vendor_assess(
+    payload: VendorAssessment,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     vendor_id = f"vnd-{uuid.uuid4().hex[:8]}"
     record = {
         **payload.model_dump(),
@@ -423,7 +486,10 @@ def grc_vendor_assess(payload: VendorAssessment) -> dict:
 
 
 @app.post("/threat-intel/osint/collect")
-def threat_intel_collect(payload: OSINTCollectRequest) -> dict:
+def threat_intel_collect(
+    payload: OSINTCollectRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     feeds = [
         "domain_reputation",
         "dark_web_mentions" if payload.include_darkweb else "none",
@@ -433,7 +499,11 @@ def threat_intel_collect(payload: OSINTCollectRequest) -> dict:
 
 
 @app.post("/threat-intel/ioc/create")
-def threat_intel_ioc_create(payload: IOCRequest, db: Session = Depends(get_db)) -> dict:
+def threat_intel_ioc_create(
+    payload: IOCRequest,
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     ioc_id = f"ioc-{uuid.uuid4().hex[:8]}"
     record = Phase5IOCModel(
         id=ioc_id,
@@ -454,7 +524,11 @@ def threat_intel_ioc_create(payload: IOCRequest, db: Session = Depends(get_db)) 
 
 
 @app.get("/threat-intel/ioc/search")
-def threat_intel_ioc_search(value: str, db: Session = Depends(get_db)) -> dict:
+def threat_intel_ioc_search(
+    value: str,
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     matches = db.query(Phase5IOCModel).filter(Phase5IOCModel.value.contains(value)).all()
     result = [
         {"ioc_id": m.id, "ioc_type": m.ioc_type, "value": m.value, "confidence": m.confidence}
@@ -464,7 +538,10 @@ def threat_intel_ioc_search(value: str, db: Session = Depends(get_db)) -> dict:
 
 
 @app.post("/threat-intel/actors/track")
-def threat_intel_actor_track(payload: ActorTrackRequest) -> dict:
+def threat_intel_actor_track(
+    payload: ActorTrackRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     return {
         "actor_name": payload.actor_name,
         "ttps": payload.ttps,
@@ -474,12 +551,18 @@ def threat_intel_actor_track(payload: ActorTrackRequest) -> dict:
 
 
 @app.post("/threat-intel/sharing/publish")
-def threat_intel_sharing(payload: ShareIntelRequest) -> dict:
+def threat_intel_sharing(
+    payload: ShareIntelRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     return {"status": "published", "destination": payload.destination, "title": payload.title}
 
 
 @app.post("/mobile/ios/analyze")
-def mobile_ios_analyze(payload: GenericAnalysisRequest) -> dict:
+def mobile_ios_analyze(
+    payload: GenericAnalysisRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     return {
         "target": payload.target,
         "checks": ["ipa_static_analysis", "runtime_checks", "ssl_pinning_assessment"],
@@ -488,7 +571,10 @@ def mobile_ios_analyze(payload: GenericAnalysisRequest) -> dict:
 
 
 @app.post("/mobile/android/analyze")
-def mobile_android_analyze(payload: GenericAnalysisRequest) -> dict:
+def mobile_android_analyze(
+    payload: GenericAnalysisRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     return {
         "target": payload.target,
         "checks": ["apk_static_analysis", "frida_hooks", "root_detection_review"],
@@ -497,7 +583,10 @@ def mobile_android_analyze(payload: GenericAnalysisRequest) -> dict:
 
 
 @app.post("/mobile/api-traffic/analyze")
-def mobile_api_traffic_analyze(payload: GenericAnalysisRequest) -> dict:
+def mobile_api_traffic_analyze(
+    payload: GenericAnalysisRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     return {
         "target": payload.target,
         "checks": ["proxy_capture", "token_extraction", "auth_flow_validation"],
@@ -506,13 +595,19 @@ def mobile_api_traffic_analyze(payload: GenericAnalysisRequest) -> dict:
 
 
 @app.post("/cspm/multicloud/assess")
-def cspm_multicloud_assess(payload: CloudAssessRequest) -> dict:
+def cspm_multicloud_assess(
+    payload: CloudAssessRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     results = [{"provider": p, "score": 82 if p == "aws" else 78} for p in payload.providers]
     return {"results": results, "multi_cloud_compliance": True}
 
 
 @app.post("/cspm/config/audit")
-def cspm_config_audit(payload: GenericAnalysisRequest) -> dict:
+def cspm_config_audit(
+    payload: GenericAnalysisRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     return {
         "target": payload.target,
         "checks": ["cis_benchmarks", "iam_review", "bucket_permissions", "network_config"],
@@ -521,7 +616,10 @@ def cspm_config_audit(payload: GenericAnalysisRequest) -> dict:
 
 
 @app.post("/cspm/workload/protect")
-def cspm_workload_protect(payload: GenericAnalysisRequest) -> dict:
+def cspm_workload_protect(
+    payload: GenericAnalysisRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     return {
         "target": payload.target,
         "controls": ["serverless_guardrails", "container_runtime_security", "api_gateway_security"],
@@ -530,12 +628,18 @@ def cspm_workload_protect(payload: GenericAnalysisRequest) -> dict:
 
 
 @app.post("/cspm/cost/optimize")
-def cspm_cost_optimize(payload: GenericAnalysisRequest) -> dict:
+def cspm_cost_optimize(
+    payload: GenericAnalysisRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     return {"target": payload.target, "savings_estimate_usd": 1200, "waste_findings": 3}
 
 
 @app.post("/web3/contracts/analyze")
-def web3_contract_analyze(payload: ContractAnalysisRequest) -> dict:
+def web3_contract_analyze(
+    payload: ContractAnalysisRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     vuln = (
         ["reentrancy", "integer_overflow"]
         if "call.value" in payload.code or "unchecked" in payload.code
@@ -545,7 +649,10 @@ def web3_contract_analyze(payload: ContractAnalysisRequest) -> dict:
 
 
 @app.post("/web3/defi/test")
-def web3_defi_test(payload: GenericAnalysisRequest) -> dict:
+def web3_defi_test(
+    payload: GenericAnalysisRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     return {
         "target": payload.target,
         "tests": ["flash_loan_simulation", "oracle_manipulation", "liquidity_pool_analysis"],
@@ -554,7 +661,10 @@ def web3_defi_test(payload: GenericAnalysisRequest) -> dict:
 
 
 @app.post("/web3/nft/analyze")
-def web3_nft_analyze(payload: GenericAnalysisRequest) -> dict:
+def web3_nft_analyze(
+    payload: GenericAnalysisRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     return {
         "target": payload.target,
         "checks": ["metadata_verification", "ownership_analysis"],
@@ -563,12 +673,18 @@ def web3_nft_analyze(payload: GenericAnalysisRequest) -> dict:
 
 
 @app.post("/web3/forensics/trace")
-def web3_forensics_trace(payload: GenericAnalysisRequest) -> dict:
+def web3_forensics_trace(
+    payload: GenericAnalysisRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     return {"target": payload.target, "trace_nodes": 7, "mixer_detection": False}
 
 
 @app.post("/iot/firmware/analyze")
-def iot_firmware_analyze(payload: GenericAnalysisRequest) -> dict:
+def iot_firmware_analyze(
+    payload: GenericAnalysisRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     return {
         "target": payload.target,
         "steps": ["extract", "binary_scan", "backdoor_detection"],
@@ -577,7 +693,10 @@ def iot_firmware_analyze(payload: GenericAnalysisRequest) -> dict:
 
 
 @app.post("/iot/protocol/fuzz")
-def iot_protocol_fuzz(payload: FuzzRequest) -> dict:
+def iot_protocol_fuzz(
+    payload: FuzzRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     return {
         "target": payload.target,
         "protocol": payload.protocol or "mqtt",
@@ -587,7 +706,10 @@ def iot_protocol_fuzz(payload: FuzzRequest) -> dict:
 
 
 @app.post("/iot/ics/assess")
-def iot_ics_assess(payload: GenericAnalysisRequest) -> dict:
+def iot_ics_assess(
+    payload: GenericAnalysisRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     return {
         "target": payload.target,
         "checks": ["scada_assessment", "modbus_dnp3_tests", "plc_scan"],
@@ -596,7 +718,10 @@ def iot_ics_assess(payload: GenericAnalysisRequest) -> dict:
 
 
 @app.post("/reverse/binary/analyze")
-def reverse_binary_analyze(payload: GenericAnalysisRequest) -> dict:
+def reverse_binary_analyze(
+    payload: GenericAnalysisRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     return {
         "target": payload.target,
         "tools": ["ghidra", "ida", "binary_ninja"],
@@ -605,7 +730,10 @@ def reverse_binary_analyze(payload: GenericAnalysisRequest) -> dict:
 
 
 @app.post("/reverse/fuzz/run")
-def reverse_fuzz_run(payload: FuzzRequest) -> dict:
+def reverse_fuzz_run(
+    payload: FuzzRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     return {
         "target": payload.target,
         "engine": payload.engine or "afl++",
@@ -615,7 +743,10 @@ def reverse_fuzz_run(payload: FuzzRequest) -> dict:
 
 
 @app.post("/reverse/malware/analyze")
-def reverse_malware_analyze(payload: GenericAnalysisRequest) -> dict:
+def reverse_malware_analyze(
+    payload: GenericAnalysisRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     return {
         "target": payload.target,
         "checks": ["static", "dynamic", "yara"],
@@ -624,7 +755,10 @@ def reverse_malware_analyze(payload: GenericAnalysisRequest) -> dict:
 
 
 @app.post("/reverse/exploit/template")
-def reverse_exploit_template(payload: GenericAnalysisRequest) -> dict:
+def reverse_exploit_template(
+    payload: GenericAnalysisRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     return {
         "target": payload.target,
         "template": "ROP_CHAIN_TEMPLATE_V1",
@@ -633,7 +767,9 @@ def reverse_exploit_template(payload: GenericAnalysisRequest) -> dict:
 
 
 @app.get("/training/labs")
-def training_labs() -> dict:
+def training_labs(
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     return {
         "labs": ["xss_lab", "sqli_lab", "cloud_misconfig_lab"],
         "ctf_enabled": True,
@@ -642,12 +778,17 @@ def training_labs() -> dict:
 
 
 @app.get("/training/cert-paths")
-def training_cert_paths() -> dict:
+def training_cert_paths(
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     return {"paths": ["OSCP", "CEH", "CISSP", "Custom Red Team"]}
 
 
 @app.get("/training/learning-paths")
-def training_learning_paths(role: str | None = None) -> dict:
+def training_learning_paths(
+    role: str | None = None,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     base: list[dict[str, Any]] = [
         {"track": "pentester"},
         {"track": "soc_analyst"},
@@ -659,7 +800,9 @@ def training_learning_paths(role: str | None = None) -> dict:
 
 
 @app.get("/training/gamification/leaderboard")
-def training_leaderboard() -> dict:
+def training_leaderboard(
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     return {
         "leaders": [{"user": "alice", "points": 1200}, {"user": "bob", "points": 980}],
         "team_competitions": True,
@@ -667,7 +810,9 @@ def training_leaderboard() -> dict:
 
 
 @app.get("/executive/risk-posture")
-def executive_risk_posture() -> dict:
+def executive_risk_posture(
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     return {
         "overall_security_score": 83,
         "trend": "improving",
@@ -677,7 +822,9 @@ def executive_risk_posture() -> dict:
 
 
 @app.get("/executive/compliance-status")
-def executive_compliance_status() -> dict:
+def executive_compliance_status(
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     return {
         "framework_compliance": {"soc2": 88, "iso27001": 81, "pci_dss": 77},
         "gap_analysis": True,
@@ -686,7 +833,9 @@ def executive_compliance_status() -> dict:
 
 
 @app.get("/executive/resource-optimization")
-def executive_resource_optimization() -> dict:
+def executive_resource_optimization(
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     return {
         "team_productivity": 0.84,
         "tool_utilization": 0.79,
@@ -695,7 +844,9 @@ def executive_resource_optimization() -> dict:
 
 
 @app.get("/executive/reports")
-def executive_reports() -> dict:
+def executive_reports(
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     return {
         "reports": ["board_kpi_deck", "quarterly_roi", "risk_reduction_trend"],
         "generated_at": datetime.now(UTC).isoformat(),

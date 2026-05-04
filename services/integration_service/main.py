@@ -18,6 +18,7 @@ from fastapi import Depends, FastAPI, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from services.common.auth_middleware import get_current_active_user
 from services.common.db import SessionLocal, get_db
 from services.common.egress import create_async_client
 from services.common.models import IntegrationConfigModel, IntegrationEventModel
@@ -163,7 +164,9 @@ async def health() -> dict:
 
 @app.post("/configs", status_code=201)
 async def create_integration_config(
-    payload: IntegrationConfigCreate, db: Session = Depends(get_db)
+    payload: IntegrationConfigCreate,
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_active_user),
 ) -> dict:
     """Persist an integration configuration to the database."""
     config_id = f"cfg-{uuid.uuid4().hex[:8]}"
@@ -184,6 +187,7 @@ async def create_integration_config(
 async def list_integration_configs(
     integration_type: str | None = None,
     db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_active_user),
 ) -> dict:
     """List all stored integration configurations."""
     query = db.query(IntegrationConfigModel)
@@ -194,7 +198,11 @@ async def list_integration_configs(
 
 
 @app.delete("/configs/{config_id}")
-async def delete_integration_config(config_id: str, db: Session = Depends(get_db)) -> dict:
+async def delete_integration_config(
+    config_id: str,
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     from fastapi import HTTPException
 
     record = db.query(IntegrationConfigModel).filter(IntegrationConfigModel.id == config_id).first()
@@ -206,7 +214,7 @@ async def delete_integration_config(config_id: str, db: Session = Depends(get_db
 
 
 @app.post("/siem/ingest")
-async def ingest_siem(event: SIEMEvent) -> dict:
+async def ingest_siem(event: SIEMEvent, _user: dict = Depends(get_current_active_user)) -> dict:
     """Ingest an event for SIEM consolidation or forwarding."""
     entry = {
         **event.model_dump(),
@@ -220,21 +228,21 @@ async def ingest_siem(event: SIEMEvent) -> dict:
 
 
 @app.post("/siem/splunk")
-async def ingest_splunk(event: SIEMEvent) -> dict:
+async def ingest_splunk(event: SIEMEvent, _user: dict = Depends(get_current_active_user)) -> dict:
     return await ingest_siem(
         SIEMEvent(source="splunk", severity=event.severity, message=event.message, data=event.data)
     )
 
 
 @app.post("/siem/qradar")
-async def ingest_qradar(event: SIEMEvent) -> dict:
+async def ingest_qradar(event: SIEMEvent, _user: dict = Depends(get_current_active_user)) -> dict:
     return await ingest_siem(
         SIEMEvent(source="qradar", severity=event.severity, message=event.message, data=event.data)
     )
 
 
 @app.post("/siem/sentinel")
-async def ingest_sentinel(event: SIEMEvent) -> dict:
+async def ingest_sentinel(event: SIEMEvent, _user: dict = Depends(get_current_active_user)) -> dict:
     return await ingest_siem(
         SIEMEvent(
             source="sentinel", severity=event.severity, message=event.message, data=event.data
@@ -243,7 +251,10 @@ async def ingest_sentinel(event: SIEMEvent) -> dict:
 
 
 @app.get("/siem/events")
-async def list_siem_events(limit: int = 50) -> dict:
+async def list_siem_events(
+    limit: int = 50,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     """List SIEM events — DB with in-memory recent buffer fallback."""
     try:
         db = SessionLocal()
@@ -272,7 +283,10 @@ async def list_siem_events(limit: int = 50) -> dict:
 
 
 @app.post("/ticket/jira")
-async def create_jira_ticket(ticket: TicketCreate) -> dict:
+async def create_jira_ticket(
+    ticket: TicketCreate,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     issue_key = f"{ticket.project.upper()}-{secrets.randbelow(9999):04d}"
     entry = {
         "provider": "jira",
@@ -290,7 +304,10 @@ async def create_jira_ticket(ticket: TicketCreate) -> dict:
 
 
 @app.post("/ticket/servicenow")
-async def create_servicenow_ticket(ticket: TicketCreate) -> dict:
+async def create_servicenow_ticket(
+    ticket: TicketCreate,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     incident_id = f"INC{secrets.randbelow(9999999):07d}"
     entry = {
         "provider": "servicenow",
@@ -314,7 +331,10 @@ async def create_servicenow_ticket(ticket: TicketCreate) -> dict:
 
 
 @app.post("/ticket/github")
-async def create_github_issue(ticket: TicketCreate) -> dict:
+async def create_github_issue(
+    ticket: TicketCreate,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     issue_number = secrets.randbelow(90000) + 1000
     entry = {
         "provider": "github",
@@ -337,7 +357,10 @@ async def create_github_issue(ticket: TicketCreate) -> dict:
 
 
 @app.post("/ticket/webhook")
-async def create_ticket_webhook(payload: WebhookRequest) -> dict:
+async def create_ticket_webhook(
+    payload: WebhookRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     entry = {
         "id": secrets.token_urlsafe(8),
         "event_type": payload.event_type,
@@ -352,7 +375,10 @@ async def create_ticket_webhook(payload: WebhookRequest) -> dict:
 
 
 @app.post("/notify/slack")
-async def notify_slack(payload: NotificationRequest) -> dict:
+async def notify_slack(
+    payload: NotificationRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     entry = _notification_entry("slack", payload)
     notifications.append(entry)
     _persist_event("slack", "notification", entry)
@@ -361,7 +387,10 @@ async def notify_slack(payload: NotificationRequest) -> dict:
 
 
 @app.post("/notify/teams")
-async def notify_teams(payload: NotificationRequest) -> dict:
+async def notify_teams(
+    payload: NotificationRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     entry = _notification_entry("teams", payload)
     notifications.append(entry)
     _persist_event("teams", "notification", entry)
@@ -370,7 +399,10 @@ async def notify_teams(payload: NotificationRequest) -> dict:
 
 
 @app.post("/notify/discord")
-async def notify_discord(payload: NotificationRequest) -> dict:
+async def notify_discord(
+    payload: NotificationRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     entry = _notification_entry("discord", payload)
     notifications.append(entry)
     _persist_event("discord", "notification", entry)
@@ -379,7 +411,10 @@ async def notify_discord(payload: NotificationRequest) -> dict:
 
 
 @app.post("/notify/pagerduty")
-async def notify_pagerduty(payload: NotificationRequest) -> dict:
+async def notify_pagerduty(
+    payload: NotificationRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     entry = _notification_entry("pagerduty", payload)
     notifications.append(entry)
     _persist_event("pagerduty", "notification", entry)
@@ -395,7 +430,10 @@ async def notify_pagerduty(payload: NotificationRequest) -> dict:
 
 
 @app.post("/notify/email")
-async def notify_email(payload: NotificationRequest) -> dict:
+async def notify_email(
+    payload: NotificationRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     entry = _notification_entry("email", payload)
     notifications.append(entry)
     _persist_event("email", "notification", entry)
@@ -407,7 +445,10 @@ async def notify_email(payload: NotificationRequest) -> dict:
 
 
 @app.post("/notify/sms")
-async def notify_sms(payload: NotificationRequest) -> dict:
+async def notify_sms(
+    payload: NotificationRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     entry = _notification_entry("sms", payload)
     notifications.append(entry)
     _persist_event("sms", "notification", entry)
@@ -418,7 +459,10 @@ async def notify_sms(payload: NotificationRequest) -> dict:
 
 
 @app.get("/threat-intel/ip")
-async def threat_intel_ip(ip: str) -> dict:
+async def threat_intel_ip(
+    ip: str,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     return {
         "ip": ip,
         "malicious": False,
@@ -430,7 +474,10 @@ async def threat_intel_ip(ip: str) -> dict:
 
 
 @app.get("/threat-intel/domain")
-async def threat_intel_domain(domain: str) -> dict:
+async def threat_intel_domain(
+    domain: str,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     return {
         "domain": domain,
         "malicious": False,
@@ -442,7 +489,10 @@ async def threat_intel_domain(domain: str) -> dict:
 
 
 @app.post("/ci/build")
-async def ci_build(trigger: dict[str, Any]) -> dict:
+async def ci_build(
+    trigger: dict[str, Any],
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     build_id = secrets.token_urlsafe(10)
     return {
         "status": "queued",
@@ -460,6 +510,7 @@ async def list_events(
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_active_user),
 ) -> dict:
     """List integration events from persistent storage with filters and pagination."""
     query = db.query(IntegrationEventModel)
@@ -493,7 +544,10 @@ async def list_events(
 
 
 @app.get("/events/summary")
-async def events_summary(db: Session = Depends(get_db)) -> dict:
+async def events_summary(
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     """Provide high-level integration event summary metrics for dashboards."""
     rows = db.query(IntegrationEventModel).all()
     by_provider: dict[str, int] = {}

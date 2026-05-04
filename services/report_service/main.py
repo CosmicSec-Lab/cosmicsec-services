@@ -3,10 +3,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from pydantic import BaseModel, Field
 
+from services.common.auth_middleware import get_current_active_user
 from services.common.security_utils import ensure_safe_child_path, sanitize_scan_id
 
 try:
@@ -152,7 +153,10 @@ def health() -> dict:
 
 
 @app.post("/reports/generate")
-def generate_report(payload: ReportRequest) -> dict:
+def generate_report(
+    payload: ReportRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     safe_format = payload.format.lower()
     if safe_format not in {"pdf", "docx", "json", "csv", "html"}:
         safe_format = "pdf"
@@ -253,7 +257,10 @@ def _compliance_template(standard: str, findings: list[dict]) -> dict[str, Any]:
 
 
 @app.post("/reports/compliance")
-def generate_compliance_report(payload: ComplianceReportRequest) -> dict:
+def generate_compliance_report(
+    payload: ComplianceReportRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     report = _compliance_template(payload.standard, payload.findings)
     return {
         "scan_id": payload.scan_id,
@@ -263,7 +270,10 @@ def generate_compliance_report(payload: ComplianceReportRequest) -> dict:
 
 
 @app.post("/reports/schedule")
-def schedule_report(payload: ScheduleRequest) -> dict:
+def schedule_report(
+    payload: ScheduleRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     job = {
         "scan_id": payload.scan_id,
         "format": payload.format,
@@ -275,7 +285,10 @@ def schedule_report(payload: ScheduleRequest) -> dict:
 
 
 @app.post("/visualization/topology")
-def generate_topology(payload: TopologyRequest) -> dict:
+def generate_topology(
+    payload: TopologyRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     filtered_nodes = payload.nodes
     if payload.node_filter != "all":
         filtered_nodes = [n for n in payload.nodes if n.get("type") == payload.node_filter]
@@ -295,7 +308,10 @@ def generate_topology(payload: TopologyRequest) -> dict:
 
 
 @app.post("/visualization/attack-path")
-def build_attack_path(payload: AttackPathRequest) -> dict:
+def build_attack_path(
+    payload: AttackPathRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     ranked = sorted(payload.attack_steps, key=lambda s: int(s.get("risk", 0)), reverse=True)
     highlighted = [
         step for step in ranked if int(step.get("risk", 0)) >= payload.highlight_threshold
@@ -310,7 +326,10 @@ def build_attack_path(payload: AttackPathRequest) -> dict:
 
 
 @app.post("/visualization/heatmap")
-def create_threat_heatmap(payload: ThreatHeatmapRequest) -> dict:
+def create_threat_heatmap(
+    payload: ThreatHeatmapRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     buckets: dict[str, dict[str, Any]] = {}
     for obs in payload.observations:
         bucket = str(obs.get(payload.group_by, "unknown"))
@@ -331,7 +350,10 @@ def create_threat_heatmap(payload: ThreatHeatmapRequest) -> dict:
 
 
 @app.post("/visualization/immersive")
-def create_immersive_view(payload: ImmersiveViewRequest) -> dict:
+def create_immersive_view(
+    payload: ImmersiveViewRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     return {
         "mode": payload.mode,
         "scene_name": payload.scene_name,

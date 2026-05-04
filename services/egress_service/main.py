@@ -10,9 +10,10 @@ from datetime import UTC, datetime
 from typing import Any
 
 import httpx
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from pydantic import BaseModel
 
+from services.common.auth_middleware import get_current_active_user
 from services.common.egress import (
     EgressOptions,
     EgressStrategyError,
@@ -48,7 +49,10 @@ async def health() -> dict[str, Any]:
 
 
 @app.post("/strategy/resolve")
-async def resolve_strategy(payload: StrategyRequest) -> dict[str, Any]:
+async def resolve_strategy(
+    payload: StrategyRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict[str, Any]:
     options = EgressOptions(
         use_proxy_pool=payload.use_proxy_pool,
         proxy_url=payload.proxy_url,
@@ -78,7 +82,10 @@ async def resolve_strategy(payload: StrategyRequest) -> dict[str, Any]:
 
 
 @app.post("/probe")
-async def probe(payload: ProbeRequest) -> dict[str, Any]:
+async def probe(
+    payload: ProbeRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict[str, Any]:
     if not payload.target_url:
         return {"status": "rejected", "reason": "target_url is required"}
 

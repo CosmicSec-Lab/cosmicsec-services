@@ -16,6 +16,7 @@ from typing import Any
 import httpx
 from fastapi import (
     BackgroundTasks,
+    Depends,
     FastAPI,
     HTTPException,
     Request,
@@ -27,6 +28,7 @@ from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
+from services.common.auth_middleware import get_current_active_user
 from cosmicsec_platform.service_discovery import get_service_url
 from services.common.db import SessionLocal
 from services.common.egress import EgressOptions
@@ -560,7 +562,12 @@ async def metrics() -> PlainTextResponse:
 
 
 @app.post("/scans", response_model=Scan)
-async def create_scan(config: ScanConfig, background_tasks: BackgroundTasks, request: Request):
+async def create_scan(
+    config: ScanConfig,
+    background_tasks: BackgroundTasks,
+    request: Request,
+    _user: dict = Depends(get_current_active_user),
+):
     """Create and initiate a new security scan."""
     org_id = request.headers.get("X-Org-Id")
     workspace_id = request.headers.get("X-Workspace-Id")
@@ -617,7 +624,10 @@ async def create_scan(config: ScanConfig, background_tasks: BackgroundTasks, req
 
 
 @app.post("/scans/{scan_id}/enqueue")
-async def enqueue_scan(scan_id: str):
+async def enqueue_scan(
+    scan_id: str,
+    _user: dict = Depends(get_current_active_user),
+):
     """Queue scan execution using Celery when available."""
     scan = _load_scan_from_cache_or_db(scan_id)
     if scan is None:
@@ -634,7 +644,10 @@ async def enqueue_scan(scan_id: str):
 
 
 @app.get("/scans/{scan_id}", response_model=Scan)
-async def get_scan(scan_id: str):
+async def get_scan(
+    scan_id: str,
+    _user: dict = Depends(get_current_active_user),
+):
     """Get scan details by ID — checks in-memory cache then database."""
     scan = _load_scan_from_cache_or_db(scan_id)
     if scan:
@@ -644,7 +657,12 @@ async def get_scan(scan_id: str):
 
 
 @app.get("/scans", response_model=list[Scan])
-async def list_scans(status_filter: ScanStatus | None = None, limit: int = 10, offset: int = 0):
+async def list_scans(
+    status_filter: ScanStatus | None = None,
+    limit: int = 10,
+    offset: int = 0,
+    _user: dict = Depends(get_current_active_user),
+):
     """List all scans with optional filtering — DB with in-memory fallback."""
     # Try DB first
     try:
@@ -665,7 +683,10 @@ async def list_scans(status_filter: ScanStatus | None = None, limit: int = 10, o
 
 
 @app.get("/scans/{scan_id}/findings", response_model=list[Finding])
-async def get_scan_findings(scan_id: str):
+async def get_scan_findings(
+    scan_id: str,
+    _user: dict = Depends(get_current_active_user),
+):
     """Get all findings for a specific scan — DB with in-memory fallback."""
     # Try DB first
     try:
@@ -694,7 +715,10 @@ async def get_scan_findings(scan_id: str):
 
 
 @app.delete("/scans/{scan_id}")
-async def delete_scan(scan_id: str):
+async def delete_scan(
+    scan_id: str,
+    _user: dict = Depends(get_current_active_user),
+):
     """Delete a scan and its findings from both DB and in-memory cache."""
     # Delete from DB
     db_deleted = False
@@ -721,7 +745,10 @@ async def delete_scan(scan_id: str):
 
 
 @app.post("/scans/{scan_id}/cancel")
-async def cancel_scan(scan_id: str):
+async def cancel_scan(
+    scan_id: str,
+    _user: dict = Depends(get_current_active_user),
+):
     """Cancel an active scan and persist cancellation state."""
     scan = _load_scan_from_cache_or_db(scan_id)
     if scan is None:
@@ -766,7 +793,9 @@ async def cancel_scan(scan_id: str):
 
 
 @app.get("/stats")
-async def get_stats():
+async def get_stats(
+    _user: dict = Depends(get_current_active_user),
+):
     """Get scanning statistics — DB with in-memory fallback."""
     # Try DB first
     try:
@@ -812,7 +841,9 @@ async def get_stats():
 
 
 @app.get("/stats/dashboard")
-async def get_dashboard_stats():
+async def get_dashboard_stats(
+    _user: dict = Depends(get_current_active_user),
+):
     """Return materialized dashboard stats when available."""
     db = SessionLocal()
     try:
@@ -827,7 +858,9 @@ async def get_dashboard_stats():
 
 
 @app.post("/stats/dashboard/refresh")
-async def refresh_dashboard_stats():
+async def refresh_dashboard_stats(
+    _user: dict = Depends(get_current_active_user),
+):
     """Force-refresh dashboard materialized view."""
     ok = _refresh_dashboard_stats_view()
     if not ok:
@@ -842,7 +875,10 @@ class QuotaUpdateRequest(BaseModel):
 
 
 @app.post("/findings/import")
-async def import_findings_batch(request: Request):
+async def import_findings_batch(
+    request: Request,
+    _user: dict = Depends(get_current_active_user),
+):
     """Import external/offline findings payload into persistent store."""
     raw = await request.body()
     if request.headers.get("content-encoding", "").lower() == "gzip":
@@ -914,7 +950,10 @@ async def import_findings_batch(request: Request):
 
 
 @app.post("/scans/agent-results")
-async def ingest_agent_task_results(payload: AgentTaskResultPayload) -> dict[str, Any]:
+async def ingest_agent_task_results(
+    payload: AgentTaskResultPayload,
+    _user: dict = Depends(get_current_active_user),
+) -> dict[str, Any]:
     """Persist CLI agent task findings into unified scan/finding storage."""
     scan_id = payload.scan_id or f"agent-task-{payload.task_id}"
     target = payload.target or "local-agent-target"
@@ -1009,6 +1048,7 @@ async def list_findings(
     scan_id: str | None = None,
     limit: int = 50,
     offset: int = 0,
+    _user: dict = Depends(get_current_active_user),
 ) -> dict[str, Any]:
     """List findings with optional severity/scan filters and pagination."""
     try:
@@ -1063,7 +1103,10 @@ async def list_findings(
 
 
 @app.get("/findings/trending")
-async def findings_trending(days: int = 7) -> dict[str, Any]:
+async def findings_trending(
+    days: int = 7,
+    _user: dict = Depends(get_current_active_user),
+) -> dict[str, Any]:
     """Return daily severity trend for the latest N days."""
     window_days = max(1, min(days, 90))
     cutoff = datetime.now(tz=UTC) - timedelta(days=window_days)
@@ -1102,14 +1145,21 @@ async def findings_trending(days: int = 7) -> dict[str, Any]:
 
 
 @app.get("/orgs/{org_id}/quotas")
-async def get_org_quotas(org_id: str):
+async def get_org_quotas(
+    org_id: str,
+    _user: dict = Depends(get_current_active_user),
+):
     """Return quota configuration for an organization."""
     quotas = await _fetch_org_quotas(org_id)
     return {"org_id": org_id, "quotas": quotas}
 
 
 @app.post("/orgs/{org_id}/quotas")
-async def set_org_quotas(org_id: str, payload: QuotaUpdateRequest):
+async def set_org_quotas(
+    org_id: str,
+    payload: QuotaUpdateRequest,
+    _user: dict = Depends(get_current_active_user),
+):
     """Update quotas for an organization (local override)."""
     current = tenant_quotas.setdefault(org_id, {})
     current["max_scans_per_day"] = payload.max_scans_per_day
@@ -1280,7 +1330,10 @@ _CLOUD_FINDINGS: dict[str, list[dict[str, Any]]] = {
 
 
 @app.post("/monitor/schedule", status_code=201)
-async def schedule_monitoring(payload: ScheduleMonitorRequest) -> dict:
+async def schedule_monitoring(
+    payload: ScheduleMonitorRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     job_id = await _monitor.schedule(
         target=payload.target,
         scan_types=[t.value for t in payload.scan_types],
@@ -1292,12 +1345,17 @@ async def schedule_monitoring(payload: ScheduleMonitorRequest) -> dict:
 
 
 @app.get("/monitor/jobs")
-async def list_monitor_jobs() -> dict:
+async def list_monitor_jobs(
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     return {"jobs": _monitor.list_jobs(), "active_count": _monitor.active_job_count}
 
 
 @app.get("/monitor/jobs/{job_id}")
-async def get_monitor_job(job_id: str) -> dict:
+async def get_monitor_job(
+    job_id: str,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     job = _monitor.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Monitor job not found")
@@ -1305,28 +1363,40 @@ async def get_monitor_job(job_id: str) -> dict:
 
 
 @app.post("/monitor/jobs/{job_id}/pause")
-async def pause_monitor_job(job_id: str) -> dict:
+async def pause_monitor_job(
+    job_id: str,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     if not _monitor.pause(job_id):
         raise HTTPException(status_code=404, detail="Monitor job not found")
     return {"job_id": job_id, "status": "paused"}
 
 
 @app.post("/monitor/jobs/{job_id}/resume")
-async def resume_monitor_job(job_id: str) -> dict:
+async def resume_monitor_job(
+    job_id: str,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     if not _monitor.resume(job_id):
         raise HTTPException(status_code=404, detail="Monitor job not found")
     return {"job_id": job_id, "status": "active"}
 
 
 @app.delete("/monitor/jobs/{job_id}")
-async def cancel_monitor_job(job_id: str) -> dict:
+async def cancel_monitor_job(
+    job_id: str,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     if not _monitor.cancel(job_id):
         raise HTTPException(status_code=404, detail="Monitor job not found")
     return {"job_id": job_id, "status": "cancelled"}
 
 
 @app.post("/scans/fuzz")
-async def fuzz_api(payload: FuzzRequest) -> dict:
+async def fuzz_api(
+    payload: FuzzRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     egress_options = _egress_options_from_payload(payload.model_dump())
     fuzzer = APIFuzzer(
         timeout=payload.timeout,
@@ -1341,12 +1411,18 @@ async def fuzz_api(payload: FuzzRequest) -> dict:
 
 
 @app.post("/scans/container")
-async def scan_container(payload: ContainerScanRequest) -> dict:
+async def scan_container(
+    payload: ContainerScanRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     return scan_container_artifact(payload.artifact_type, payload.content)
 
 
 @app.post("/scans/smart-plan")
-async def smart_scan_plan(payload: SmartScanRequest) -> dict:
+async def smart_scan_plan(
+    payload: SmartScanRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     egress_options = _egress_options_from_payload(payload.model_dump())
     return await smart_scan(
         payload.url,
@@ -1356,7 +1432,10 @@ async def smart_scan_plan(payload: SmartScanRequest) -> dict:
 
 
 @app.post("/scans/cloud")
-async def cloud_scan(payload: CloudScanRequest) -> dict:
+async def cloud_scan(
+    payload: CloudScanRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     provider = payload.provider.lower()
     findings = _CLOUD_FINDINGS.get(provider, [])
     stamped = []
@@ -1382,7 +1461,10 @@ async def cloud_scan(payload: CloudScanRequest) -> dict:
 
 
 @app.post("/distributed/nodes/register", status_code=201)
-async def register_node(payload: RegisterNodeRequest) -> dict:
+async def register_node(
+    payload: RegisterNodeRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     node = _distributed.register_node(
         node_id=payload.node_id,
         region=payload.region,
@@ -1393,12 +1475,18 @@ async def register_node(payload: RegisterNodeRequest) -> dict:
 
 
 @app.get("/distributed/nodes")
-async def list_nodes() -> dict:
+async def list_nodes(
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     return {"nodes": _distributed.list_nodes(), "total": len(_distributed.list_nodes())}
 
 
 @app.post("/distributed/nodes/{node_id}/heartbeat")
-async def node_heartbeat(node_id: str, payload: NodeHeartbeatRequest) -> dict:
+async def node_heartbeat(
+    node_id: str,
+    payload: NodeHeartbeatRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     node = _distributed.heartbeat(node_id, healthy=payload.healthy, active_jobs=payload.active_jobs)
     if node is None:
         raise HTTPException(status_code=404, detail="Node not found")
@@ -1406,7 +1494,10 @@ async def node_heartbeat(node_id: str, payload: NodeHeartbeatRequest) -> dict:
 
 
 @app.post("/distributed/assign")
-async def distributed_assign(payload: DistributedAssignRequest) -> dict:
+async def distributed_assign(
+    payload: DistributedAssignRequest,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     return _distributed.assign_target(
         target=payload.target,
         replicas=payload.replicas,
@@ -1416,7 +1507,10 @@ async def distributed_assign(payload: DistributedAssignRequest) -> dict:
 
 
 @app.post("/distributed/nodes/{node_id}/complete")
-async def distributed_complete(node_id: str) -> dict:
+async def distributed_complete(
+    node_id: str,
+    _user: dict = Depends(get_current_active_user),
+) -> dict:
     ok = _distributed.complete_assignment(node_id)
     if not ok:
         raise HTTPException(status_code=404, detail="Node not found")

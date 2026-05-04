@@ -31,7 +31,12 @@ class CosmicSecSSHServer(asyncssh.SSHServer):
         return True
 
     def validate_password(self, username, password):
-        expected = os.getenv("COSMICSEC_ADMIN_PASSWORD", "cosmicsec_admin")
+        expected = os.getenv("COSMICSEC_ADMIN_PASSWORD")
+        if not expected:
+            raise PermissionError(
+                "COSMICSEC_ADMIN_PASSWORD environment variable is required. "
+                "Set a strong password before starting the admin service."
+            )
         return username == "admin" and password == expected
 
     def public_key_auth_supported(self):
@@ -98,7 +103,10 @@ class CosmicSecProcess(asyncssh.SSHServerProcess):
 def validate_totp(code: str) -> bool:
     secret = os.getenv("COSMICSEC_ADMIN_TOTP_SECRET")
     if not secret:
-        return code == "000000"
+        raise PermissionError(
+            "COSMICSEC_ADMIN_TOTP_SECRET environment variable is required for 2FA. "
+            "Generate one with: python -c 'import pyotp; print(pyotp.random_base32())'"
+        )
     return pyotp.TOTP(secret).verify(code)
 
 
