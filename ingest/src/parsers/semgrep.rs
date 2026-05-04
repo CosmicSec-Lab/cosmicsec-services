@@ -63,7 +63,7 @@ struct SemgrepResult {
     extra: SemgrepExtra,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Default)]
 struct SemgrepExtra {
     #[serde(default)]
     severity: String,
@@ -77,7 +77,7 @@ struct SemgrepExtra {
     fix_text: Option<String>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Default)]
 struct SemgrepMetadata {
     #[serde(default)]
     category: Option<String>,

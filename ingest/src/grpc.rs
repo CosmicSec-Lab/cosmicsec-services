@@ -6,17 +6,21 @@ use crate::db::DbWriter;
 use crate::normalizer::{Finding, Severity};
 use crate::parsers::parser_for_tool;
 use crate::AppState;
+use std::pin::Pin;
 use std::time::Instant;
+use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
 pub mod ingest_proto {
-    tonic::include_proto!("ingest");
+    tonic::include_proto!("cosmicsec.ingest.v1");
 }
 
 use ingest_proto::ingest_service_server::IngestService;
 use ingest_proto::{
     FindingProto, IngestRequest, IngestResponse, StatusRequest, StatusResponse, ToolType,
 };
+
+type ResponseStream = Pin<Box<dyn Stream<Item = Result<FindingProto, Status>> + Send + 'static>>;
 
 /// gRPC service implementation.
 pub struct IngestSvc {
@@ -26,6 +30,8 @@ pub struct IngestSvc {
 
 #[tonic::async_trait]
 impl IngestService for IngestSvc {
+    type StreamIngestStream = ResponseStream;
+
     async fn ingest_batch(
         &self,
         request: Request<IngestRequest>,
@@ -37,7 +43,7 @@ impl IngestService for IngestSvc {
             return Err(Status::invalid_argument("raw_data is empty"));
         }
 
-        let tool_str = tool_type_to_str(inner.tool);
+        let tool_str = tool_type_from_i32(inner.tool);
         let parser = parser_for_tool(tool_str);
 
         let parse_start = Instant::now();
@@ -96,7 +102,7 @@ impl IngestService for IngestSvc {
             return Err(Status::invalid_argument("raw_data is empty"));
         }
 
-        let tool_str = tool_type_to_str(inner.tool);
+        let tool_str = tool_type_from_i32(inner.tool);
         let parser = parser_for_tool(tool_str);
 
         let findings = parser
@@ -143,8 +149,8 @@ impl IngestService for IngestSvc {
     }
 }
 
-fn tool_type_to_str(tool: ToolType) -> &'static str {
-    match tool {
+fn tool_type_from_i32(tool: i32) -> &'static str {
+    match ToolType::try_from(tool).unwrap_or(ToolType::ToolUnknown) {
         ToolType::ToolNmap => "nmap",
         ToolType::ToolNuclei => "nuclei",
         ToolType::ToolNikto => "nikto",
@@ -157,24 +163,38 @@ fn tool_type_to_str(tool: ToolType) -> &'static str {
     }
 }
 
-fn severity_to_proto(s: &Severity) -> ingest_proto::Severity {
+fn severity_to_i32(s: &Severity) -> i32 {
     match s {
-        Severity::Critical => ingest_proto::Severity::Critical,
-        Severity::High => ingest_proto::Severity::High,
-        Severity::Medium => ingest_proto::Severity::Medium,
-        Severity::Low => ingest_proto::Severity::Low,
-        Severity::Info => ingest_proto::Severity::Info,
-        Severity::Unknown => ingest_proto::Severity::Unknown,
+        Severity::Critical => ingest_proto::Severity::Critical as i32,
+        Severity::High => ingest_proto::Severity::High as i32,
+        Severity::Medium => ingest_proto::Severity::Medium as i32,
+        Severity::Low => ingest_proto::Severity::Low as i32,
+        Severity::Info => ingest_proto::Severity::Info as i32,
+        Severity::Unknown => ingest_proto::Severity::Unknown as i32,
     }
 }
 
 fn finding_to_proto(f: Finding) -> FindingProto {
+    let extra = if let serde_json::Value::Object(map) = &f.extra {
+        map.iter()
+            .filter_map(|(k, v)| {
+                if let serde_json::Value::String(s) = v {
+                    Some((k.clone(), s.clone()))
+                } else {
+                    Some((k.clone(), v.to_string()))
+                }
+            })
+            .collect()
+    } else {
+        std::collections::HashMap::new()
+    };
+
     FindingProto {
         id: f.id.to_string(),
         scan_id: f.scan_id,
         title: f.title,
         description: f.description,
-        severity: severity_to_proto(&f.severity),
+        severity: severity_to_i32(&f.severity),
         cvss_score: f.cvss_score.unwrap_or(0.0),
         category: f.category,
         cve_id: f.cve_id.unwrap_or_default(),
@@ -184,12 +204,12 @@ fn finding_to_proto(f: Finding) -> FindingProto {
         recommendation: f.recommendation,
         raw_evidence: f.raw_evidence,
         detected_at: f.detected_at.to_rfc3339(),
-        extra: serde_json::to_string(&f.extra).unwrap_or_default(),
+        extra,
     }
 }
 
 /// Build the tonic gRPC server.
-pub fn build_grpc_server(db: DbWriter, state: AppState) -> tonic::transport::Server {
+pub fn build_grpc_server(db: DbWriter, state: AppState) -> tonic::transport::server::Router {
     let svc = IngestSvc { db, state };
     tonic::transport::Server::builder()
         .add_service(ingest_proto::ingest_service_server::IngestServiceServer::new(svc))

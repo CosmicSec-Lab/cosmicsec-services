@@ -78,7 +78,7 @@ struct GrypeVuln {
     cvss: Vec<GrypeCVSS>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Default)]
 struct GrypeFix {
     #[serde(default)]
     versions: Option<String>,
